@@ -420,7 +420,12 @@ def _strict_yaml(path: Path) -> dict[str, Any]:
 
 
 def _verify_profile_assets(home: Path, profile: ManagedProfile) -> dict[str, Any]:
-    config_path = home / "config.yaml"
+    from hermes_cli.managed_scope import get_managed_dir
+
+    managed_dir = get_managed_dir()
+    if managed_dir is None or managed_dir.is_symlink() or not managed_dir.is_dir():
+        raise GovernedProfileError("managed config scope is missing or unsafe")
+    config_path = managed_dir / "config.yaml"
     metadata_path = home / "profile.yaml"
     binding_path = home / "flexa-profile.yaml"
     if any(path.is_symlink() or not path.is_file() for path in (
@@ -437,12 +442,10 @@ def _verify_profile_assets(home: Path, profile: ManagedProfile) -> dict[str, Any
     metadata = _strict_yaml(metadata_path)
     binding = _strict_yaml(binding_path)
     expected_workspace = f"/workspaces/{profile.employee_id}"
-    if (
-        set(config) != {"terminal"}
-        or not isinstance(config.get("terminal"), dict)
-        or set(config["terminal"]) != {"cwd"}
-        or config["terminal"].get("cwd") != expected_workspace
-    ):
+    if config != {
+        "skills": {"external_dirs": ["/opt/hermes/skills"]},
+        "terminal": {"cwd": expected_workspace},
+    }:
         raise GovernedProfileError("managed profile config is not canonical")
     if "flexa" in config:
         raise GovernedProfileError("Flexa identity must not be stored in Hermes config")
