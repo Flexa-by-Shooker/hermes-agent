@@ -1627,6 +1627,81 @@ class TestInternalHelpers:
 class TestEdgeCases:
     """Additional edge-case tests."""
 
+    def test_skill_count_is_local_plus_external_union(self, profile_env):
+        tmp_path = profile_env
+        profile = tmp_path / ".hermes" / "profiles" / "oren-cto"
+        local = profile / "skills"
+        external = tmp_path / "hermes-stock-skills"
+        roots_and_names = (
+            (local, ("oren-only", "shared")),
+            (external, ("stock-only", "shared")),
+        )
+        for root, names in roots_and_names:
+            for name in names:
+                skill_dir = root / name
+                skill_dir.mkdir(parents=True, exist_ok=True)
+                (skill_dir / "SKILL.md").write_text(
+                    f"---\nname: {name}\n---\n",
+                    encoding="utf-8",
+                )
+
+        # Runtime identity comes from frontmatter, not the containing folder.
+        # Two differently named folders with the same logical name are one
+        # effective skill (the local copy takes precedence).
+        for root, folder in ((local, "local-alias"), (external, "stock-alias")):
+            skill_dir = root / folder
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: logical-shared\n---\n",
+                encoding="utf-8",
+            )
+
+        # A preserved skill package under a real skill's support tree is not
+        # active and must not inflate the profile card.
+        archived = local / "oren-only" / "references" / "archived"
+        archived.mkdir(parents=True)
+        (archived / "SKILL.md").write_text("---\nname: archived\n---\n", encoding="utf-8")
+        (profile / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external}\n",
+            encoding="utf-8",
+        )
+
+        profiles._SKILL_COUNT_CACHE.clear()
+        assert profiles._count_skills(profile) == 4
+
+    def test_skill_count_honors_managed_external_root(
+        self, profile_env, monkeypatch
+    ):
+        from agent.skill_utils import _external_dirs_cache_clear
+        from hermes_cli.managed_scope import invalidate_managed_cache
+
+        tmp_path = profile_env
+        profile = tmp_path / ".hermes" / "profiles" / "oren-cto"
+        local_skill = profile / "skills" / "oren-only"
+        local_skill.mkdir(parents=True)
+        (local_skill / "SKILL.md").write_text(
+            "---\nname: oren-only\n---\n", encoding="utf-8"
+        )
+        external = tmp_path / "hermes-stock-skills"
+        for name in ("stock-one", "stock-two"):
+            skill_dir = external / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\n---\n", encoding="utf-8"
+            )
+        managed = tmp_path / "managed"
+        managed.mkdir()
+        (managed / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+        invalidate_managed_cache()
+        _external_dirs_cache_clear()
+        profiles._SKILL_COUNT_CACHE.clear()
+
+        assert profiles._count_skills(profile) == 3
+
     def test_create_profile_returns_correct_path(self, profile_env):
         tmp_path = profile_env
         result = create_profile("mybot", no_alias=True)

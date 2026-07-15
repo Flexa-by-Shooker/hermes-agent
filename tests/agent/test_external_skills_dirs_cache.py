@@ -146,3 +146,70 @@ def test_cache_key_is_per_config_path(tmp_path, monkeypatch):
     # And switching back still works — both entries coexist in the cache.
     monkeypatch.setenv("HERMES_HOME", str(home_a))
     assert get_external_skills_dirs() == [ext_a.resolve()]
+
+
+def test_managed_config_supplies_external_dir_without_user_config(tmp_path, monkeypatch):
+    """A managed skill root works even when the profile has no config file."""
+    from hermes_cli.managed_scope import invalidate_managed_cache
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "skills").mkdir()
+    external = tmp_path / "managed-skills"
+    external.mkdir()
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "config.yaml").write_text(
+        f"skills:\n  external_dirs:\n    - {external}\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    _external_dirs_cache_clear()
+    invalidate_managed_cache()
+
+    assert get_external_skills_dirs() == [external.resolve()]
+
+
+def test_managed_external_dir_wins_and_invalidates_cache(tmp_path, monkeypatch):
+    """The managed leaf overrides user config and edits invalidate the memo."""
+    from hermes_cli.managed_scope import invalidate_managed_cache
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "skills").mkdir()
+    user_external = tmp_path / "user-skills"
+    user_external.mkdir()
+    managed_external = tmp_path / "managed-skills"
+    managed_external.mkdir()
+    replacement = tmp_path / "replacement-skills"
+    replacement.mkdir()
+    (home / "config.yaml").write_text(
+        f"skills:\n  external_dirs:\n    - {user_external}\n",
+        encoding="utf-8",
+    )
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    managed_config = managed / "config.yaml"
+    managed_config.write_text(
+        f"skills:\n  external_dirs:\n    - {managed_external}\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    _external_dirs_cache_clear()
+    invalidate_managed_cache()
+    assert get_external_skills_dirs() == [managed_external.resolve()]
+
+    managed_config.write_text(
+        f"skills:\n  external_dirs:\n    - {replacement}\n",
+        encoding="utf-8",
+    )
+    stat = managed_config.stat()
+    future = stat.st_atime + 10
+    os.utime(managed_config, (future, future))
+    invalidate_managed_cache()
+
+    assert get_external_skills_dirs() == [replacement.resolve()]
