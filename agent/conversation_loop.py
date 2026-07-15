@@ -606,9 +606,9 @@ def _run_conversation_impl(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
-    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+    from hermes_cli.flexa_governed import disclosure_boundary_mode
 
-    _governed_turn = _flexa_governed_mode()
+    _disclosure_boundary_turn = disclosure_boundary_mode()
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -797,7 +797,7 @@ def _run_conversation_impl(
                 agent.session_id or "-",
             )
 
-        if _governed_turn:
+        if _disclosure_boundary_turn:
             current_turn_user_idx = governed_current_user_index(messages, turn_id)
             agent._persist_user_message_idx = current_turn_user_idx
 
@@ -5490,9 +5490,17 @@ def run_conversation(
         scrub_reasoning,
         user_input as enforce_user_input,
     )
-    from hermes_cli.flexa_governed import governed_mode
+    from hermes_cli.flexa_governed import (
+        ensure_governed_content_free_logging,
+        governed_mode,
+        supervised_disclosure_mode,
+    )
 
-    if not governed_mode():
+    _governed = governed_mode()
+    _supervised = supervised_disclosure_mode() and not _governed
+    if _governed or _supervised:
+        ensure_governed_content_free_logging()
+    if not _governed and not _supervised:
         return _run_conversation_impl(
             agent,
             user_message,
@@ -5505,7 +5513,30 @@ def run_conversation(
             moa_config,
         )
 
-    require_governed_runtime(agent)
+    _supervised_output_snapshot = None
+    _restore_supervised_output_guard = None
+    if _supervised:
+        from hermes_cli.flexa_supervised_disclosure import (
+            build_supervised_blocked_result,
+            filter_supervised_disclosure_history,
+            install_supervised_output_guard,
+            install_supervised_turn_guard,
+            restore_supervised_output_guard,
+            supervised_disclosure_preflight,
+            validate_supervised_plugin_manager,
+        )
+
+        validate_supervised_plugin_manager()
+        install_supervised_turn_guard(agent)
+        if getattr(agent, "api_mode", None) == "codex_app_server":
+            raise RuntimeError(
+                "supervised disclosure boundary does not permit the "
+                "codex_app_server bypass path"
+            )
+        _supervised_output_snapshot = install_supervised_output_guard(agent)
+        _restore_supervised_output_guard = restore_supervised_output_guard
+    else:
+        require_governed_runtime(agent)
     _observer_names = (
         "status_callback",
         "thinking_callback",
@@ -5519,6 +5550,9 @@ def run_conversation(
         "notice_clear_callback",
         "reaction_callback",
         "step_callback",
+        "stream_delta_callback",
+        "read_terminal_callback",
+        "event_callback",
     )
     _saved_observers = {
         name: getattr(agent, name, None)
@@ -5535,6 +5569,66 @@ def run_conversation(
     if hasattr(agent, "verbose_logging"):
         agent.verbose_logging = False
     agent.suppress_status_output = True
+    if _supervised:
+        try:
+            if not isinstance(user_message, str) or not user_message.strip():
+                raise RuntimeError("supervised user message must be non-empty text")
+            _supervised_history = filter_supervised_disclosure_history(
+                list(conversation_history or []),
+                session_id=str(task_id or getattr(agent, "session_id", None) or ""),
+                platform=str(getattr(agent, "platform", None) or ""),
+            )
+            _fixed_response = supervised_disclosure_preflight(
+                user_message,
+                session_id=str(task_id or getattr(agent, "session_id", None) or ""),
+                platform=str(getattr(agent, "platform", None) or ""),
+            )
+            if _fixed_response is not None:
+                return build_supervised_blocked_result(
+                    agent,
+                    user_message=user_message,
+                    fixed_response=_fixed_response,
+                    conversation_history=_supervised_history,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                )
+            return _run_conversation_impl(
+                agent,
+                user_message,
+                system_message,
+                _supervised_history,
+                task_id,
+                None,
+                persist_user_message,
+                persist_user_timestamp,
+                moa_config,
+            )
+        except Exception:
+            logger.error("supervised turn failed", exc_info=True)
+            raise RuntimeError("supervised turn failed") from None
+        finally:
+            if (
+                _restore_supervised_output_guard is not None
+                and _supervised_output_snapshot is not None
+            ):
+                _restore_supervised_output_guard(
+                    agent,
+                    _supervised_output_snapshot,
+                )
+            for _observer_name, _observer in _saved_observers.items():
+                if hasattr(agent, _observer_name):
+                    setattr(agent, _observer_name, _observer)
+            if _saved_quiet_mode is not None:
+                agent.quiet_mode = _saved_quiet_mode
+            if _saved_verbose_logging is not None:
+                agent.verbose_logging = _saved_verbose_logging
+            if _saved_suppress_status is None:
+                try:
+                    delattr(agent, "suppress_status_output")
+                except AttributeError:
+                    pass
+            else:
+                agent.suppress_status_output = _saved_suppress_status
     discard_memory = getattr(agent, "_discard_governed_external_memory", None)
     if callable(discard_memory):
         discard_memory()

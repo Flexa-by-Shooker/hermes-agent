@@ -605,6 +605,12 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if stop_event is not None:
         stop_event.set()
 
+    if not session.get("running"):
+        try:
+            _flush_supervised_blocked_queue(session)
+        except Exception:
+            session["_supervised_blocked_persistence_failed"] = True
+
     agent = session.get("agent")
     lock = session.get("history_lock")
     try:
@@ -695,7 +701,13 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
 
     if agent is not None and history and hasattr(agent, "commit_memory_session"):
         try:
-            agent.commit_memory_session(history)
+            memory_history = _supervised_safe_history(
+                session,
+                history,
+                platform="desktop-memory-history",
+            )
+            if memory_history:
+                agent.commit_memory_session(memory_history)
         except Exception:
             pass
 
@@ -2106,6 +2118,7 @@ def _persist_branch_seed(session: dict) -> None:
         return
     with session["history_lock"]:
         seed = [dict(msg) for msg in (session.get("history") or [])]
+    seed = _supervised_safe_history(session, seed, platform="desktop-branch")
     if not seed:
         return
     with _session_db(session) as db:
@@ -3401,7 +3414,11 @@ def _compress_session_history(
         with session["history_lock"]:
             before_messages = list(session.get("history", []))
             history_version = int(session.get("history_version", 0))
-    history = before_messages
+    history = _supervised_safe_history(
+        session,
+        before_messages,
+        platform="desktop-compression-history",
+    )
     if len(history) < 4:
         usage = _get_usage(agent)
         return 0, usage
@@ -5738,7 +5755,10 @@ def _(rid, params: dict) -> dict:
     # + skeleton panel, then build the real AIAgent just after this response is
     # flushed.  This keeps startup responsive while still hydrating tools/skills
     # without requiring the user to submit a first prompt.
-    _schedule_agent_build(sid)
+    from hermes_cli.flexa_governed import supervised_disclosure_mode
+
+    if not supervised_disclosure_mode():
+        _schedule_agent_build(sid)
     _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
 
     return _ok(
@@ -6088,6 +6108,16 @@ def _(rid, params: dict) -> dict:
             target = tip
             found = db.get_session(target) or found
 
+    from hermes_cli.flexa_governed import (
+        supervised_disclosure_mode,
+        supervised_session_lineage_qualified,
+    )
+
+    if supervised_disclosure_mode() and not supervised_session_lineage_qualified(
+        found
+    ):
+        return _err(rid, 4030, "session is unavailable in supervised profiles")
+
     profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
         profile_home
     )
@@ -6234,7 +6264,10 @@ def _(rid, params: dict) -> dict:
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
 
-        _schedule_agent_build(sid)
+        from hermes_cli.flexa_governed import supervised_disclosure_mode
+
+        if not supervised_disclosure_mode():
+            _schedule_agent_build(sid)
         _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
 
         messages = _history_to_messages(display_history)
@@ -8548,8 +8581,22 @@ def _(rid, params: dict) -> dict:
     if db is None:
         return _db_unavailable_error(rid, code=5008)
     old_key = session["session_key"]
+    from hermes_cli.flexa_governed import (
+        supervised_disclosure_mode,
+        supervised_session_lineage_qualified,
+    )
+
+    if supervised_disclosure_mode() and not supervised_session_lineage_qualified(
+        db.get_session(old_key)
+    ):
+        return _err(rid, 4030, "session is unavailable in supervised profiles")
     with session["history_lock"]:
         history = [dict(msg) for msg in session.get("history", [])]
+    history = _supervised_safe_history(
+        session,
+        history,
+        platform="desktop-branch-history",
+    )
     if not history:
         return _err(rid, 4008, "nothing to branch — send a message first")
     new_key = _new_session_key()
@@ -8914,6 +8961,10 @@ def _(rid, params: dict) -> dict:
     it on its next iteration. No interrupt, no new user turn, no role
     alternation violation.
     """
+    from hermes_cli.flexa_governed import supervised_disclosure_mode
+
+    if supervised_disclosure_mode():
+        return _err(rid, 4030, "session.steer is unavailable in supervised profiles")
     text = (params.get("text") or "").strip()
     if not text:
         return _err(rid, 4002, "text is required")
@@ -8942,6 +8993,220 @@ def _(rid, params: dict) -> dict:
 # ── Methods: prompt ──────────────────────────────────────────────────
 
 
+def _supervised_prompt_preflight(
+    session: dict,
+    sid: str,
+    text: Any,
+) -> str | None:
+    """Return a fixed response before any prompt-side runtime work."""
+
+    from hermes_cli.flexa_governed import (
+        ensure_governed_content_free_logging,
+        supervised_disclosure_mode,
+    )
+
+    if not supervised_disclosure_mode():
+        return None
+    ensure_governed_content_free_logging()
+    from hermes_cli.flexa_supervised_disclosure import (
+        supervised_disclosure_preflight,
+    )
+
+    home_token = None
+    profile_home = str(session.get("profile_home") or "").strip()
+    if profile_home:
+        home_token = set_hermes_home_override(profile_home)
+    try:
+        return supervised_disclosure_preflight(
+            text,
+            session_id=str(session.get("session_key") or sid),
+            platform="desktop-tui",
+        )
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+
+
+def _persist_supervised_blocked_prompt(
+    session: dict,
+    text: str,
+    fixed_response: str,
+    *,
+    event_sid: str,
+    cols: int,
+) -> bool:
+    """Persist now, or queue behind the active turn without a DB race.
+
+    Returns ``True`` when queued. The active turn flushes the queue only after
+    its own agent persistence has completed, preserving chronological order and
+    preventing a later snapshot write from deleting the deterministic pair.
+    """
+
+    session_key = str(session.get("session_key") or "").strip()
+    if not session_key or not isinstance(text, str) or not isinstance(fixed_response, str):
+        raise RuntimeError("supervised blocked prompt is invalid")
+    with session["history_lock"]:
+        if session.get("running"):
+            session.setdefault("_supervised_blocked_queue", []).append(
+                {
+                    "text": text,
+                    "fixed_response": fixed_response,
+                    "event_sid": event_sid,
+                    "cols": cols,
+                }
+            )
+            session["last_active"] = time.time()
+            return True
+        _persist_supervised_blocked_turns_locked(
+            session,
+            [(text, fixed_response)],
+        )
+        session["last_active"] = time.time()
+        return False
+
+
+def _supervised_blocked_rows(
+    turns: list[tuple[str, str]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for text, fixed_response in turns:
+        rows.extend(
+            [
+                {
+                    "role": "user",
+                    "content": text,
+                    "effect_disposition": "flexa_disclosure_blocked",
+                    "_db_persisted": True,
+                },
+                {
+                    "role": "assistant",
+                    "content": fixed_response,
+                    "effect_disposition": "flexa_disclosure_blocked",
+                    "_db_persisted": True,
+                },
+            ]
+        )
+    return rows
+
+
+def _persist_supervised_blocked_turns_locked(
+    session: dict,
+    turns: list[tuple[str, str]],
+) -> None:
+    session_key = str(session.get("session_key") or "").strip()
+    with _session_db(session) as db:
+        if db is None:
+            raise RuntimeError("supervised session store is unavailable")
+        db.create_session(session_key, source="desktop")
+        db.append_text_turns_atomic(session_key, turns)
+    session.setdefault("history", []).extend(_supervised_blocked_rows(turns))
+    session["history_version"] = int(session.get("history_version", 0)) + 1
+
+
+def _flush_supervised_blocked_queue(session: dict) -> None:
+    """Serialize blocked turns after the active agent snapshot is durable."""
+
+    with session["history_lock"]:
+        pending = list(session.get("_supervised_blocked_queue") or [])
+        if not pending:
+            return
+        turns: list[tuple[str, str]] = []
+        for item in pending:
+            if not isinstance(item, dict):
+                raise RuntimeError("supervised blocked queue is invalid")
+            text = item.get("text")
+            fixed_response = item.get("fixed_response")
+            if not isinstance(text, str) or not isinstance(fixed_response, str):
+                raise RuntimeError("supervised blocked queue item is invalid")
+            turns.append((text, fixed_response))
+        _persist_supervised_blocked_turns_locked(session, turns)
+        session["_supervised_blocked_queue"] = []
+    for item in pending:
+        _emit_supervised_blocked_prompt(
+            str(item.get("event_sid") or session.get("_sid") or ""),
+            str(item["fixed_response"]),
+            int(item.get("cols") or 80),
+        )
+
+
+def _emit_supervised_blocked_prompt(
+    sid: str,
+    fixed_response: str,
+    cols: int,
+) -> None:
+    _emit("message.start", sid)
+    payload = {
+        "text": fixed_response,
+        "status": "complete",
+        "disclosure_blocked": True,
+    }
+    rendered = render_message(fixed_response, cols)
+    if rendered:
+        payload["rendered"] = rendered
+    _emit("message.complete", sid, payload)
+
+
+def _discard_supervised_blocked_attachments(session: dict, text: str) -> None:
+    """Delete only attachments staged for this rejected prompt, unread."""
+
+    claim_id = _claim_accepted_prompt_attachments(session, text)
+    _cleanup_prompt_attachment_claim(session, claim_id)
+
+
+def _supervised_safe_history(
+    session: dict,
+    history: Any,
+    *,
+    platform: str,
+) -> list[dict[str, Any]]:
+    """Return history safe for model-derived and cross-session consumers."""
+
+    from hermes_cli.flexa_governed import supervised_disclosure_mode
+
+    rows = list(history or [])
+    if not supervised_disclosure_mode():
+        return rows
+    from hermes_cli.flexa_supervised_disclosure import (
+        filter_supervised_disclosure_history,
+    )
+
+    return filter_supervised_disclosure_history(
+        rows,
+        session_id=str(session.get("session_key") or ""),
+        platform=platform,
+    )
+
+
+def _supervised_display_history(
+    session: dict,
+    audit_history: list[dict[str, Any]],
+    model_history: list[dict[str, Any]],
+    result_history: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep blocked audit rows visible without returning them to the model.
+
+    A normal result retains the supplied conversation prefix. If a provider or
+    compression path rewrites that prefix, the durable database remains the
+    authoritative audit trail and the rewritten safe result becomes the live
+    context; blocked rows are never reintroduced into model-derived history.
+    """
+
+    from hermes_cli.flexa_governed import supervised_disclosure_mode
+
+    if not supervised_disclosure_mode():
+        return result_history
+    if (
+        len(result_history) >= len(model_history)
+        and result_history[: len(model_history)] == model_history
+    ):
+        return [*audit_history, *result_history[len(model_history) :]]
+    return _supervised_safe_history(
+        session,
+        result_history,
+        platform="desktop-result-history",
+    )
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     sid, text = params.get("session_id", ""), params.get("text", "")
@@ -8949,6 +9214,54 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    from hermes_cli.flexa_governed import supervised_disclosure_mode
+
+    if (
+        supervised_disclosure_mode()
+        and not session.get("running")
+        and session.get("_supervised_blocked_queue")
+    ):
+        try:
+            _flush_supervised_blocked_queue(session)
+        except Exception:
+            session["_supervised_blocked_persistence_failed"] = True
+            return _err(rid, 5033, "supervised disclosure persistence failed")
+    if supervised_disclosure_mode() and (
+        not isinstance(text, str) or not text.strip()
+    ):
+        return _err(rid, 4002, "text is required")
+    try:
+        fixed_response = _supervised_prompt_preflight(session, sid, text)
+    except Exception:
+        return _err(rid, 5032, "supervised disclosure preflight failed")
+    if fixed_response is not None:
+        if (t := current_transport()) is not None:
+            session["transport"] = t
+        try:
+            _discard_supervised_blocked_attachments(session, text)
+            queued = _persist_supervised_blocked_prompt(
+                session,
+                text,
+                fixed_response,
+                event_sid=sid,
+                cols=int(session.get("cols", 80)),
+            )
+        except Exception:
+            return _err(rid, 5033, "supervised disclosure persistence failed")
+        if queued:
+            return _ok(
+                rid,
+                {"status": "queued", "disclosure_blocked": True},
+            )
+        _emit_supervised_blocked_prompt(
+            sid,
+            fixed_response,
+            int(session.get("cols", 80)),
+        )
+        return _ok(
+            rid,
+            {"status": "complete", "disclosure_blocked": True},
+        )
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
     # or fallback moved the session transport to stdio.
@@ -9409,7 +9722,9 @@ def _wire_agent_terminal_output() -> None:
         return ""
 
     def _emit_agent_terminal_output(session, chunk):
-        if _flexa_governed_mode():
+        from hermes_cli.flexa_governed import disclosure_boundary_mode
+
+        if disclosure_boundary_mode():
             return
         _emit(
             "agent.terminal.output",
@@ -9451,10 +9766,15 @@ def _run_prompt_submit(
     attachment_claim_id: str | None = None,
 ) -> None:
     with session["history_lock"]:
-        history = list(session["history"])
+        audit_history = list(session["history"])
         history_version = int(session.get("history_version", 0))
         if not isinstance(session.get("inflight_turn"), dict):
             _start_inflight_turn(session, text)
+    history = _supervised_safe_history(
+        session,
+        audit_history,
+        platform="desktop-model-history",
+    )
     agent = session["agent"]
     if hasattr(agent, "clear_interrupt"):
         try:
@@ -9468,6 +9788,9 @@ def _run_prompt_submit(
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
+        disclosure_blocked = False
+        supervised_preblocked = False
+        blocked_flush_failed = False
         images: list[str] = []
         attachment_display_names: dict[str, str] = {}
         turn_file_upload_ids: set[str] = set()
@@ -9487,27 +9810,43 @@ def _run_prompt_submit(
             _profile_home_str = session.get("profile_home")
             if _profile_home_str:
                 home_token = set_hermes_home_override(_profile_home_str)
-            (
-                images,
-                attachment_display_names,
-                claimed_file_ids,
-            ) = _activate_prompt_attachment_claim(session, attachment_claim_id)
-            turn_file_upload_ids.update(claimed_file_ids)
+            from hermes_cli.flexa_governed import supervised_disclosure_mode
+
+            if supervised_disclosure_mode():
+                from hermes_cli.flexa_supervised_disclosure import (
+                    supervised_disclosure_preflight,
+                )
+
+                supervised_preblocked = supervised_disclosure_preflight(
+                    text,
+                    session_id=str(session.get("session_key") or sid),
+                    platform="desktop-tui",
+                ) is not None
+            if not supervised_preblocked:
+                (
+                    images,
+                    attachment_display_names,
+                    claimed_file_ids,
+                ) = _activate_prompt_attachment_claim(session, attachment_claim_id)
+                turn_file_upload_ids.update(claimed_file_ids)
             # The sudo password callback is thread-local (tools.terminal_tool
             # _callback_tls), so wiring it on the build thread doesn't reach this
             # turn thread — terminal sudo prompts would fall through to /dev/tty
             # and hang the headless gateway. Re-wire here so the prompt routes to
             # the sudo.request overlay. Secret capture is ContextVar-scoped, so
             # re-wiring also binds it to this exact profile turn.
-            _wire_callbacks(sid)
-            _sync_agent_model_with_config(sid, session)
-            cwd = _session_cwd(session)
-            _register_session_cwd(session)
+            if not supervised_preblocked:
+                _wire_callbacks(sid)
+                _sync_agent_model_with_config(sid, session)
+                cwd = _session_cwd(session)
+                _register_session_cwd(session)
+            else:
+                cwd = ""
             cols = session.get("cols", 80)
             streamer = make_stream_renderer(cols)
             prompt = text
 
-            if isinstance(prompt, str) and "@" in prompt:
+            if not supervised_preblocked and isinstance(prompt, str) and "@" in prompt:
                 from agent.context_references import preprocess_context_references
                 from agent.flexa_enforcement import FlexaEnforcementError
                 from agent.model_metadata import get_model_context_length
@@ -9643,7 +9982,7 @@ def _run_prompt_submit(
 
             run_kwargs = {
                 "conversation_history": list(history),
-                "stream_callback": _stream,
+                "stream_callback": None if supervised_preblocked else _stream,
             }
             try:
                 if "task_id" in inspect.signature(agent.run_conversation).parameters:
@@ -9667,17 +10006,20 @@ def _run_prompt_submit(
                 run_message = GovernedAttachmentPrompt(
                     str(run_message), cleanup_ids
                 )
-            from agent.flexa_enforcement import channel_ingress as _flexa_channel_ingress
+            if supervised_preblocked:
+                governed_run_message = run_message
+            else:
+                from agent.flexa_enforcement import channel_ingress as _flexa_channel_ingress
 
-            governed_run_message = _flexa_channel_ingress(
-                agent,
-                run_message,
-                platform="desktop-tui",
-                session_id=session["session_key"],
-                persistence_content=(
-                    str(run_message) if governed_attachment_ids else None
-                ),
-            )
+                governed_run_message = _flexa_channel_ingress(
+                    agent,
+                    run_message,
+                    platform="desktop-tui",
+                    session_id=session["session_key"],
+                    persistence_content=(
+                        str(run_message) if governed_attachment_ids else None
+                    ),
+                )
             if governed_image_ids:
                 from agent.flexa_enforcement import (
                     FlexaEnforcementError,
@@ -9744,7 +10086,13 @@ def _run_prompt_submit(
                         "managed image input failed"
                     ) from exc
             result = agent.run_conversation(governed_run_message, **run_kwargs)
-            if "moa_one_shot_restore" in session:
+            disclosure_blocked = bool(
+                isinstance(result, dict)
+                and result.get("disclosure_blocked") is True
+            )
+            if supervised_preblocked and not disclosure_blocked:
+                raise RuntimeError("supervised blocked preflight lost its trusted result")
+            if not disclosure_blocked and "moa_one_shot_restore" in session:
                 _restore = session.pop("moa_one_shot_restore", None)
                 # Restore the model the user was on before the /moa one-shot.
                 # The one-shot did a real in-place agent.switch_model() to MoA
@@ -9793,7 +10141,12 @@ def _run_prompt_submit(
                     with session["history_lock"]:
                         current_version = int(session.get("history_version", 0))
                         if current_version == history_version:
-                            session["history"] = result["messages"]
+                            session["history"] = _supervised_display_history(
+                                session,
+                                audit_history,
+                                history,
+                                result["messages"],
+                            )
                             session["history_version"] = history_version + 1
                         else:
                             # History mutated externally during the turn
@@ -9821,9 +10174,10 @@ def _run_prompt_submit(
                 # applied to the continuation. Restart slash worker so subsequent
                 # worker-backed commands (/title etc.) target the live session.
                 # Fix for #20001.
-                _sync_session_key_after_compress(
-                    sid, session, clear_pending_title=False, restart_slash_worker=True,
-                )
+                if not disclosure_blocked:
+                    _sync_session_key_after_compress(
+                        sid, session, clear_pending_title=False, restart_slash_worker=True,
+                    )
 
                 raw = result.get("final_response", "")
                 status = (
@@ -9870,7 +10224,12 @@ def _run_prompt_submit(
             # ("✓ Goal achieved" / "⏸ budget exhausted") is surfaced as
             # a system line so the user sees progress regardless of
             # outcome. Mirrors gateway/run._post_turn_goal_continuation.
-            if status == "complete" and isinstance(raw, str) and raw.strip():
+            if (
+                not disclosure_blocked
+                and status == "complete"
+                and isinstance(raw, str)
+                and raw.strip()
+            ):
                 try:
                     from hermes_cli.goals import GoalManager
 
@@ -9916,7 +10275,7 @@ def _run_prompt_submit(
 
             # Apply pending_title now that the DB row exists.
             _pending = session.get("pending_title")
-            if _pending and status == "complete":
+            if _pending and status == "complete" and not disclosure_blocked:
                 _pdb = _get_db()
                 if _pdb:
                     _session_key = session.get("session_key") or sid
@@ -9936,6 +10295,8 @@ def _run_prompt_submit(
                         pass
 
             if (
+                not disclosure_blocked
+                and
                 status == "complete"
                 and isinstance(raw, str)
                 and raw.strip()
@@ -9951,7 +10312,11 @@ def _run_prompt_submit(
                         _title_key,
                         text,
                         raw,
-                        session.get("history", []),
+                        _supervised_safe_history(
+                            session,
+                            session.get("history", []),
+                            platform="desktop-title-history",
+                        ),
                         # Push the generated title live so the sidebar renames
                         # without waiting for the next list refresh (the titler
                         # runs async, after this turn's refresh already fired).
@@ -9967,6 +10332,8 @@ def _run_prompt_submit(
             # calls / reasoning already stream separately and would be
             # noisy to read aloud.
             if (
+                not disclosure_blocked
+                and
                 status == "complete"
                 and isinstance(raw, str)
                 and raw.strip()
@@ -10054,15 +10421,25 @@ def _run_prompt_submit(
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             _clear_session_context(session_tokens)
+            try:
+                _flush_supervised_blocked_queue(session)
+            except Exception:
+                blocked_flush_failed = True
+                session["_supervised_blocked_persistence_failed"] = True
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
                 _clear_inflight_turn(session)
-            _emit("session.info", sid, _session_info(agent, session))
+            if not disclosure_blocked and not blocked_flush_failed:
+                _emit("session.info", sid, _session_info(agent, session))
+            if blocked_flush_failed:
+                _emit("error", sid, {"message": "managed persistence failed"})
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
         # the goal judge / notifications re-evaluate at the end of that turn.
+        if disclosure_blocked:
+            return
         if _drain_queued_prompt(rid, sid, session):
             return
 
@@ -11377,7 +11754,9 @@ def _cleanup_prompt_attachment_claim(session: dict, claim_id: str | None) -> Non
             if isinstance(item, dict) and item.get("attachment_id")
         }
         attachment_ids.update(claim.get("files", {}))
-        if _flexa_governed_mode():
+        from hermes_cli.flexa_governed import disclosure_boundary_mode
+
+        if disclosure_boundary_mode():
             token = _governed_attachment_home(session)
             try:
                 from agent.flexa_enforcement import delete_governed_upload
@@ -13936,6 +14315,10 @@ _paste_counter = 0
 @method("paste.collapse")
 def _(rid, params: dict) -> dict:
     global _paste_counter
+    from hermes_cli.flexa_governed import supervised_disclosure_mode
+
+    if supervised_disclosure_mode():
+        return _err(rid, 4030, "paste.collapse is unavailable in supervised profiles")
     text = params.get("text", "")
     if not text:
         return _err(rid, 4004, "empty paste")

@@ -28,6 +28,8 @@ _SIDECAR = re.compile(r"^http://enforcement-[a-z0-9][a-z0-9-]{0,62}:8081$")
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
 _LOG_FACTORY_LOCK = threading.Lock()
 _LOG_FACTORY_INSTALLED = False
+SUPERVISED_DISCLOSURE_LINEAGE_FIELD = "_flexa_disclosure_boundary_version"
+SUPERVISED_DISCLOSURE_LINEAGE_VERSION = "1"
 
 
 class GovernedProfileError(RuntimeError):
@@ -54,11 +56,60 @@ def governed_mode() -> bool:
     return os.environ.get("FLEXA_GOVERNED_MODE", "").strip().lower() == "true"
 
 
+def supervised_disclosure_mode() -> bool:
+    return (
+        os.environ.get("FLEXA_SUPERVISED_DISCLOSURE_BOUNDARY", "")
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+
+def disclosure_boundary_mode() -> bool:
+    """Return whether a signed pre-persistence disclosure boundary is required."""
+
+    return governed_mode() or supervised_disclosure_mode()
+
+
+def stamp_supervised_session_config(value: Any) -> dict[str, Any] | None:
+    """Stamp new supervised lineages without upgrading pre-existing rows."""
+
+    if not supervised_disclosure_mode():
+        return value
+    if value is None:
+        stamped: dict[str, Any] = {}
+    elif isinstance(value, dict):
+        stamped = dict(value)
+    else:
+        raise GovernedProfileError("supervised session config is invalid")
+    stamped[SUPERVISED_DISCLOSURE_LINEAGE_FIELD] = (
+        SUPERVISED_DISCLOSURE_LINEAGE_VERSION
+    )
+    return stamped
+
+
+def supervised_session_lineage_qualified(row: Any) -> bool:
+    """Return exact proof that a durable session began under this boundary."""
+
+    if not isinstance(row, dict):
+        return False
+    raw = row.get("model_config")
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(value, dict)
+        and value.get(SUPERVISED_DISCLOSURE_LINEAGE_FIELD)
+        == SUPERVISED_DISCLOSURE_LINEAGE_VERSION
+    )
+
+
 def ensure_governed_content_free_logging() -> None:
     """Make every in-process log record content-free in governed runtimes."""
 
     global _LOG_FACTORY_INSTALLED
-    if not governed_mode() or _LOG_FACTORY_INSTALLED:
+    if not disclosure_boundary_mode() or _LOG_FACTORY_INSTALLED:
         return
     with _LOG_FACTORY_LOCK:
         if _LOG_FACTORY_INSTALLED:
@@ -67,7 +118,7 @@ def ensure_governed_content_free_logging() -> None:
 
         def content_free_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
             record = previous_factory(*args, **kwargs)
-            if governed_mode():
+            if disclosure_boundary_mode():
                 record.msg = "governed runtime event"
                 record.args = ()
                 record.exc_info = None
@@ -459,6 +510,78 @@ _GOVERNED_RPC_ALLOWLIST = frozenset({
 })
 
 
+_SUPERVISED_RPC_ALLOWLIST = frozenset({
+    # Minimal Desktop conversation lifecycle. Every new upstream RPC remains
+    # denied until Flexa explicitly reviews and adds it here.
+    "session.create",
+    "session.list",
+    "session.most_recent",
+    "session.resume",
+    "session.activate",
+    "session.title",
+    "session.usage",
+    "session.status",
+    "session.history",
+    "session.close",
+    "session.branch",
+    "session.interrupt",
+    "prompt.submit",
+    "terminal.resize",
+    # Clarification answers are context-dependent model input, so the entire
+    # surface remains unavailable until the signed boundary can bind and
+    # classify the stored question, choices, and answer together.
+    # All responder RPCs remain unavailable until request kind and owning
+    # session are cryptographically bound to the nonce at dispatch.
+    # Safe connection readiness projections used by Desktop.
+    "setup.status",
+    "setup.runtime_check",
+})
+
+
+def _validate_supervised_metadata(value: Any, label: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str):
+        raise GovernedProfileError(f"{label} must be text")
+    if len(value) > 160 or any(ord(char) < 32 for char in value):
+        raise GovernedProfileError(f"{label} is invalid")
+
+
+def _authorize_supervised_rpc(method: str, params: dict[str, Any]) -> None:
+    if method not in _SUPERVISED_RPC_ALLOWLIST:
+        raise GovernedProfileError("RPC method is unavailable in a supervised profile")
+
+    if {"messages", "cwd"}.intersection(params):
+        raise GovernedProfileError("RPC runtime overrides are unavailable")
+    desktop_lifecycle = method in {"session.create", "session.resume"}
+    if desktop_lifecycle:
+        source = str(params.get("source") or "").strip()
+        if source and source != "desktop":
+            raise GovernedProfileError("supervised session source is invalid")
+        if params.get("lazy"):
+            raise GovernedProfileError("supervised lazy sessions are unavailable")
+        for key in ("model", "provider", "reasoning_effort", "fast"):
+            params.pop(key, None)
+    elif method == "setup.runtime_check":
+        params.pop("provider", None)
+        if {"model", "reasoning_effort", "fast"}.intersection(params):
+            raise GovernedProfileError("RPC runtime overrides are unavailable")
+    elif {"model", "provider", "reasoning_effort", "fast"}.intersection(params):
+        raise GovernedProfileError("RPC runtime overrides are unavailable")
+
+    if method in {"session.create", "session.title"}:
+        _validate_supervised_metadata(params.get("title"), "session title")
+    if method == "session.create" and params.get("parent_session_id"):
+        raise GovernedProfileError("supervised seeded sessions are unavailable")
+    if method == "session.branch":
+        _validate_supervised_metadata(params.get("name"), "branch name")
+    if (
+        method == "prompt.submit"
+        and params.get("truncate_before_user_ordinal") is not None
+    ):
+        raise GovernedProfileError("supervised transcript editing is unavailable")
+
+
 def _path_within_workspace(value: str, workspace: str) -> bool:
     if not value or "\x00" in value:
         return False
@@ -481,14 +604,21 @@ def authorize_governed_rpc(method: str, params: dict[str, Any]) -> ManagedProfil
     connection-scoped HERMES_HOME; request JSON may not hop profiles.
     """
 
-    if not governed_mode():
+    if not disclosure_boundary_mode():
         return None
-    if method not in _GOVERNED_RPC_ALLOWLIST:
+    supervised = supervised_disclosure_mode()
+    if supervised and method not in _SUPERVISED_RPC_ALLOWLIST:
+        raise GovernedProfileError("RPC method is unavailable in a supervised profile")
+    if not supervised and method not in _GOVERNED_RPC_ALLOWLIST:
         raise GovernedProfileError("RPC method is unavailable in a managed profile")
     profile, binding = binding_for_current_home()
     requested_profile = str(params.get("profile") or "").strip()
     if requested_profile and requested_profile != profile.slug:
         raise GovernedProfileError("RPC profile does not match the connection binding")
+    if supervised:
+        _authorize_supervised_rpc(method, params)
+        return profile
+
     desktop_lifecycle = method in {"session.create", "session.resume"}
     source = str(params.get("source") or "").strip()
     if desktop_lifecycle:
@@ -671,7 +801,7 @@ def redact_governed_rpc_response(method: str, response: Any) -> Any:
     or backend exception text to a managed client.
     """
 
-    if not governed_mode() or not isinstance(response, dict):
+    if not disclosure_boundary_mode() or not isinstance(response, dict):
         return response
     if "error" in response:
         result = dict(response)

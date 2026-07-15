@@ -50,7 +50,14 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
-    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+    from hermes_cli.flexa_governed import (
+        disclosure_boundary_mode as _flexa_disclosure_boundary_mode,
+        governed_mode as _flexa_governed_mode,
+        supervised_disclosure_mode as _flexa_supervised_mode,
+    )
+
+    _governed = _flexa_governed_mode()
+    _supervised = _flexa_supervised_mode() and not _governed
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -170,18 +177,19 @@ def finalize_turn(
     # killing the turn.
     _cleanup_errors = []
     _response_transformed = False
+    _disclosure_blocked = False
 
     # Governed profiles buffer the entire response, then pass it through the
     # sole signed profile hook before any assistant text is persisted. The
     # hook reclassifies the original user message at this final boundary, so
     # it does not rely solely on process-local pre-hook state.
-    if final_response and not interrupted and _flexa_governed_mode():
-        _raw_final_response = final_response
+    if (_governed and final_response and not interrupted) or _supervised:
+        _raw_final_response = final_response or ""
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
                 "transform_llm_output",
-                response_text=final_response,
+                response_text=_raw_final_response,
                 session_id=agent.session_id or "",
                 user_message=original_user_message,
                 model=agent.model,
@@ -194,10 +202,16 @@ def finalize_turn(
             ]
             if len(_safe_results) != 1:
                 raise RuntimeError("governed disclosure transform returned no unique result")
-            final_response = _safe_results[0]
-            _response_transformed = final_response != _raw_final_response
+            _safe_result = _safe_results[0]
+            _blocked_marker = getattr(_safe_result, "flexa_blocked", None)
+            if not isinstance(_blocked_marker, bool):
+                raise RuntimeError("disclosure transform omitted its signed decision")
+            _disclosure_blocked = _blocked_marker
+            final_response = str(_safe_result)
+            _response_transformed = _disclosure_blocked or final_response != _raw_final_response
         except Exception as exc:
             logger.error("governed disclosure transform failed: %s", exc, exc_info=True)
+            _disclosure_blocked = True
             _original_text = (
                 original_user_message if isinstance(original_user_message, str) else ""
             )
@@ -228,7 +242,7 @@ def finalize_turn(
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
-    if not _flexa_governed_mode():
+    if not _flexa_disclosure_boundary_mode():
         try:
             agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
         except Exception as _save_err:
@@ -286,7 +300,21 @@ def finalize_turn(
             if _tail_role != "assistant":
                 messages.append({"role": "assistant", "content": final_response})
 
-        agent._persist_session(messages, conversation_history)
+        if _supervised:
+            from hermes_cli.flexa_supervised_disclosure import (
+                persist_sanitized_turn,
+                sanitize_current_turn,
+            )
+
+            sanitize_current_turn(
+                messages,
+                final_response,
+                turn_id,
+                blocked=_disclosure_blocked,
+            )
+            persist_sanitized_turn(agent, messages, conversation_history)
+        else:
+            agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
@@ -350,7 +378,7 @@ def finalize_turn(
     # Gate: only applied when a real text response exists for this
     # turn and the user didn't interrupt.  Empty/interrupted turns
     # already have other surface text that shouldn't be augmented.
-    if final_response and not interrupted and not _flexa_governed_mode():
+    if final_response and not interrupted and not _flexa_disclosure_boundary_mode():
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
             if _failed and agent._file_mutation_verifier_enabled():
@@ -376,7 +404,7 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted and not _flexa_governed_mode():
+    if not interrupted and not _flexa_disclosure_boundary_mode():
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
@@ -421,7 +449,7 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted and not _flexa_governed_mode():
+    if final_response and not interrupted and not _flexa_disclosure_boundary_mode():
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
@@ -443,7 +471,7 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
     # to an external memory system).
-    if final_response and not interrupted and not _flexa_governed_mode():
+    if final_response and not interrupted and not _flexa_disclosure_boundary_mode():
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _invoke_hook(
@@ -490,6 +518,7 @@ def finalize_turn(
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
+        "disclosure_blocked": _disclosure_blocked,
         "model": agent.model,
         "provider": agent.provider,
         "base_url": agent.base_url,
@@ -534,25 +563,28 @@ def finalize_turn(
 
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.
     _should_review_skills = False
-    if (agent._skill_nudge_interval > 0
+    if (not _disclosure_blocked
+            and agent._skill_nudge_interval > 0
             and agent._iters_since_skill >= agent._skill_nudge_interval
             and "skill_manage" in agent.valid_tool_names):
         _should_review_skills = True
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message,
-        final_response=final_response,
-        interrupted=interrupted,
-        messages=messages,
-    )
+    if not _disclosure_blocked:
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+            messages=messages,
+        )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
     if (
         final_response
         and not interrupted
+        and not _disclosure_blocked
         and not _flexa_governed_mode()
         and (_should_review_memory or _should_review_skills)
     ):
@@ -575,7 +607,7 @@ def finalize_turn(
     # Plugin hook: on_session_end
     # Fired at the very end of every run_conversation call.
     # Plugins can use this for cleanup, flushing buffers, etc.
-    if not _flexa_governed_mode():
+    if not _flexa_governed_mode() and not _disclosure_blocked:
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _invoke_hook(

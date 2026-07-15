@@ -160,7 +160,10 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
-    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+    from hermes_cli.flexa_governed import (
+        disclosure_boundary_mode as _flexa_disclosure_boundary_mode,
+        governed_mode as _flexa_governed_mode,
+    )
 
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
@@ -343,7 +346,7 @@ def build_turn_context(
 
     # Add user message.
     user_msg = {"role": "user", "content": user_message}
-    if _flexa_governed_mode():
+    if _flexa_disclosure_boundary_mode():
         user_msg[GOVERNED_TURN_MARKER_FIELD] = turn_id
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
@@ -505,7 +508,7 @@ def build_turn_context(
                 if not _compressor.should_compress(_preflight_tokens):
                     break
 
-    if _flexa_governed_mode():
+    if _flexa_disclosure_boundary_mode():
         current_turn_user_idx = governed_current_user_index(messages, turn_id)
         agent._persist_user_message_idx = current_turn_user_idx
 

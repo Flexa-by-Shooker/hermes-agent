@@ -850,9 +850,9 @@ class AIAgent:
         - output is explicitly rerouted via ``_print_fn``; or
         - stdout is a real TTY.
         """
-        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+        from hermes_cli.flexa_governed import disclosure_boundary_mode
 
-        if _flexa_governed_mode():
+        if disclosure_boundary_mode():
             return False
         if self._print_fn is not None:
             return True
@@ -1967,6 +1967,7 @@ class AIAgent:
                     tool_name=msg.get("tool_name"),
                     tool_calls=tool_calls_data,
                     tool_call_id=msg.get("tool_call_id"),
+                    effect_disposition=msg.get("effect_disposition"),
                     finish_reason=msg.get("finish_reason"),
                     reasoning=msg.get("reasoning") if role == "assistant" else None,
                     reasoning_content=msg.get("reasoning_content") if role == "assistant" else None,
