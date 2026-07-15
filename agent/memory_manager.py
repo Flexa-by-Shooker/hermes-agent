@@ -81,6 +81,14 @@ def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
 
 def memory_provider_tools_enabled(enabled_toolsets: Optional[List[str]]) -> bool:
     """Return whether external memory-provider tools should be exposed."""
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    # Provider schemas do not declare read-vs-write effects, and governed
+    # profiles currently have no scope-bound external write approver.  Hide the
+    # entire provider tool surface until that contract exists; prefetch remains
+    # the governed read path.
+    if _flexa_governed_mode():
+        return False
     if enabled_toolsets is None:
         return True
     if not enabled_toolsets:
@@ -99,6 +107,10 @@ def memory_provider_tools_enabled(enabled_toolsets: Optional[List[str]]) -> bool
 
 def inject_memory_provider_tools(agent: Any) -> int:
     """Append external memory-provider tool schemas to an agent tool surface."""
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode():
+        return 0
     memory_manager = getattr(agent, "_memory_manager", None)
     tools = getattr(agent, "tools", None)
     if not memory_manager or tools is None:
@@ -466,6 +478,10 @@ class MemoryManager:
                 if block and block.strip():
                     blocks.append(block)
             except Exception as e:
+                from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+                if _flexa_governed_mode():
+                    raise
                 logger.warning(
                     "Memory provider '%s' system_prompt_block() failed: %s",
                     provider.name, e,
@@ -590,6 +606,13 @@ class MemoryManager:
         before turn N+1; provider implementations don't need their own
         ordering guarantees.
         """
+        from hermes_cli.flexa_governed import (
+            governed_mode as _flexa_governed_mode,
+            require_governed_memory_write_approval,
+        )
+
+        if _flexa_governed_mode():
+            require_governed_memory_write_approval(operation="turn-sync")
         providers = list(self._providers)
         if not providers:
             return
@@ -622,8 +645,6 @@ class MemoryManager:
                         "Memory provider '%s' sync_turn failed: %s",
                         provider.name, e,
                     )
-
-        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
 
         if _flexa_governed_mode():
             _run()
@@ -715,7 +736,11 @@ class MemoryManager:
         :meth:`add_provider`, so the manager must not advertise a schema it
         will never route. Built-ins always win (#40466).
         """
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
         from toolsets import _HERMES_CORE_TOOLS
+
+        if _flexa_governed_mode():
+            return []
 
         _core_tool_names = set(_HERMES_CORE_TOOLS)
         schemas = []
@@ -738,6 +763,10 @@ class MemoryManager:
                         schemas.append(schema)
                         seen.add(name)
             except Exception as e:
+                from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+                if _flexa_governed_mode():
+                    raise
                 logger.warning(
                     "Memory provider '%s' get_tool_schemas() failed: %s",
                     provider.name, e,
@@ -760,12 +789,26 @@ class MemoryManager:
         Returns JSON string result. Raises ValueError if no provider
         handles the tool.
         """
+        from hermes_cli.flexa_governed import (
+            governed_mode as _flexa_governed_mode,
+            require_governed_memory_write_approval,
+        )
+
+        if _flexa_governed_mode():
+            # Provider schemas have no trustworthy effect classification, so a
+            # model-facing provider call could be a write even when its name
+            # looks read-only.  Block before dispatch; never ask the provider.
+            require_governed_memory_write_approval(operation="provider-tool")
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
         try:
             return provider.handle_tool_call(tool_name, args, **kwargs)
         except Exception as e:
+            from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+            if _flexa_governed_mode():
+                raise
             logger.error(
                 "Memory provider '%s' handle_tool_call(%s) failed: %s",
                 provider.name, tool_name, e,
@@ -902,6 +945,10 @@ class MemoryManager:
                     **kwargs,
                 )
             except Exception as e:
+                from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+                if _flexa_governed_mode():
+                    raise
                 logger.debug(
                     "Memory provider '%s' on_session_switch failed: %s",
                     provider.name, e,
@@ -920,6 +967,10 @@ class MemoryManager:
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
+                from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+                if _flexa_governed_mode():
+                    raise
                 logger.debug(
                     "Memory provider '%s' on_pre_compress failed: %s",
                     provider.name, e,
@@ -963,6 +1014,13 @@ class MemoryManager:
 
         Skips the builtin provider itself (it's the source of the write).
         """
+        from hermes_cli.flexa_governed import (
+            governed_mode as _flexa_governed_mode,
+            require_governed_memory_write_approval,
+        )
+
+        if _flexa_governed_mode():
+            require_governed_memory_write_approval(operation="memory-bridge")
         for provider in self._providers:
             if provider.name == "builtin":
                 continue
@@ -1031,6 +1089,14 @@ class MemoryManager:
         """
         if not self._memory_tool_result_succeeded(tool_result):
             return
+
+        from hermes_cli.flexa_governed import (
+            governed_mode as _flexa_governed_mode,
+            require_governed_memory_write_approval,
+        )
+
+        if _flexa_governed_mode():
+            require_governed_memory_write_approval(operation="memory-tool")
 
         target = str(tool_args.get("target") or "memory")
         operations = tool_args.get("operations")
@@ -1160,6 +1226,10 @@ class MemoryManager:
             try:
                 provider.initialize(session_id=session_id, **kwargs)
             except Exception as e:
+                from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+                if _flexa_governed_mode():
+                    raise
                 logger.warning(
                     "Memory provider '%s' initialize failed: %s",
                     provider.name, e,

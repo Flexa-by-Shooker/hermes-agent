@@ -5704,8 +5704,10 @@ def run_conversation(
         if _contains_governed_native_data(sanitized):
             raise FlexaEnforcementError("managed output contains native image data")
         commit_memory = getattr(agent, "_commit_governed_external_memory", None)
-        if callable(commit_memory):
-            commit_memory(turn_id=governed_turn_id)
+        if not callable(commit_memory):
+            raise FlexaEnforcementError("managed memory commit is unavailable")
+        if commit_memory(turn_id=governed_turn_id) is not True:
+            raise FlexaEnforcementError("managed memory commit was not confirmed")
         final_messages = _copy_safe_governed_messages(safe_staging)
         final_messages.append({"role": "assistant", "content": sanitized})
         scrub_reasoning(final_messages)

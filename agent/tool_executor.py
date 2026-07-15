@@ -1757,6 +1757,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
                 _mem_result = function_result
             except Exception as tool_error:
+                from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+                if _flexa_governed_mode():
+                    raise
                 function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
                 logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
             finally:

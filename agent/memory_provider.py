@@ -48,6 +48,18 @@ class MemoryProvider(ABC):
     def name(self) -> str:
         """Short identifier for this provider (e.g. 'builtin', 'honcho', 'hindsight')."""
 
+    @property
+    def governed_scope_version(self) -> str:
+        """Governed Flexa scope contract supported by this provider.
+
+        Empty by default so existing providers cannot be selected for a
+        managed Flexa profile accidentally. A reviewed adapter must override
+        this with ``"1"`` and consume the ``flexa_scope`` initialize kwarg
+        before it is eligible for governed use.
+        """
+
+        return ""
+
     # -- Core lifecycle (implement these) ------------------------------------
 
     @abstractmethod
@@ -80,6 +92,9 @@ class MemoryProvider(ABC):
           - parent_session_id (str): For subagents, the parent's session_id.
           - user_id (str): Platform user identifier (gateway sessions).
           - user_id_alt (str): Optional alternate stable platform user identifier.
+          - flexa_scope (dict): Signed tenant/employee plus authenticated
+            principal scope. Present only for governed Flexa profiles and only
+            for providers declaring ``governed_scope_version == "1"``.
         """
 
     def system_prompt_block(self) -> str:

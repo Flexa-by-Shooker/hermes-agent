@@ -647,6 +647,9 @@ def compress_context(
         try:
             agent._memory_manager.on_pre_compress(messages)
         except Exception:
+            if _flexa_governed_mode():
+                _release_lock()
+                raise
             pass
 
     try:
@@ -938,6 +941,8 @@ def compress_context(
                     reason="compression",
                 )
         except Exception as _me_err:
+            if _flexa_governed_mode():
+                raise
             logger.debug("memory manager on_session_switch (compression): %s", _me_err)
 
         # Warn on repeated compressions (quality degrades with each pass).

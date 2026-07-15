@@ -24,10 +24,13 @@ _SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _EMPLOYEE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _RELEASE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_MEMORY_PROVIDER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SIDECAR = re.compile(r"^http://enforcement-[a-z0-9][a-z0-9-]{0,62}:8081$")
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
 _LOG_FACTORY_LOCK = threading.Lock()
 _LOG_FACTORY_INSTALLED = False
+GOVERNED_MEMORY_MODE = "governed_external"
+GOVERNED_MEMORY_SCOPE_VERSION = "1"
 SUPERVISED_DISCLOSURE_LINEAGE_FIELD = "_flexa_disclosure_boundary_version"
 SUPERVISED_DISCLOSURE_LINEAGE_VERSION = "1"
 
@@ -419,6 +422,120 @@ def _strict_yaml(path: Path) -> dict[str, Any]:
     return value
 
 
+def validate_governed_memory_config(value: Any, *, exact: bool = False) -> str:
+    """Return the signed external provider name or fail closed.
+
+    Managed Flexa profiles must never fall back to Hermes' flat
+    ``MEMORY.md``/``USER.md`` stores.  The provider itself is selected by the
+    signed managed config so the runtime adapter can be versioned separately,
+    but the mode and every native-memory guard are fixed here.
+    """
+
+    required_keys = {
+        "mode",
+        "memory_enabled",
+        "user_profile_enabled",
+        "write_approval",
+        "provider",
+    }
+    if (
+        not isinstance(value, dict)
+        or not required_keys.issubset(value)
+        or (exact and set(value) != required_keys)
+    ):
+        raise GovernedProfileError("managed memory config is not canonical")
+    provider = value.get("provider")
+    if (
+        value.get("mode") != GOVERNED_MEMORY_MODE
+        or value.get("memory_enabled") is not False
+        or value.get("user_profile_enabled") is not False
+        or value.get("write_approval") is not True
+        or not isinstance(provider, str)
+        or not _MEMORY_PROVIDER.fullmatch(provider)
+    ):
+        raise GovernedProfileError("managed memory config is not canonical")
+    return provider
+
+
+def governed_memory_scope(
+    *,
+    platform: str,
+    user_id: Any,
+    user_id_alt: Any = None,
+) -> dict[str, str]:
+    """Build the immutable scope handed to a governed memory provider.
+
+    ``user_id`` and ``user_id_alt`` must come from the authenticated transport
+    adapter, never message/RPC content.  Desktop/TUI currently supplies no such
+    identity and therefore fails here instead of collapsing users into a
+    shared native ``USER.md``.
+    """
+
+    profile, _binding = binding_for_current_home()
+    namespace = str(platform or "").strip()
+    principal = str(user_id_alt or user_id or "").strip()
+    if (
+        not namespace
+        or len(namespace) > 128
+        or "\x00" in namespace
+        or not namespace.isprintable()
+        or not principal
+        or len(principal) > 512
+        or "\x00" in principal
+        or not principal.isprintable()
+    ):
+        raise GovernedProfileError("authenticated memory principal is required")
+    return {
+        "schema_version": GOVERNED_MEMORY_SCOPE_VERSION,
+        "tenant_id": profile.tenant_id,
+        "employee_id": profile.employee_id,
+        "profile_slug": profile.slug,
+        "principal_namespace": namespace,
+        "principal_id": principal,
+        "release_id": profile.release_id,
+        "bundle_signing_payload_sha256": profile.bundle_signing_payload_sha256,
+    }
+
+
+def require_governed_memory_provider(provider: Any) -> None:
+    """Require an adapter that explicitly consumes the governed scope v1."""
+
+    try:
+        version = provider.governed_scope_version
+    except Exception as exc:
+        raise GovernedProfileError(
+            "memory provider does not support governed scope"
+        ) from exc
+    if version != GOVERNED_MEMORY_SCOPE_VERSION:
+        raise GovernedProfileError("memory provider does not support governed scope")
+
+
+def require_governed_memory_write_approval(*, operation: str) -> None:
+    """Fail closed until governed external-memory writes have a safe approver.
+
+    Hermes' existing ``memory.write_approval`` implementation stages plaintext
+    payloads under the writable profile home and relies on interactive slash
+    commands to approve them.  Neither boundary is acceptable for a managed
+    Flexa profile: the pending payload would sit outside the signed memory
+    provider and the approval commands are deliberately absent from the
+    governed RPC allowlist.
+
+    The signed managed config therefore keeps ``write_approval: true`` as a
+    mandatory policy declaration, while this seam categorically blocks every
+    external-memory write.  A later coordinated rollout may replace this guard
+    only with a verified, scope-bound approval token/handler.  ``operation`` is
+    intentionally not echoed so errors and logs remain content-free.
+    """
+
+    if not governed_mode():
+        return
+    if not isinstance(operation, str) or not operation.strip():
+        raise GovernedProfileError("managed memory write operation is invalid")
+    raise GovernedProfileError(
+        "managed external memory write approval is unavailable"
+    )
+
+
 def _verify_profile_assets(home: Path, profile: ManagedProfile) -> dict[str, Any]:
     from hermes_cli.managed_scope import get_managed_dir
 
@@ -442,9 +559,20 @@ def _verify_profile_assets(home: Path, profile: ManagedProfile) -> dict[str, Any
     metadata = _strict_yaml(metadata_path)
     binding = _strict_yaml(binding_path)
     expected_workspace = f"/workspaces/{profile.employee_id}"
+    try:
+        provider = validate_governed_memory_config(config.get("memory"), exact=True)
+    except GovernedProfileError as exc:
+        raise GovernedProfileError("managed profile config is not canonical") from exc
     if config != {
         "skills": {"external_dirs": ["/opt/hermes/skills"]},
         "terminal": {"cwd": expected_workspace},
+        "memory": {
+            "mode": GOVERNED_MEMORY_MODE,
+            "memory_enabled": False,
+            "user_profile_enabled": False,
+            "write_approval": True,
+            "provider": provider,
+        },
     }:
         raise GovernedProfileError("managed profile config is not canonical")
     if "flexa" in config:

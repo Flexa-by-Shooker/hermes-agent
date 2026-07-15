@@ -3477,6 +3477,11 @@ class AIAgent:
         persist the exchange) and ``queue_prefetch_all`` (to start
         warming context for the next turn) in one shot.
 
+        Governed profiles are deliberately different: they never stage or
+        persist the raw exchange here. They record only a ``no_write`` decision
+        bound to the current turn and session; the sync and prefetch behavior
+        described in this docstring applies only to non-governed profiles.
+
         Uses ``original_user_message`` rather than ``user_message``
         because the latter may carry injected skill content that bloats
         or breaks provider queries.
@@ -3497,6 +3502,21 @@ class AIAgent:
         """
         if interrupted:
             return
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            if not self._memory_manager:
+                raise RuntimeError("managed memory provider is unavailable")
+            turn_id = str(getattr(self, "_flexa_turn_id", "") or "")
+            session_id = str(self.session_id or "")
+            if not turn_id or not session_id:
+                raise RuntimeError("managed memory no-write decision is unbound")
+            self._flexa_pending_memory_decision = {
+                "decision": "no_write",
+                "turn_id": turn_id,
+                "session_id": session_id,
+            }
+            return
         if not (self._memory_manager and final_response and original_user_message):
             return
         # Multimodal turns carry content as a list of typed parts; providers
@@ -3505,30 +3525,6 @@ class AIAgent:
         user_text = _summarize_user_message_for_log(original_user_message, sep="\n")
         response_text = _summarize_user_message_for_log(final_response, sep="\n")
         if not (user_text and response_text):
-            return
-        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
-
-        if _flexa_governed_mode():
-            from agent.flexa_enforcement import memory_candidate
-
-            user_text = memory_candidate(
-                self,
-                user_text,
-                action="sync-user",
-                target="external-memory",
-            )
-            response_text = memory_candidate(
-                self,
-                response_text,
-                action="sync-assistant",
-                target="external-memory",
-            )
-            self._flexa_pending_memory_commit = {
-                "turn_id": str(getattr(self, "_flexa_turn_id", "") or ""),
-                "session_id": str(self.session_id or ""),
-                "user_text": user_text,
-                "response_text": response_text,
-            }
             return
         try:
             sync_kwargs = {"session_id": self.session_id or ""}
@@ -3547,51 +3543,35 @@ class AIAgent:
             pass
 
     def _commit_governed_external_memory(self, *, turn_id: str) -> bool:
-        """Best-effort commit of one exact pre-authorized turn candidate.
-
-        External memory providers do not offer a cross-provider transaction.
-        A partial provider write therefore must not hide an already-approved
-        assistant output or trigger an automatic retry.  The pending record is
-        consumed exactly once and failures become content-free incidents.
-        """
+        """Consume one exact, turn-bound managed ``no_write`` decision."""
 
         from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
 
         if not _flexa_governed_mode():
             return False
-        pending = getattr(self, "_flexa_pending_memory_commit", None)
+        pending = getattr(self, "_flexa_pending_memory_decision", None)
         if pending is None:
-            return False
+            raise RuntimeError("managed memory no-write decision is missing")
         try:
-            delattr(self, "_flexa_pending_memory_commit")
+            delattr(self, "_flexa_pending_memory_decision")
         except AttributeError:
             pass
         if (
             not isinstance(pending, dict)
-            or set(pending) != {"turn_id", "session_id", "user_text", "response_text"}
+            or set(pending) != {"decision", "turn_id", "session_id"}
+            or pending["decision"] != "no_write"
             or pending["turn_id"] != str(turn_id or "")
             or pending["session_id"] != str(self.session_id or "")
-            or not isinstance(pending["user_text"], str)
-            or not isinstance(pending["response_text"], str)
             or not self._memory_manager
         ):
-            raise RuntimeError("managed memory commit is invalid")
-        try:
-            self._memory_manager.sync_all(
-                pending["user_text"],
-                pending["response_text"],
-                session_id=pending["session_id"],
-            )
-            return True
-        except Exception:
-            logger.error("governed external memory commit failed")
-            return False
+            raise RuntimeError("managed memory no-write decision is invalid")
+        return True
 
     def _discard_governed_external_memory(self) -> None:
-        """Forget an uncommitted candidate on block, failure or interruption."""
+        """Forget an unconsumed decision on block, failure or interruption."""
 
         try:
-            delattr(self, "_flexa_pending_memory_commit")
+            delattr(self, "_flexa_pending_memory_decision")
         except AttributeError:
             pass
 
