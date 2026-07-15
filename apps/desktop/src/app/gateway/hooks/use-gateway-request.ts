@@ -1,11 +1,31 @@
-import { isGatewayReauthRequired, resolveGatewayWsUrl } from '@hermes/shared'
+import { isGatewayReauthRequired } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useRef } from 'react'
 
+import type { HermesConnection } from '@/global'
 import type { HermesGateway } from '@/hermes'
-import { $gateway, ensureActiveGatewayOpen, isActivePrimary } from '@/store/gateway'
+import {
+  exactConnectionProfile,
+  GatewayConnectionSupersededError,
+  resolveDesktopGatewayWsUrl,
+  sameConnectionIdentity
+} from '@/lib/desktop-gateway-connection'
+import type { GatewayRequest, GatewayRequestCall } from '@/lib/gateway-request'
+import {
+  $gateway,
+  ensureExactSecondaryGatewayOpen,
+  gatewayMatchesConnection,
+  isExactPrimaryGateway
+} from '@/store/gateway'
+import { $gatewaySwitching } from '@/store/gateway-switch'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $gatewayState, setConnection } from '@/store/session'
+import { $connection, $gatewayState, setConnection } from '@/store/session'
+
+interface GatewayBinding {
+  connection: HermesConnection
+  gateway: HermesGateway
+  profile: string
+}
 
 export function useGatewayRequest() {
   const gatewayState = useStore($gatewayState)
@@ -16,7 +36,12 @@ export function useGatewayRequest() {
   )
 
   const gatewayStateRef = useRef(gatewayState)
-  const reconnectingRef = useRef<Promise<HermesGateway | null> | null>(null)
+  const reconnectingRef = useRef<
+    | (GatewayBinding & {
+        promise: Promise<HermesGateway | null>
+      })
+    | null
+  >(null)
   // Holds the reauth error from the most recent failed reconnect so
   // requestGateway can surface the gateway's "session expired, sign in again"
   // message instead of the opaque "connection closed" that triggered the retry.
@@ -36,73 +61,140 @@ export function useGatewayRequest() {
     []
   )
 
-  const ensureGatewayOpen = useCallback(async () => {
-    const existing = gatewayRef.current
+  const captureActiveBinding = useCallback((): GatewayBinding => {
+    const gateway = gatewayRef.current
+    const connection = $connection.get()
+    const profile = ($activeGatewayProfile.get() || '').trim() || 'default'
 
-    if (!existing) {
-      return null
+    if (
+      $gatewaySwitching.get() ||
+      !gateway ||
+      !connection ||
+      exactConnectionProfile(connection) !== profile ||
+      !gatewayMatchesConnection(gateway, connection)
+    ) {
+      throw new GatewayConnectionSupersededError('Hermes changed gateways before the request could be pinned.')
     }
 
-    if (gatewayStateRef.current === 'open') {
-      return existing
-    }
+    return { connection, gateway, profile }
+  }, [])
 
-    if (reconnectingRef.current) {
-      return reconnectingRef.current
-    }
+  const bindingIsActive = useCallback(
+    (binding: GatewayBinding): boolean =>
+      !$gatewaySwitching.get() &&
+      gatewayRef.current === binding.gateway &&
+      $activeGatewayProfile.get() === binding.profile &&
+      sameConnectionIdentity($connection.get(), binding.connection) &&
+      gatewayMatchesConnection(binding.gateway, binding.connection),
+    []
+  )
 
-    reconnectingRef.current = (async () => {
-      const desktop = window.hermesDesktop
+  const ensureGatewayOpen = useCallback(
+    async (binding: GatewayBinding): Promise<HermesGateway | null> => {
+      const { connection: originConnection, gateway: existing, profile: targetProfile } = binding
 
-      if (!desktop) {
+      if (!bindingIsActive(binding)) {
         return null
       }
 
-      reauthErrorRef.current = null
-
-      try {
-        // Reconnect to whichever profile the gateway is currently routed to (not
-        // always the primary), so a sleep/wake reconnect keeps the user on the
-        // profile they were chatting in.
-        const conn = await desktop.getConnection($activeGatewayProfile.get())
-        connectionRef.current = conn
-        setConnection(conn)
-        // Re-mint the WS URL before reconnecting. OAuth tickets are single-use
-        // and short-lived, so the cached conn.wsUrl ticket is dead here;
-        // resolveGatewayWsUrl() throws a reauth error in OAuth mode rather than
-        // connecting with a stale ticket. Stash it so requestGateway can show
-        // the actionable "sign in again" message.
-        const wsUrl = await resolveGatewayWsUrl(desktop, conn)
-        await existing.connect(wsUrl)
-
+      if (gatewayStateRef.current === 'open') {
         return existing
-      } catch (error) {
-        if (isGatewayReauthRequired(error)) {
-          reauthErrorRef.current = error
+      }
+
+      const reconnecting = reconnectingRef.current
+
+      if (reconnecting) {
+        return sameConnectionIdentity(reconnecting.connection, originConnection) && reconnecting.gateway === existing
+          ? reconnecting.promise
+          : null
+      }
+
+      const task = (async () => {
+        const desktop = window.hermesDesktop
+
+        if (!desktop) {
+          return null
         }
 
-        connectionRef.current = null
-        setConnection(null)
+        reauthErrorRef.current = null
 
-        return null
+        try {
+          const conn = await desktop.getConnection(targetProfile)
+
+          if (
+            !bindingIsActive(binding) ||
+            exactConnectionProfile(conn) !== targetProfile ||
+            !sameConnectionIdentity(conn, originConnection)
+          ) {
+            return null
+          }
+          const wsUrl = await resolveDesktopGatewayWsUrl(desktop, conn)
+
+          if (!bindingIsActive(binding)) {
+            return null
+          }
+
+          await existing.connect(wsUrl)
+
+          if (!bindingIsActive(binding)) {
+            return null
+          }
+
+          connectionRef.current = conn
+          setConnection(conn)
+
+          return existing
+        } catch (error) {
+          if (isGatewayReauthRequired(error)) {
+            reauthErrorRef.current = error
+          }
+
+          if (bindingIsActive(binding)) {
+            connectionRef.current = null
+            setConnection(null)
+          }
+
+          return null
+        }
+      })()
+
+      reconnectingRef.current = { ...binding, promise: task }
+
+      try {
+        return await task
       } finally {
-        reconnectingRef.current = null
+        if (reconnectingRef.current?.promise === task) {
+          reconnectingRef.current = null
+        }
       }
-    })()
+    },
+    [bindingIsActive]
+  )
 
-    return reconnectingRef.current
-  }, [])
+  const pinGateway = useCallback((): GatewayRequestCall => {
+    const binding = captureActiveBinding()
+
+    return async <T>(method: string, params = {}, timeoutMs?: number, signal?: AbortSignal): Promise<T> => {
+      if (!gatewayMatchesConnection(binding.gateway, binding.connection)) {
+        throw new GatewayConnectionSupersededError('The originating Hermes gateway is no longer available.')
+      }
+
+      return binding.gateway.request<T>(method, params, timeoutMs, signal)
+    }
+  }, [captureActiveBinding])
 
   const requestGateway = useCallback(
     async <T>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number, signal?: AbortSignal) => {
-      const gateway = gatewayRef.current
-
-      if (!gateway) {
-        throw new Error('Hermes gateway unavailable')
-      }
+      const binding = captureActiveBinding()
 
       try {
-        return await gateway.request<T>(method, params, timeoutMs, signal)
+        const result = await binding.gateway.request<T>(method, params, timeoutMs, signal)
+
+        if (!bindingIsActive(binding)) {
+          throw new GatewayConnectionSupersededError('Hermes changed profiles before the request completed.')
+        }
+
+        return result
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
 
@@ -110,12 +202,15 @@ export function useGatewayRequest() {
           throw error
         }
 
-        // Primary keeps the OAuth-aware reconnect (remote gateways re-mint a
-        // single-use ticket); background profiles are always local pool
-        // backends, so the registry handles their reconnect with no reauth.
-        const recovered = isActivePrimary() ? await ensureGatewayOpen() : await ensureActiveGatewayOpen()
+        if (!bindingIsActive(binding)) {
+          throw new GatewayConnectionSupersededError('Hermes changed profiles before the request retry.')
+        }
 
-        if (!recovered) {
+        const recovered = isExactPrimaryGateway(binding.gateway, binding.profile)
+          ? await ensureGatewayOpen(binding)
+          : await ensureExactSecondaryGatewayOpen(binding.profile, binding.gateway, binding.connection)
+
+        if (!recovered || recovered !== binding.gateway || !bindingIsActive(binding)) {
           // Prefer the reauth error from the failed reconnect (OAuth session
           // expired) over the generic transport error that triggered the retry.
           const reauthError = reauthErrorRef.current
@@ -128,11 +223,19 @@ export function useGatewayRequest() {
           throw error
         }
 
-        return recovered.request<T>(method, params, timeoutMs, signal)
+        const result = await recovered.request<T>(method, params, timeoutMs, signal)
+
+        if (!bindingIsActive(binding)) {
+          throw new GatewayConnectionSupersededError('Hermes changed profiles before the request completed.')
+        }
+
+        return result
       }
     },
-    [ensureGatewayOpen]
-  )
+    [bindingIsActive, captureActiveBinding, ensureGatewayOpen]
+  ) as GatewayRequest
+
+  requestGateway.pin = pinGateway
 
   return { connectionRef, gatewayRef, requestGateway }
 }

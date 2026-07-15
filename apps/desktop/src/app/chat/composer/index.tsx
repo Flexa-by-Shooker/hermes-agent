@@ -6,6 +6,7 @@ import { composerFill, composerSurfaceGlass } from '@/components/chat/composer-d
 import { Button } from '@/components/ui/button'
 import { useI18n } from '@/i18n'
 import { chatMessageText } from '@/lib/chat-messages'
+import { composerSessionScope } from '@/lib/composer-scope'
 import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
 import { triggerHaptic } from '@/lib/haptics'
 import { cn } from '@/lib/utils'
@@ -15,7 +16,7 @@ import { POPOUT_WIDTH_REM } from '@/store/composer-popout'
 import { removeQueuedPrompt } from '@/store/composer-queue'
 import { $activeSessionAwaitingInput } from '@/store/prompts'
 import { toggleReview } from '@/store/review'
-import { $gatewayState, $messages } from '@/store/session'
+import { $connection, $gatewayState, $messages } from '@/store/session'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { $autoSpeakReplies } from '@/store/voice-prefs'
 import { useTheme } from '@/themes'
@@ -90,7 +91,8 @@ export function ChatBar({
   // would discard a question the user may want to come back to. The blocking
   // prompt owns its own dismissal (Skip, Reject, dialog close).
   const awaitingInput = useStore($activeSessionAwaitingInput)
-  const activeQueueSessionKey = queueSessionKey || sessionId || null
+  const connection = useStore($connection)
+  const activeQueueSessionKey = composerSessionScope(connection, queueSessionKey || sessionId || null)
 
   // Status items (subagents, background processes) are keyed by the RUNTIME
   // session id — gateway events and process.list both speak that id. Only the

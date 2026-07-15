@@ -37,6 +37,26 @@ from agent.model_metadata import (
 
 logger = logging.getLogger(__name__)
 
+GOVERNED_TURN_MARKER_FIELD = "_hermes_governed_current_turn"
+
+
+def governed_current_user_index(
+    messages: List[Dict[str, Any]],
+    turn_marker: str,
+) -> int:
+    """Return the uniquely marked current governed user message or fail closed."""
+
+    matches = [
+        index
+        for index, message in enumerate(messages)
+        if isinstance(message, dict)
+        and message.get("role") == "user"
+        and message.get(GOVERNED_TURN_MARKER_FIELD) == turn_marker
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("managed current-turn marker is unavailable")
+    return matches[0]
+
 
 def _compression_made_progress(
     orig_len: int, new_len: int, orig_tokens: int, new_tokens: int
@@ -140,6 +160,8 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -215,7 +237,9 @@ def build_turn_context(
     # Generate unique task_id if not provided to isolate VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
-    turn_id = f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+    turn_id = getattr(agent, "_flexa_turn_id", None) or (
+        f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+    )
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
 
@@ -258,7 +282,11 @@ def build_turn_context(
     agent.iteration_budget = IterationBudget(agent.max_iterations)
 
     # Log conversation turn start for debugging/observability.
-    _preview_text = summarize_user_message_for_log(user_message)
+    _preview_text = (
+        "[redacted]"
+        if _flexa_governed_mode()
+        else summarize_user_message_for_log(user_message)
+    )
     _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
     _msg_preview = _msg_preview.replace("\n", " ")
     logger.info(
@@ -315,6 +343,8 @@ def build_turn_context(
 
     # Add user message.
     user_msg = {"role": "user", "content": user_message}
+    if _flexa_governed_mode():
+        user_msg[GOVERNED_TURN_MARKER_FIELD] = turn_id
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
@@ -475,6 +505,10 @@ def build_turn_context(
                 if not _compressor.should_compress(_preflight_tokens):
                     break
 
+    if _flexa_governed_mode():
+        current_turn_user_idx = governed_current_user_index(messages, turn_id)
+        agent._persist_user_message_idx = current_turn_user_idx
+
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
@@ -547,8 +581,10 @@ def build_turn_context(
         agent._interrupt_message = None
         agent._interrupt_thread_signal_pending = False
 
-    # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager:
+    # Notify memory providers of the new turn (BEFORE prefetch_all in normal
+    # Hermes mode). Governed mode defers the potentially stateful hook until
+    # after its retrieval result and candidate input have both been approved.
+    if agent._memory_manager and not _flexa_governed_mode():
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -558,11 +594,32 @@ def build_turn_context(
     # External memory provider: prefetch once before the tool loop.
     ext_prefetch_cache = ""
     if agent._memory_manager:
-        try:
-            _query = original_user_message if isinstance(original_user_message, str) else ""
+        _query = original_user_message if isinstance(original_user_message, str) else ""
+        if _flexa_governed_mode():
+            from agent.flexa_enforcement import memory_candidate, memory_retrieval
+
             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
-        except Exception:
-            pass
+            if ext_prefetch_cache:
+                ext_prefetch_cache = memory_retrieval(
+                    agent,
+                    ext_prefetch_cache,
+                    target="external-prefetch",
+                )
+            governed_turn_message = memory_candidate(
+                agent,
+                _query,
+                action="turn-start",
+                target="external-memory",
+            )
+            agent._memory_manager.on_turn_start(
+                agent._user_turn_count,
+                governed_turn_message,
+            )
+        else:
+            try:
+                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+            except Exception:
+                pass
 
     return TurnContext(
         user_message=user_message,

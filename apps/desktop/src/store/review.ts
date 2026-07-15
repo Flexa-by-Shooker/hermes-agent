@@ -8,6 +8,7 @@ import { desktopGit } from '@/lib/desktop-git'
 import { isExcludedPath } from '@/lib/excluded-paths'
 import { requestOneShot } from '@/lib/oneshot'
 import { Codecs, persistentAtom } from '@/lib/persisted'
+import { registerTenantRuntimeReset } from '@/lib/tenant-runtime-reset'
 
 import { refreshRepoStatus } from './coding-status'
 import { $busy, $currentCwd } from './session'
@@ -88,6 +89,7 @@ const repoCwd = (): null | string => $currentCwd.get()?.trim() || null
 type ReviewBridge = NonNullable<NonNullable<NonNullable<Window['hermesDesktop']>['git']>['review']>
 let reviewRefreshSeq = 0
 let reviewRefreshTimer: ReturnType<typeof setTimeout> | null = null
+let reviewDiffSeq = 0
 let shipInfoSeq = 0
 let shipInfoLastCheckedAt = 0
 
@@ -177,6 +179,7 @@ function scheduleReviewRefresh(): void {
 }
 
 export async function selectReviewFile(file: HermesReviewFile): Promise<void> {
+  const seq = (reviewDiffSeq += 1)
   $reviewSelectedPath.set(file.path)
 
   const ctx = reviewCtx()
@@ -192,21 +195,22 @@ export async function selectReviewFile(file: HermesReviewFile): Promise<void> {
   try {
     const diff = await ctx.review.diff(ctx.cwd, file.path, 'uncommitted', null, file.staged)
 
-    if ($reviewSelectedPath.get() === file.path) {
+    if (seq === reviewDiffSeq && $reviewSelectedPath.get() === file.path && repoCwd() === ctx.cwd) {
       $reviewDiff.set(diff || '')
     }
   } catch {
-    if ($reviewSelectedPath.get() === file.path) {
+    if (seq === reviewDiffSeq && $reviewSelectedPath.get() === file.path && repoCwd() === ctx.cwd) {
       $reviewDiff.set('')
     }
   } finally {
-    if ($reviewSelectedPath.get() === file.path) {
+    if (seq === reviewDiffSeq && $reviewSelectedPath.get() === file.path && repoCwd() === ctx.cwd) {
       $reviewDiffLoading.set(false)
     }
   }
 }
 
 export function clearReviewSelection(): void {
+  reviewDiffSeq += 1
   $reviewSelectedPath.set(null)
   $reviewDiff.set(null)
   $reviewDiffLoading.set(false)
@@ -367,6 +371,33 @@ export async function commitChanges(message: string, opts: { push?: boolean } = 
 // it, so a stale resolve is ignored. The model call can't be aborted
 // server-side — we just drop its result and free the UI immediately.
 let commitGenSeq = 0
+
+/** Clear tenant-owned review content and invalidate every in-flight read/generation. */
+export function resetReviewForTenantSwitch(): void {
+  reviewRefreshSeq += 1
+  reviewDiffSeq += 1
+  shipInfoSeq += 1
+  commitGenSeq += 1
+
+  if (reviewRefreshTimer) {
+    clearTimeout(reviewRefreshTimer)
+    reviewRefreshTimer = null
+  }
+
+  shipInfoLastCheckedAt = 0
+  $reviewFiles.set([])
+  $reviewIsRepo.set(true)
+  $reviewLoading.set(false)
+  $reviewSelectedPath.set(null)
+  $reviewDiff.set(null)
+  $reviewDiffLoading.set(false)
+  $reviewShipInfo.set({ ghReady: false, pr: null })
+  $reviewShipBusy.set(false)
+  $reviewCommitMsgBusy.set(false)
+  $reviewRevertTarget.set(undefined)
+}
+
+registerTenantRuntimeReset(resetReviewForTenantSwitch)
 
 /** Abandon any in-flight commit-message generation and re-enable the input. */
 export function cancelCommitMessage(): void {

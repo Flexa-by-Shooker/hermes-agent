@@ -1,5 +1,7 @@
 import { atom } from 'nanostores'
 
+import { sameComposerGatewayScope } from '@/lib/composer-scope'
+
 import type { ComposerAttachment } from './composer'
 
 export interface QueuedPromptEntry {
@@ -11,7 +13,7 @@ export interface QueuedPromptEntry {
 
 type QueueState = Record<string, QueuedPromptEntry[]>
 
-const STORAGE_KEY = 'hermes.desktop.composerQueue.v1'
+const STORAGE_KEY = 'hermes.desktop.composerQueue.v2'
 
 const load = (): QueueState => {
   if (typeof window === 'undefined') {
@@ -221,6 +223,13 @@ export const migrateQueuedPrompts = (fromKey: string | null | undefined, toKey: 
   const to = sidOf(toKey)
 
   if (!from || !to || from === to) {
+    return false
+  }
+
+  const fromQualified = from.startsWith('hermes-composer:')
+  const toQualified = to.startsWith('hermes-composer:')
+
+  if ((fromQualified || toQualified) && !sameComposerGatewayScope(from, to)) {
     return false
   }
 

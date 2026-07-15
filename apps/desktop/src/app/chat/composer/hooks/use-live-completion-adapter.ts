@@ -1,5 +1,8 @@
 import type { Unstable_TriggerAdapter, Unstable_TriggerItem } from '@assistant-ui/core'
+import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+
+import { $tenantRuntimeEpoch } from '@/store/gateway-switch'
 
 export interface CompletionEntry {
   text: string
@@ -28,6 +31,7 @@ export function useLiveCompletionAdapter(options: {
   toItem: (entry: CompletionEntry, index: number) => Unstable_TriggerItem
 }): { adapter: Unstable_TriggerAdapter; loading: boolean } {
   const { enabled, debounceMs = 60, fetcher, toItem } = options
+  const tenantEpoch = useStore($tenantRuntimeEpoch)
 
   const [state, setState] = useState<{ query: string; items: Unstable_TriggerItem[] }>({
     query: EMPTY_QUERY,
@@ -50,16 +54,12 @@ export function useLiveCompletionAdapter(options: {
   useEffect(() => () => cancelTimer(), [cancelTimer])
 
   useEffect(() => {
-    if (enabled) {
-      return
-    }
-
     cancelTimer()
     pendingQueryRef.current = null
     tokenRef.current += 1
     setLoading(false)
     setState({ query: EMPTY_QUERY, items: [] })
-  }, [cancelTimer, enabled])
+  }, [cancelTimer, enabled, fetcher, tenantEpoch, toItem])
 
   const scheduleFetch = useCallback(
     (query: string) => {

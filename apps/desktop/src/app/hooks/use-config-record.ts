@@ -1,22 +1,40 @@
+import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 
 import { getHermesConfigRecord } from '@/hermes'
-import { queryClient, writeCache } from '@/lib/query-client'
+import { queryClient } from '@/lib/query-client'
+import { $gatewaySwitching, $tenantRuntimeEpoch } from '@/store/gateway-switch'
 import type { HermesConfigRecord } from '@/types/hermes'
 
-// One shared cache for the whole profile config record (`GET /api/config`).
-// Every settings surface (MCP, model, config) reads and writes through this key
-// so a save in one shows in the others, and revisiting a tab paints the cache
-// instead of blanking on a fresh fetch.
-//
-// Distinct from session/hooks/use-hermes-config.ts, which is side-effecting —
-// it pushes personality/cwd/voice/… into the session stores for live chat.
+// One shared cache namespace for the whole profile config record
+// (`GET /api/config`). The tenant epoch suffix keeps a late result from one
+// backend out of another backend's cache.
 export const HERMES_CONFIG_KEY = ['hermes-config-record'] as const
 
-// staleTime 0 → serve cache instantly, background-revalidate on every mount.
-export const useHermesConfigRecord = () =>
-  useQuery({ queryKey: HERMES_CONFIG_KEY, queryFn: getHermesConfigRecord, staleTime: 0 })
+export const hermesConfigKey = (tenantEpoch: number) => [...HERMES_CONFIG_KEY, tenantEpoch] as const
 
-export const setHermesConfigCache = writeCache<HermesConfigRecord>(HERMES_CONFIG_KEY)
+// Reads pause while the mutable REST connection is between tenants. Each
+// runtime epoch receives a distinct key, so an old in-flight result cannot
+// populate or paint the new tenant's configuration.
+export const useHermesConfigRecord = () => {
+  const gatewaySwitching = useStore($gatewaySwitching)
+  const tenantEpoch = useStore($tenantRuntimeEpoch)
+
+  return useQuery({
+    enabled: !gatewaySwitching,
+    queryKey: hermesConfigKey(tenantEpoch),
+    queryFn: getHermesConfigRecord,
+    staleTime: 0
+  })
+}
+
+type HermesConfigUpdater =
+  | HermesConfigRecord
+  | ((current: HermesConfigRecord | undefined) => HermesConfigRecord | undefined)
+
+export const setHermesConfigCache = (update: HermesConfigUpdater, tenantEpoch = $tenantRuntimeEpoch.get()): void =>
+  void queryClient.setQueryData<HermesConfigRecord>(hermesConfigKey(tenantEpoch), current =>
+    typeof update === 'function' ? update(current) : update
+  )
 
 export const invalidateHermesConfig = () => queryClient.invalidateQueries({ queryKey: HERMES_CONFIG_KEY })

@@ -7060,7 +7060,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             
             # Set up message + fatal error handlers
-            adapter.set_message_handler(self._handle_message)
+            from hermes_cli.flexa_governed import governed_mode, primary_profile
+            adapter.set_message_handler(
+                self._make_profile_message_handler(primary_profile().slug)
+                if governed_mode()
+                else self._handle_message
+            )
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -7896,7 +7901,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         del self._failed_platforms[platform]
                         continue
 
-                    adapter.set_message_handler(self._handle_message)
+                    from hermes_cli.flexa_governed import governed_mode, primary_profile
+                    adapter.set_message_handler(
+                        self._make_profile_message_handler(primary_profile().slug)
+                        if governed_mode()
+                        else self._handle_message
+                    )
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -8630,7 +8640,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return a message handler that stamps source.profile then delegates."""
         async def _handler(event):
             try:
-                if getattr(event, "source", None) is not None and not event.source.profile:
+                if getattr(event, "source", None) is not None:
                     event.source.profile = profile_name
             except Exception:
                 pass
@@ -9331,6 +9341,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 steer_text = event.get_command_args().strip()
                 if not steer_text:
                     return "Usage: /steer <prompt>"
+                from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+                if _flexa_governed_mode():
+                    adapter = self._adapter_for_source(source)
+                    if adapter:
+                        queued_event = MessageEvent(
+                            text=steer_text,
+                            message_type=MessageType.TEXT,
+                            source=event.source,
+                            message_id=event.message_id,
+                            channel_prompt=event.channel_prompt,
+                        )
+                        self._enqueue_fifo(_quick_key, queued_event, adapter)
+                    return "Queued for the next governed turn."
                 running_agent = self._running_agents.get(_quick_key)
                 if running_agent is _AGENT_PENDING_SENTINEL:
                     # Agent hasn't started yet — queue as turn-boundary fallback.
@@ -10400,6 +10424,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         video_paths: list[str] = []
 
         if event.media_urls:
+            from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+            if _flexa_governed_mode():
+                from agent.flexa_enforcement import governed_attachment_prompt
+
+                return governed_attachment_prompt(message_text, list(event.media_urls))
             image_paths = []
             audio_paths = []
             for i, path in enumerate(event.media_urls):
@@ -10774,9 +10804,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        _msg_preview = (event.text or "")[:80].replace("\n", " ")
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        _msg_preview = (
+            "[redacted]"
+            if _flexa_governed_mode()
+            else (event.text or "")[:80].replace("\n", " ")
+        )
         _reply_id = getattr(event, "reply_to_message_id", None)
-        _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
+        _reply_txt = (
+            "[redacted]"
+            if _flexa_governed_mode()
+            else (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
+        )
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
@@ -13436,8 +13476,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     fallback_model=self._refresh_fallback_model(),
                 )
                 try:
+                    from agent.flexa_enforcement import channel_ingress as _flexa_channel_ingress
+
+                    governed_prompt = _flexa_channel_ingress(
+                        agent,
+                        enriched_prompt,
+                        platform=platform_key,
+                        session_id=task_id,
+                    )
                     return agent.run_conversation(
-                        user_message=enriched_prompt,
+                        user_message=governed_prompt,
                         task_id=task_id,
                     )
                 finally:
@@ -16981,6 +17029,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         by the /p/<profile>/ URL prefix or a per-credential adapter), falling
         back to the active profile (the multiplexer's own home).
         """
+        from hermes_cli.flexa_governed import governed_mode, primary_profile, verified_profile_home
+        if governed_mode():
+            selected = (source.profile or "").strip() or primary_profile().slug
+            return verified_profile_home(selected)
+
         from hermes_cli.profiles import get_active_profile_name, get_profile_dir
         try:
             name = (source.profile or "").strip() or get_active_profile_name() or "default"
@@ -18907,7 +18960,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                from agent.flexa_enforcement import channel_ingress as _flexa_channel_ingress
+
+                _governed_run_message = _flexa_channel_ingress(
+                    agent,
+                    _api_run_message,
+                    platform=str(getattr(source.platform, "value", source.platform) or "gateway"),
+                    session_id=session_id,
+                    persistence_content=_conversation_kwargs.get("persist_user_message"),
+                )
+                result = agent.run_conversation(_governed_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent

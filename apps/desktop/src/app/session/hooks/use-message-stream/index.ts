@@ -20,6 +20,7 @@ import {
   stripGeneratedImageEchoes
 } from '@/lib/generated-images'
 import { parseTodos } from '@/lib/todos'
+import { $tenantRuntimeEpoch } from '@/store/gateway-switch'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { upsertSubagent } from '@/store/subagents'
@@ -210,6 +211,22 @@ export function useMessageStream({
     flushHandleRef.current = window.setTimeout(runFlush, Math.max(0, STREAM_DELTA_FLUSH_MS - sinceLast))
   }, [flushQueuedDeltas])
 
+  const discardQueuedDeltas = useCallback(() => {
+    const handle = flushHandleRef.current
+
+    if (handle !== null && typeof window !== 'undefined') {
+      window.cancelAnimationFrame?.(handle)
+      window.clearTimeout(handle)
+    }
+
+    flushHandleRef.current = null
+    queuedDeltasRef.current.clear()
+    lastFlushAtRef.current = 0
+    nativeSubagentSessionsRef.current.clear()
+    compactedTurnRef.current.clear()
+    lastCwdInfoSessionRef.current = null
+  }, [])
+
   const queueDelta = useCallback(
     (sessionId: string, key: keyof QueuedStreamDeltas, delta: string) => {
       if (!delta) {
@@ -224,21 +241,9 @@ export function useMessageStream({
     [scheduleDeltaFlush]
   )
 
-  useEffect(
-    () => () => {
-      if (flushHandleRef.current !== null && typeof window !== 'undefined') {
-        if (typeof window.cancelAnimationFrame === 'function') {
-          window.cancelAnimationFrame(flushHandleRef.current)
-        } else {
-          window.clearTimeout(flushHandleRef.current)
-        }
-      }
+  useEffect(() => $tenantRuntimeEpoch.subscribe(discardQueuedDeltas), [discardQueuedDeltas])
 
-      flushHandleRef.current = null
-      flushQueuedDeltas()
-    },
-    [flushQueuedDeltas]
-  )
+  useEffect(() => discardQueuedDeltas, [discardQueuedDeltas])
 
   const appendAssistantDelta = useCallback(
     (sessionId: string, delta: string) => {

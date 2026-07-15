@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
 import { requestComposerSubmit } from '@/app/chat/composer/focus'
 import { Button } from '@/components/ui/button'
@@ -9,6 +9,8 @@ import { SplitButton } from '@/components/ui/split-button'
 import { Textarea } from '@/components/ui/textarea'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
+import { isGatewayConnectionSuperseded } from '@/lib/desktop-gateway-connection'
+import { $tenantRuntimeEpoch } from '@/store/gateway-switch'
 import { notifyError } from '@/store/notifications'
 import {
   $reviewCommitDefault,
@@ -36,9 +38,14 @@ export function ReviewShipBar() {
   const ship = useStore($reviewShipInfo)
   const busy = useStore($reviewShipBusy)
   const generating = useStore($reviewCommitMsgBusy)
+  const tenantEpoch = useStore($tenantRuntimeEpoch)
   const commitDefault = useStore($reviewCommitDefault)
   const [message, setMessage] = useState('')
   const prLabel = ship.pr?.url ? c.openPr : c.createPr
+
+  useEffect(() => {
+    setMessage('')
+  }, [tenantEpoch])
 
   const hasFiles = files.length > 0
   const canCommit = hasFiles && message.trim().length > 0 && !busy
@@ -67,9 +74,15 @@ export function ReviewShipBar() {
       return
     }
 
+    const originEpoch = tenantEpoch
+
     void generateCommitMessage(message)
-      .then(text => text && setMessage(text))
-      .catch(err => notifyError(err, c.generateCommitMessage))
+      .then(text => text && $tenantRuntimeEpoch.get() === originEpoch && setMessage(text))
+      .catch(err => {
+        if ($tenantRuntimeEpoch.get() === originEpoch && !isGatewayConnectionSuperseded(err)) {
+          notifyError(err, c.generateCommitMessage)
+        }
+      })
   }
 
   return (

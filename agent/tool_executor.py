@@ -43,8 +43,9 @@ from tools.terminal_tool import (
 )
 from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
-    maybe_persist_tool_result,
     enforce_turn_budget,
+    fit_inline_only_tool_result,
+    maybe_persist_tool_result,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
@@ -153,6 +154,7 @@ def _emit_terminal_post_tool_call(
     error_type: str | None = None,
     error_message: str | None = None,
     middleware_trace: Optional[list[dict[str, Any]]] = None,
+    governed_approved: bool = False,
 ) -> None:
     try:
         from model_tools import _emit_post_tool_call_hook
@@ -170,6 +172,7 @@ def _emit_terminal_post_tool_call(
             error_type=error_type,
             error_message=error_message,
             middleware_trace=list(middleware_trace or []),
+            governed_approved=governed_approved,
         )
     except Exception:
         pass
@@ -212,6 +215,54 @@ def _emit_cancelled_terminal_post_tool_call(
         middleware_trace=list(middleware_trace or []),
     )
     return result
+
+
+def _close_governed_synthetic_result(
+    agent,
+    *,
+    tool_call,
+    raw_result: Any,
+    effective_task_id: str,
+    status: str,
+    error_type: str,
+) -> tuple[str, Any]:
+    """Authorize a skipped/malformed result without executing the tool."""
+
+    from hermes_cli.flexa_governed import governed_mode
+
+    function_name = tool_call.function.name
+    if not governed_mode():
+        return function_name, raw_result
+    function_args, _malformed = _parse_tool_arguments(tool_call.function.arguments)
+    from agent.flexa_enforcement import tool_proposal, tool_result
+
+    function_name, function_args, operation_id = tool_proposal(
+        agent,
+        function_name,
+        function_args,
+        operation_id=getattr(tool_call, "id", "") or None,
+    )
+    if not getattr(tool_call, "id", ""):
+        tool_call.id = operation_id
+    sanitized_result = tool_result(
+        agent,
+        function_name,
+        raw_result,
+        operation_id=operation_id,
+    )
+    _emit_terminal_post_tool_call(
+        agent,
+        function_name=function_name,
+        function_args=function_args,
+        result=sanitized_result,
+        effective_task_id=effective_task_id,
+        tool_call_id=operation_id,
+        status=status,
+        error_type=error_type,
+        error_message="tool execution did not run",
+        governed_approved=True,
+    )
+    return function_name, sanitized_result
 
 
 def _tool_search_scoped_names(agent) -> frozenset:
@@ -328,6 +379,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     Results are collected in the original tool-call order and appended to
     messages so the API sees them in the expected sequence.
     """
+    from hermes_cli.flexa_governed import governed_mode
+
+    if governed_mode():
+        execute_tool_calls_sequential(
+            agent, assistant_message, messages, effective_task_id, api_call_count
+        )
+        return
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
 
@@ -362,6 +420,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         )
 
         if malformed_args_result is not None:
+            from agent.flexa_enforcement import tool_proposal as _flexa_tool_proposal
+
+            function_name, function_args, _operation_id = _flexa_tool_proposal(
+                agent,
+                function_name,
+                function_args,
+                operation_id=getattr(tool_call, "id", "") or None,
+            )
+            if not getattr(tool_call, "id", ""):
+                tool_call.id = _operation_id
             parsed_calls.append(
                 (
                     tool_call,
@@ -396,10 +464,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # scope check), so we enforce session toolset scope HERE. A tool
         # the session was not granted is rejected before any checkpoint,
         # hook, or dispatch fires.
-        _ts_scope_block = None
+        from agent.flexa_enforcement import governed_tool_denial
+
+        _ts_scope_block = governed_tool_denial(function_name)
         try:
             from tools import tool_search as _ts
-            if function_name == _ts.TOOL_CALL_NAME:
+            if _ts_scope_block is None and function_name == _ts.TOOL_CALL_NAME:
                 _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
                 if not _err and _underlying:
                     if _underlying in _tool_search_scoped_names(agent):
@@ -422,6 +492,25 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             effective_task_id=effective_task_id,
             tool_call_id=getattr(tool_call, "id", "") or "",
         )
+        from model_tools import coerce_tool_args
+
+        function_args = coerce_tool_args(function_name, function_args)
+        if not isinstance(function_args, dict):
+            function_args = {}
+
+        from agent.flexa_enforcement import tool_proposal as _flexa_tool_proposal
+
+        function_name, function_args, _operation_id = _flexa_tool_proposal(
+            agent,
+            function_name,
+            function_args,
+            operation_id=getattr(tool_call, "id", "") or None,
+        )
+        if not getattr(tool_call, "id", ""):
+            tool_call.id = _operation_id
+        _governed_denial = governed_tool_denial(function_name)
+        if _governed_denial is not None:
+            _ts_scope_block = _governed_denial
 
         # ── Block evaluation (BEFORE checkpoint preflight) ───────────
         # We must know whether the tool will execute before touching
@@ -519,7 +608,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     # ── Logging / callbacks ──────────────────────────────────────────
     tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
-    if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+    _has_governed_broker = bool(
+        _flexa_governed_mode()
+        and any(name == "read_attachment" for _, name, _, _, _, _ in parsed_calls)
+    )
+    if (
+        not _has_governed_broker
+        and not agent.quiet_mode
+        and getattr(agent, "tool_progress_mode", "all") != "off"
+    ):
         print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
         for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls, 1):
             display_args = _redact_tool_args_for_display(name, args) or args
@@ -534,7 +632,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     for tc, name, args, middleware_trace, block_result, blocked_by_guardrail in parsed_calls:
         if block_result is not None:
             continue
-        if agent.tool_progress_callback:
+        if (
+            not (_flexa_governed_mode() and name == "read_attachment")
+            and agent.tool_progress_callback
+        ):
             try:
                 display_args = _redact_tool_args_for_display(name, args) or args
                 preview = _build_tool_preview(name, display_args)
@@ -545,7 +646,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     for tc, name, args, middleware_trace, block_result, blocked_by_guardrail in parsed_calls:
         if block_result is not None:
             continue
-        if agent.tool_start_callback:
+        if (
+            not (_flexa_governed_mode() and name == "read_attachment")
+            and agent.tool_start_callback
+        ):
             try:
                 display_args = _redact_tool_args_for_display(name, args) or args
                 agent.tool_start_callback(tc.id, name, display_args)
@@ -605,6 +709,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     pre_tool_block_checked=True,
                     skip_tool_request_middleware=True,
                     tool_request_middleware_trace=list(middleware_trace),
+                    flexa_boundary_managed=True,
                 )
             except KeyboardInterrupt:
                 try:
@@ -833,6 +938,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
             effect_disposition = "unknown"
+            from agent.flexa_enforcement import tool_result as _flexa_tool_result
+
+            function_result = _flexa_tool_result(
+                agent, name, function_result, operation_id=getattr(tc, "id", "") or ""
+            )
             _emit_terminal_post_tool_call(
                 agent,
                 function_name=name,
@@ -850,6 +960,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             # Tool was cancelled (interrupt) or thread didn't return
             if agent._interrupt_requested:
                 function_result = f"[Tool execution cancelled — {name} was skipped due to user interrupt]"
+                from agent.flexa_enforcement import tool_result as _flexa_tool_result
+
+                function_result = _flexa_tool_result(
+                    agent, name, function_result, operation_id=getattr(tc, "id", "") or ""
+                )
                 _emit_terminal_post_tool_call(
                     agent,
                     function_name=name,
@@ -864,6 +979,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
             else:
                 function_result = f"Error executing tool '{name}': thread did not return a result"
+                from agent.flexa_enforcement import tool_result as _flexa_tool_result
+
+                function_result = _flexa_tool_result(
+                    agent, name, function_result, operation_id=getattr(tc, "id", "") or ""
+                )
                 _emit_terminal_post_tool_call(
                     agent,
                     function_name=name,
@@ -881,6 +1001,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace = r
             if blocked:
                 effect_disposition = "none"
+                from agent.flexa_enforcement import tool_result as _flexa_tool_result
+
+                function_result = _flexa_tool_result(
+                    agent,
+                    function_name,
+                    function_result,
+                    operation_id=getattr(tc, "id", "") or "",
+                )
 
             if not blocked:
                 function_result = agent._append_guardrail_observation(
@@ -890,8 +1018,32 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     failed=is_error,
                 )
 
+                from agent.flexa_enforcement import tool_result as _flexa_tool_result
+
+                function_result = _flexa_tool_result(
+                    agent,
+                    function_name,
+                    function_result,
+                    operation_id=getattr(tc, "id", "") or "",
+                )
+
+            from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+            _governed_broker_result = (
+                _flexa_governed_mode() and name == "read_attachment"
+            )
+            if _governed_broker_result and isinstance(function_result, str):
+                function_result = fit_inline_only_tool_result(
+                    content=function_result,
+                    tool_name=name,
+                    max_chars=_tool_budget.resolve_threshold(name),
+                )
+
             if is_error:
-                _err_text = _multimodal_text_summary(function_result)
+                _err_text = (
+                    "[managed attachment read failed]"
+                    if _governed_broker_result
+                    else _multimodal_text_summary(function_result)
+                )
                 result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
 
@@ -906,7 +1058,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 except Exception as _ver_err:
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
-            if not blocked and agent.tool_progress_callback:
+            if (
+                not blocked
+                and not _governed_broker_result
+                and agent.tool_progress_callback
+            ):
                 try:
                     agent.tool_progress_callback(
                         "tool.completed", function_name, None, None,
@@ -918,14 +1074,45 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
             if agent.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
-                logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
+                if _governed_broker_result:
+                    logging.debug("Managed attachment result retained in memory only")
+                else:
+                    logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
+
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+        _governed_broker_result = (
+            _flexa_governed_mode() and name == "read_attachment"
+        )
+
+        if _flexa_governed_mode() and not _governed_broker_result:
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=name,
+                function_args=args,
+                result=function_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tc, "id", "") or "",
+                duration_ms=int(tool_duration * 1000),
+                status="blocked" if blocked else None,
+                middleware_trace=list(middleware_trace),
+                governed_approved=True,
+            )
 
         # Print cute message per tool
         if agent._should_emit_quiet_tool_messages():
-            cute_msg = _get_cute_tool_message_impl(name, args, tool_duration, result=function_result)
+            cute_msg = _get_cute_tool_message_impl(
+                name,
+                args,
+                tool_duration,
+                result=(None if _governed_broker_result else function_result),
+            )
             agent._safe_print(f"  {cute_msg}")
         elif not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
-            _preview_str = _multimodal_text_summary(function_result)
+            _preview_str = (
+                "[managed attachment page]"
+                if _governed_broker_result
+                else _multimodal_text_summary(function_result)
+            )
             if agent.verbose_logging:
                 print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s")
                 print(agent._wrap_verbose("Result: ", _preview_str))
@@ -936,22 +1123,36 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         agent._current_tool = None
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s)")
 
-        if not blocked and agent.tool_complete_callback:
+        if (
+            not blocked
+            and not _governed_broker_result
+            and agent.tool_complete_callback
+        ):
             try:
                 display_args = _redact_tool_args_for_display(name, args) or args
                 agent.tool_complete_callback(tc.id, name, display_args, function_result)
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
 
-        function_result = maybe_persist_tool_result(
-            content=function_result,
-            tool_name=name,
-            tool_use_id=tc.id,
-            env=get_active_env(effective_task_id),
-            config=_tool_budget,
-        ) if not _is_multimodal_tool_result(function_result) else function_result
+        if (
+            not _governed_broker_result
+            and not _is_multimodal_tool_result(function_result)
+        ):
+            function_result = maybe_persist_tool_result(
+                content=function_result,
+                tool_name=name,
+                tool_use_id=tc.id,
+                env=get_active_env(effective_task_id),
+                config=_tool_budget,
+            )
 
-        subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        subdir_hints = (
+            ""
+            if _flexa_governed_mode()
+            else agent._subdirectory_hints.check_tool_call(name, args)
+        )
         if subdir_hints:
             if _is_multimodal_tool_result(function_result):
                 # Append the hint to the text summary part so the model
@@ -1008,7 +1209,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     num_tools = len(parsed_calls)
     if num_tools > 0:
         turn_tool_msgs = messages[-num_tools:]
-        enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget)
+        enforce_turn_budget(
+            turn_tool_msgs,
+            env=get_active_env(effective_task_id),
+            config=_tool_budget,
+            never_persist_tool_names=(
+                {"read_attachment"} if _flexa_governed_mode() else None
+            ),
+        )
 
     # ── /steer injection ──────────────────────────────────────────────
     # Append any pending user steer text to the last tool result so the
@@ -1032,10 +1240,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if remaining_calls:
                 agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {len(remaining_calls)} tool call(s)", force=True)
             for skipped_tc in remaining_calls:
-                skipped_name = skipped_tc.function.name
+                skipped_name, skipped_result = _close_governed_synthetic_result(
+                    agent,
+                    tool_call=skipped_tc,
+                    raw_result=(
+                        f"[Tool execution cancelled — {skipped_tc.function.name} "
+                        "was skipped due to user interrupt]"
+                    ),
+                    effective_task_id=effective_task_id,
+                    status="cancelled",
+                    error_type="user_interrupt",
+                )
                 messages.append(make_tool_result_message(
                     skipped_name,
-                    f"[Tool execution cancelled — {skipped_name} was skipped due to user interrupt]",
+                    skipped_result,
                     skipped_tc.id,
                     effect_disposition="none",
                 ))
@@ -1052,6 +1270,40 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_call.function.arguments
         )
         if malformed_args_result is not None:
+            from agent.flexa_enforcement import (
+                tool_proposal as _flexa_tool_proposal,
+                tool_result as _flexa_tool_result,
+            )
+
+            function_name, function_args, _operation_id = _flexa_tool_proposal(
+                agent,
+                function_name,
+                function_args,
+                operation_id=getattr(tool_call, "id", "") or None,
+            )
+            if not getattr(tool_call, "id", ""):
+                tool_call.id = _operation_id
+            malformed_args_result = _flexa_tool_result(
+                agent,
+                function_name,
+                malformed_args_result,
+                operation_id=tool_call.id,
+            )
+            from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+            if _flexa_governed_mode():
+                _emit_terminal_post_tool_call(
+                    agent,
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=malformed_args_result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=tool_call.id,
+                    status="blocked",
+                    error_type="invalid_arguments",
+                    error_message="tool arguments were invalid",
+                    governed_approved=True,
+                )
             messages.append(
                 make_tool_result_message(
                     function_name,
@@ -1070,10 +1322,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Tool Search unwrap — see execute_tool_calls_concurrent for full
         # rationale, including the scope gate (the unwrap dispatches the
         # underlying tool directly, so session toolset scope is enforced here).
-        _ts_scope_block: Optional[str] = None
+        from agent.flexa_enforcement import governed_tool_denial
+
+        _ts_scope_block: Optional[str] = governed_tool_denial(function_name)
         try:
             from tools import tool_search as _ts
-            if function_name == _ts.TOOL_CALL_NAME:
+            if _ts_scope_block is None and function_name == _ts.TOOL_CALL_NAME:
                 _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
                 if not _err and _underlying:
                     if _underlying in _tool_search_scoped_names(agent):
@@ -1093,6 +1347,29 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             function_args=function_args,
             effective_task_id=effective_task_id,
             tool_call_id=getattr(tool_call, "id", "") or "",
+        )
+        from model_tools import coerce_tool_args
+
+        function_args = coerce_tool_args(function_name, function_args)
+        if not isinstance(function_args, dict):
+            function_args = {}
+
+        from agent.flexa_enforcement import tool_proposal as _flexa_tool_proposal
+
+        function_name, function_args, _operation_id = _flexa_tool_proposal(
+            agent,
+            function_name,
+            function_args,
+            operation_id=getattr(tool_call, "id", "") or None,
+        )
+        if not getattr(tool_call, "id", ""):
+            tool_call.id = _operation_id
+        _governed_denial = governed_tool_denial(function_name)
+        if _governed_denial is not None:
+            _ts_scope_block = _governed_denial
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+        _governed_broker_observer = bool(
+            _flexa_governed_mode() and function_name == "read_attachment"
         )
 
         # Check plugin hooks for a block directive before executing.
@@ -1135,7 +1412,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         elif function_name == "skill_manage":
             agent._iters_since_skill = 0
 
-        if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
+        if (
+            not _governed_broker_observer
+            and not agent.quiet_mode
+            and getattr(agent, "tool_progress_mode", "all") != "off"
+        ):
             display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
             args_str = json.dumps(display_args, ensure_ascii=False)
             if agent.verbose_logging:
@@ -1159,7 +1440,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception:
                 pass
 
-        if not _execution_blocked and agent.tool_progress_callback:
+        if (
+            not _execution_blocked
+            and not _governed_broker_observer
+            and agent.tool_progress_callback
+        ):
             try:
                 display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
                 preview = _build_tool_preview(function_name, display_args)
@@ -1167,7 +1452,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
-        if not _execution_blocked and agent.tool_start_callback:
+        if (
+            not _execution_blocked
+            and not _governed_broker_observer
+            and agent.tool_start_callback
+        ):
             try:
                 display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
                 agent.tool_start_callback(tool_call.id, function_name, display_args)
@@ -1283,6 +1572,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
         elif function_name == "memory":
             def _execute(next_args: dict) -> Any:
+                from agent.flexa_enforcement import memory_candidate_arguments
+
+                next_args = memory_candidate_arguments(
+                    agent,
+                    next_args,
+                    action=str(next_args.get("action") or "batch"),
+                    target=str(next_args.get("target") or "memory"),
+                )
                 target = next_args.get("target", "memory")
                 operations = next_args.get("operations")
                 from tools.memory_tool import memory_tool as _memory_tool
@@ -1441,6 +1738,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _mem_result = None
             try:
                 def _execute(next_args: dict) -> Any:
+                    from agent.flexa_enforcement import memory_candidate_arguments
+
+                    next_args = memory_candidate_arguments(
+                        agent,
+                        next_args,
+                        action=str(next_args.get("action") or function_name),
+                        target=function_name,
+                    )
                     return agent._memory_manager.handle_tool_call(function_name, next_args)
                 function_result, function_args = _run_agent_tool_execution_middleware(
                     agent,
@@ -1557,6 +1862,47 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             result_preview = function_result
             _result_len = len(str(function_result))
 
+        _pre_flexa_error_result, _ = _detect_tool_failure(function_name, function_result)
+        if not _execution_blocked:
+            function_result = agent._append_guardrail_observation(
+                function_name,
+                function_args,
+                function_result,
+                failed=_pre_flexa_error_result,
+            )
+        from agent.flexa_enforcement import tool_result as _flexa_tool_result
+
+        function_result = _flexa_tool_result(
+            agent,
+            function_name,
+            function_result,
+            operation_id=getattr(tool_call, "id", "") or "",
+        )
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+        _governed_broker_result = (
+            _flexa_governed_mode() and function_name == "read_attachment"
+        )
+        if _governed_broker_result and isinstance(function_result, str):
+            function_result = fit_inline_only_tool_result(
+                content=function_result,
+                tool_name=function_name,
+                max_chars=_tool_budget.resolve_threshold(function_name),
+            )
+
+        if _flexa_governed_mode() and not _governed_broker_result:
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=function_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                duration_ms=int(tool_duration * 1000),
+                status="blocked" if _execution_blocked else None,
+                middleware_trace=list(middleware_trace),
+                governed_approved=True,
+            )
+
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
@@ -1569,6 +1915,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         from agent.agent_runtime_helpers import agent_runtime_owns_post_tool_hook
         _executor_must_emit_post_hook = (
             not _execution_blocked
+            and not _governed_broker_result
             and agent_runtime_owns_post_tool_hook(agent, function_name)
         )
         if _executor_must_emit_post_hook:
@@ -1583,14 +1930,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 middleware_trace=list(middleware_trace),
             )
         if not _execution_blocked:
-            function_result = agent._append_guardrail_observation(
-                function_name,
-                function_args,
-                function_result,
-                failed=_is_error_result,
-            )
-            result_preview = function_result if agent.verbose_logging else (
-                function_result[:200] if len(function_result) > 200 else function_result
+            result_preview = (
+                "[managed attachment page]"
+                if _governed_broker_result
+                else (
+                    function_result
+                    if agent.verbose_logging
+                    else (
+                        function_result[:200]
+                        if len(function_result) > 200
+                        else function_result
+                    )
+                )
             )
         if _is_error_result:
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
@@ -1609,7 +1960,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
-        if not _execution_blocked and agent.tool_progress_callback:
+        if (
+            not _execution_blocked
+            and not _governed_broker_result
+            and agent.tool_progress_callback
+        ):
             try:
                 agent.tool_progress_callback(
                     "tool.completed", function_name, None, None,
@@ -1624,26 +1979,43 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         if agent.verbose_logging:
             logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
-            _log_result = _multimodal_text_summary(function_result)
-            logging.debug(f"Tool result ({len(_log_result)} chars): {_log_result}")
+            if _governed_broker_result:
+                logging.debug("Managed attachment result retained in memory only")
+            else:
+                _log_result = _multimodal_text_summary(function_result)
+                logging.debug(f"Tool result ({len(_log_result)} chars): {_log_result}")
 
-        if not _execution_blocked and agent.tool_complete_callback:
+        if (
+            not _execution_blocked
+            and not _governed_broker_result
+            and agent.tool_complete_callback
+        ):
             try:
                 display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
                 agent.tool_complete_callback(tool_call.id, function_name, display_args, function_result)
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
 
-        function_result = maybe_persist_tool_result(
-            content=function_result,
-            tool_name=function_name,
-            tool_use_id=tool_call.id,
-            env=get_active_env(effective_task_id),
-            config=_tool_budget,
-        ) if not _is_multimodal_tool_result(function_result) else function_result
+        if (
+            not _governed_broker_result
+            and not _is_multimodal_tool_result(function_result)
+        ):
+            function_result = maybe_persist_tool_result(
+                content=function_result,
+                tool_name=function_name,
+                tool_use_id=tool_call.id,
+                env=get_active_env(effective_task_id),
+                config=_tool_budget,
+            )
 
         # Discover subdirectory context files from tool arguments
-        subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        subdir_hints = (
+            ""
+            if _flexa_governed_mode()
+            else agent._subdirectory_hints.check_tool_call(function_name, function_args)
+        )
         if subdir_hints:
             if _is_multimodal_tool_result(function_result):
                 _append_subdir_hint_to_multimodal(function_result, subdir_hints)
@@ -1687,9 +2059,23 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             if agent.verbose_logging:
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
-                print(agent._wrap_verbose("Result: ", function_result))
+                print(
+                    agent._wrap_verbose(
+                        "Result: ",
+                        (
+                            "[managed attachment page]"
+                            if _governed_broker_result
+                            else function_result
+                        ),
+                    )
+                )
             else:
-                _fr_str = function_result if isinstance(function_result, str) else str(function_result)
+                _display_result = (
+                    "[managed attachment page]"
+                    if _governed_broker_result
+                    else function_result
+                )
+                _fr_str = _display_result if isinstance(_display_result, str) else str(_display_result)
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 
@@ -1697,10 +2083,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             remaining = len(assistant_message.tool_calls) - i
             agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {remaining} remaining tool call(s)", force=True)
             for skipped_tc in assistant_message.tool_calls[i:]:
-                skipped_name = skipped_tc.function.name
+                skipped_name, skipped_result = _close_governed_synthetic_result(
+                    agent,
+                    tool_call=skipped_tc,
+                    raw_result=(
+                        f"[Tool execution skipped — {skipped_tc.function.name} "
+                        "was not started. User sent a new message]"
+                    ),
+                    effective_task_id=effective_task_id,
+                    status="cancelled",
+                    error_type="user_interrupt",
+                )
                 messages.append(make_tool_result_message(
                     skipped_name,
-                    f"[Tool execution skipped — {skipped_name} was not started. User sent a new message]",
+                    skipped_result,
                     skipped_tc.id,
                     effect_disposition="none",
                 ))
@@ -1717,7 +2113,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     num_tools_seq = len(assistant_message.tool_calls)
     if num_tools_seq > 0:
-        enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget)
+        enforce_turn_budget(
+            messages[-num_tools_seq:],
+            env=get_active_env(effective_task_id),
+            config=_tool_budget,
+            never_persist_tool_names=(
+                {"read_attachment"} if _flexa_governed_mode() else None
+            ),
+        )
 
     # ── /steer injection ──────────────────────────────────────────────
     # See _execute_tool_calls_parallel for the rationale. Same hook,

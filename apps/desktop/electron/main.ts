@@ -36,10 +36,11 @@ import { canImportHermesCli, verifyHermesCli } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { runBootstrap } from './bootstrap-runner'
+import { buildRemoteAuthorityId, remoteAuthorityMatches } from './connection-authority'
 import {
   authModeFromStatus,
   buildGatewayWsUrl,
-  buildGatewayWsUrlWithTicket,
+  buildProfileGatewayWsUrlWithTicket,
   connectionScopeKey,
   cookiesHaveLiveSession,
   cookiesHavePrivySession,
@@ -95,6 +96,7 @@ import {
 } from './hardening'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
+import { buildPrimaryBackendArgs, promoteProfileToPrimary } from './primary-backend-lifecycle'
 import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
@@ -802,6 +804,15 @@ function registerMediaProtocol() {
 let mainWindow = null
 let hermesProcess = null
 let connectionPromise = null
+// The primary connection cache is keyed by the exact profile captured when its
+// boot began.  A monotonic generation makes every public descriptor immutable
+// and lets both IPC and the renderer reject work that finishes after a
+// profile/config re-home.  Never infer either value from the currently-active
+// renderer profile: the primary socket and secondary sockets may be live at the
+// same time.
+let connectionPromiseProfile = null
+let connectionPromiseGeneration = 0
+let nextConnectionGeneration = 0
 // True while connection-config:apply soft-rehomes the primary — suppresses the
 // backend-exit toast so an intentional kill doesn't look like a crash.
 let softRehomeInProgress = false
@@ -5366,7 +5377,8 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
   })
 }
 
-// Mint a single-use WS ticket for a gated gateway. Returns the ticket string.
+// Mint a single-use WS ticket and the opaque authority derived atomically from
+// the exact verified Session that minted it.
 // Throws (with statusCode 401) if the session cookie is missing/expired —
 // callers treat that as "needs re-login".
 async function mintGatewayWsTicket(baseUrl) {
@@ -5376,12 +5388,15 @@ async function mintGatewayWsTicket(baseUrl) {
   })) as any
 
   const ticket = body?.ticket
+  const serverAuthorityId = body?.authority_id
 
-  if (!ticket || typeof ticket !== 'string') {
-    throw new Error('Gateway did not return a WS ticket.')
+  if (!ticket || typeof ticket !== 'string' || !serverAuthorityId || typeof serverAuthorityId !== 'string') {
+    throw new Error('Gateway did not return a tenant-bound WS ticket.')
   }
 
-  return ticket
+  const authorityId = buildRemoteAuthorityId(baseUrl, serverAuthorityId)
+
+  return { authorityId, ticket }
 }
 
 // Build a fresh WS URL for the *current* connection. Critical for reconnects:
@@ -5390,22 +5405,48 @@ async function mintGatewayWsTicket(baseUrl) {
 // calls this immediately before every gateway.connect() so each WS upgrade
 // carries a freshly-minted ticket. For local/token connections this just
 // reuses the static token (no minting needed).
-async function freshGatewayWsUrl(profile) {
+async function freshGatewayWsUrl(profile, generation) {
   // Mint for the requested profile's backend, NOT always the primary. The
   // renderer re-mints right before every gateway.connect(); when swapping to a
   // pooled profile we must return THAT backend's ws URL, otherwise the connect
   // silently lands back on the primary (default) backend and writes sessions to
   // the wrong profile's DB. A null/empty profile resolves to the primary, so
   // legacy callers and single-profile users are unchanged.
-  const connection = await ensureBackend(profile)
+  const requestedProfile = connectionScopeKey(profile) || primaryProfileKey()
+  const requestedGeneration = Number(generation)
+
+  if (!Number.isSafeInteger(requestedGeneration) || requestedGeneration <= 0) {
+    throw staleConnectionError('A valid Hermes connection generation is required to mint a gateway URL.')
+  }
+
+  const connection = await ensureBackend(requestedProfile)
+  const scopedProfile = connectionScopeKey(connection.profile)
+
+  if (scopedProfile !== requestedProfile || connection.generation !== requestedGeneration) {
+    throw staleConnectionError(
+      'The Hermes connection changed before its gateway URL could be minted. Retry the connection.'
+    )
+  }
 
   if (connection.authMode === 'oauth') {
-    const ticket = await mintGatewayWsTicket(connection.baseUrl)
+    const { authorityId, ticket } = await mintGatewayWsTicket(connection.baseUrl)
 
-    return buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
+    if (!resolvedConnectionIsCurrent(connection) || !remoteAuthorityMatches(connection.authorityId, authorityId)) {
+      throw staleConnectionError(
+        'The authenticated Hermes tenant changed while its gateway ticket was being minted. Reconnect the gateway.'
+      )
+    }
+
+    return buildProfileGatewayWsUrlWithTicket(connection.baseUrl, ticket, scopedProfile)
   }
 
   // Local/token: the cached wsUrl already carries the (long-lived) token.
+  if (!resolvedConnectionIsCurrent(connection)) {
+    throw staleConnectionError(
+      'The Hermes connection changed before its gateway URL was returned. Retry the connection.'
+    )
+  }
+
   return connection.wsUrl
 }
 
@@ -5868,17 +5909,23 @@ function readActiveDesktopProfile() {
   return null
 }
 
-function writeActiveDesktopProfile(name) {
+function normalizeActiveDesktopProfile(name) {
   const value = typeof name === 'string' ? name.trim() : ''
 
   if (value && value !== 'default' && !PROFILE_NAME_RE.test(value)) {
     throw new Error(`Invalid profile name: ${value}`)
   }
 
-  fs.mkdirSync(path.dirname(DESKTOP_PROFILE_CONFIG_PATH), { recursive: true })
-  writeFileAtomic(DESKTOP_PROFILE_CONFIG_PATH, JSON.stringify({ profile: value || null }, null, 2))
-
   return value || null
+}
+
+function writeActiveDesktopProfile(name) {
+  const value = normalizeActiveDesktopProfile(name)
+
+  fs.mkdirSync(path.dirname(DESKTOP_PROFILE_CONFIG_PATH), { recursive: true })
+  writeFileAtomic(DESKTOP_PROFILE_CONFIG_PATH, JSON.stringify({ profile: value }, null, 2))
+
+  return value
 }
 
 // Sanitize a connection config into the renderer-facing shape. With no
@@ -6025,8 +6072,9 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
 // and is shared by the per-profile, env, and global resolution paths. `token`
 // is the DECRYPTED static token (or null in OAuth mode). `source` is a label
 // for diagnostics ('profile' | 'env' | 'settings').
-async function buildRemoteConnection(rawUrl, authMode, token, source) {
+async function buildRemoteConnection(rawUrl, authMode, token, source, profile = null) {
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)
+  const scopedProfile = connectionScopeKey(profile)
 
   if (authMode === 'oauth') {
     // OAuth gateway: auth comes from the session cookies in the OAuth
@@ -6047,10 +6095,10 @@ async function buildRemoteConnection(rawUrl, authMode, token, source) {
       throw err
     }
 
-    let ticket
+    let minted
 
     try {
-      ticket = await mintGatewayWsTicket(baseUrl)
+      minted = await mintGatewayWsTicket(baseUrl)
     } catch (error) {
       const err = new Error(
         'Your remote gateway session has expired. ' + 'Open Settings → Gateway and click "Sign in" again.'
@@ -6062,13 +6110,15 @@ async function buildRemoteConnection(rawUrl, authMode, token, source) {
     }
 
     return {
+      authorityId: minted.authorityId,
       baseUrl,
       mode: 'remote',
       source,
       authMode: 'oauth',
+      profile: scopedProfile,
       // No static token in OAuth mode; REST is cookie-authed via the partition.
       token: null,
-      wsUrl: buildGatewayWsUrlWithTicket(baseUrl, ticket)
+      wsUrl: buildProfileGatewayWsUrlWithTicket(baseUrl, minted.ticket, scopedProfile)
     }
   }
 
@@ -6084,8 +6134,9 @@ async function buildRemoteConnection(rawUrl, authMode, token, source) {
     mode: 'remote',
     source,
     authMode: 'token',
+    profile: scopedProfile,
     token,
-    wsUrl: buildGatewayWsUrl(baseUrl, token)
+    wsUrl: buildGatewayWsUrl(baseUrl, token, scopedProfile)
   }
 }
 
@@ -6107,7 +6158,7 @@ async function resolveRemoteBackend(profile) {
   if (override) {
     const token = override.authMode === 'oauth' ? null : decryptDesktopSecret(override.token)
 
-    return buildRemoteConnection(override.url, override.authMode, token, 'profile')
+    return buildRemoteConnection(override.url, override.authMode, token, 'profile', profile)
   }
 
   // 2. Env override (global, token-auth only).
@@ -6122,7 +6173,7 @@ async function resolveRemoteBackend(profile) {
       )
     }
 
-    return buildRemoteConnection(rawEnvUrl, 'token', rawEnvToken, 'env')
+    return buildRemoteConnection(rawEnvUrl, 'token', rawEnvToken, 'env', profile)
   }
 
   // 3. Global remote (or cloud — cloud resolves to a remote backend, Q6).
@@ -6133,7 +6184,7 @@ async function resolveRemoteBackend(profile) {
   const authMode = normAuthMode(config.remote?.authMode)
   const token = authMode === 'oauth' ? null : decryptDesktopSecret(config.remote?.token)
 
-  return buildRemoteConnection(config.remote?.url, authMode, token, 'settings')
+  return buildRemoteConnection(config.remote?.url, authMode, token, 'settings', profile)
 }
 
 // A remote profile's sessions live on its remote host's state.db, not on a local
@@ -6284,7 +6335,10 @@ async function testDesktopConnectionConfig(input: any = {}) {
   // false-positive "reachable" while the real boot still failed with "Could not
   // connect to Hermes gateway". Mirror the renderer's connect here so the test
   // reflects the full path the app actually uses.
-  const wsUrl = await resolveTestWsUrl(baseUrl, authMode, token, { mintTicket: mintGatewayWsTicket })
+  const wsUrl = await resolveTestWsUrl(baseUrl, authMode, token, {
+    mintTicket: mintGatewayWsTicket,
+    profile: key || primaryProfileKey()
+  })
 
   // Skip the WS leg only when the runtime genuinely lacks a WebSocket (so an
   // older Electron/Node never fails the test spuriously); Electron's main
@@ -6342,6 +6396,8 @@ function stopBackendChild(child) {
 // switch / crash recovery), which still resets boot progress + reloads.
 function resetHermesConnection({ soft = false } = {}) {
   connectionPromise = null
+  connectionPromiseProfile = null
+  connectionPromiseGeneration = 0
   backendStartFailure = null
 
   stopBackendChild(hermesProcess)
@@ -6427,14 +6483,70 @@ function primaryProfileKey() {
   return readActiveDesktopProfile() || 'default'
 }
 
+function allocateConnectionGeneration() {
+  nextConnectionGeneration += 1
+
+  return nextConnectionGeneration
+}
+
+function staleConnectionError(message) {
+  const error = new Error(message) as any
+  error.code = 'HERMES_STALE_CONNECTION'
+
+  return error
+}
+
+function primaryConnectionIsCurrent(profile, generation) {
+  return (
+    connectionPromise !== null &&
+    connectionPromiseProfile === profile &&
+    connectionPromiseGeneration === generation &&
+    primaryProfileKey() === profile
+  )
+}
+
+function assertPrimaryConnectionCurrent(profile, generation) {
+  if (!primaryConnectionIsCurrent(profile, generation)) {
+    throw staleConnectionError(`Hermes connection for profile "${profile}" was superseded during startup.`)
+  }
+}
+
+function poolConnectionIsCurrent(profile, entry) {
+  return backendPool.get(profile) === entry
+}
+
+function assertPoolConnectionCurrent(profile, entry) {
+  if (!poolConnectionIsCurrent(profile, entry)) {
+    throw staleConnectionError(`Hermes connection for profile "${profile}" was superseded during startup.`)
+  }
+}
+
+function resolvedConnectionIsCurrent(connection) {
+  const profile = connectionScopeKey(connection?.profile)
+  const generation = Number(connection?.generation)
+
+  if (!profile || !Number.isSafeInteger(generation) || generation <= 0) {
+    return false
+  }
+
+  if (profile === connectionPromiseProfile) {
+    return primaryConnectionIsCurrent(profile, generation)
+  }
+
+  const entry = backendPool.get(profile)
+
+  return Boolean(entry && entry.generation === generation)
+}
+
 // Resolve a backend connection for the given profile. Routes the primary
 // profile to startHermes() (the window backend: boot UI, bootstrap, remote
 // mode), and any OTHER profile to a lazily-spawned pool backend. An empty /
 // unknown profile resolves to the primary, so all legacy callers are unchanged.
 async function ensureBackend(profile) {
-  const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
+  const capturedPrimary = primaryProfileKey()
+  const key = profile && String(profile).trim() ? String(profile).trim() : capturedPrimary
 
-  if (key === primaryProfileKey()) {
+  if (key === capturedPrimary) {
     return startHermes()
   }
 
@@ -6448,9 +6560,25 @@ async function ensureBackend(profile) {
 
   evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
 
-  const entry = { process: null, port: null, token: null, connectionPromise: null, lastActiveAt: Date.now() }
+  const entry = {
+    process: null,
+    port: null,
+    token: null,
+    readyFile: null,
+    generation: allocateConnectionGeneration(),
+    connectionPromise: null,
+    lastActiveAt: Date.now()
+  }
   entry.connectionPromise = spawnPoolBackend(key, entry).catch(error => {
-    backendPool.delete(key)
+    if (backendPool.get(key) === entry) {
+      backendPool.delete(key)
+    }
+    stopBackendChild(entry.process)
+
+    if (entry.readyFile) {
+      fs.unlink(entry.readyFile, () => {})
+    }
+
     throw error
   })
   backendPool.set(key, entry)
@@ -6537,13 +6665,16 @@ async function spawnPoolBackend(profile, entry) {
   // entry keeps `entry.process === null`, which stopPoolBackend/evict already
   // tolerate.
   const remote = await resolveRemoteBackend(profile)
+  assertPoolConnectionCurrent(profile, entry)
 
   if (remote) {
     await waitForHermes(remote.baseUrl, remote.token)
+    assertPoolConnectionCurrent(profile, entry)
 
     return {
       ...remote,
       profile,
+      generation: entry.generation,
       logs: hermesLog.slice(-80),
       ...getWindowState()
     }
@@ -6555,11 +6686,13 @@ async function spawnPoolBackend(profile, entry) {
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
   const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
   const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
+  assertPoolConnectionCurrent(profile, entry)
   // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
   backend.args = getBackendArgsForRuntime(backend)
   const hermesCwd = resolveHermesCwd()
   const webDist = resolveWebDist()
   const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
+  entry.readyFile = readyFile
 
   rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
 
@@ -6603,12 +6736,16 @@ async function spawnPoolBackend(profile, entry) {
 
   child.once('error', error => {
     rememberLog(`Hermes backend for profile "${profile}" failed to start: ${error.message}`)
-    backendPool.delete(profile)
+    if (poolConnectionIsCurrent(profile, entry)) {
+      backendPool.delete(profile)
+    }
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
     rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
-    backendPool.delete(profile)
+    if (poolConnectionIsCurrent(profile, entry)) {
+      backendPool.delete(profile)
+    }
 
     if (!ready) {
       rejectStart?.(
@@ -6619,15 +6756,18 @@ async function spawnPoolBackend(profile, entry) {
 
   // Discover the ephemeral port the child bound to
   const port = await Promise.race([waitForDashboardPortAnnouncement(child, { readyFile }), startFailed])
+  assertPoolConnectionCurrent(profile, entry)
 
   if (readyFile) {
     fs.unlink(readyFile, () => {})
+    entry.readyFile = null
   }
 
   entry.port = port
 
   const baseUrl = `http://127.0.0.1:${port}`
   await Promise.race([waitForHermes(baseUrl, token), startFailed])
+  assertPoolConnectionCurrent(profile, entry)
   ready = true
 
   const authToken = await adoptServedDashboardToken(baseUrl, token, {
@@ -6635,6 +6775,7 @@ async function spawnPoolBackend(profile, entry) {
     label: `Hermes backend for profile "${profile}"`,
     rememberLog
   })
+  assertPoolConnectionCurrent(profile, entry)
 
   entry.token = authToken
 
@@ -6645,7 +6786,8 @@ async function spawnPoolBackend(profile, entry) {
     authMode: 'token',
     token: authToken,
     profile,
-    wsUrl: `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`,
+    generation: entry.generation,
+    wsUrl: buildGatewayWsUrl(baseUrl, authToken, profile),
     logs: hermesLog.slice(-80),
     ...getWindowState()
   }
@@ -6750,19 +6892,44 @@ async function startHermes() {
     throw backendStartFailure
   }
 
+  const selectedProfile = primaryProfileKey()
+
   if (connectionPromise) {
-    return connectionPromise
+    if (connectionPromiseProfile === selectedProfile) {
+      return connectionPromise
+    }
+
+    // A profile/config write can race a connection request (including an
+    // external edit of the Desktop profile file). Retire the old keyed cache
+    // and its owned child before resolving the newly-captured primary. The old
+    // async chain sees its generation invalidated and cleans up without
+    // latching a boot failure.
+    await teardownPrimaryBackendAndWait()
+
+    return startHermes()
   }
+
+  const generation = allocateConnectionGeneration()
+  connectionPromiseProfile = selectedProfile
+  connectionPromiseGeneration = generation
+  let ownedChild = null
+  let ownedReadyFile = null
 
   connectionPromise = (async () => {
     await advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
+    assertPrimaryConnectionCurrent(selectedProfile, generation)
     // Resolve for the desktop's primary profile so a per-profile remote
     // override on the active profile is honored (falls back to env / global).
-    const remote = await resolveRemoteBackend(primaryProfileKey())
+    // Capture it once so the connection descriptor and every later ticket
+    // refresh identify the exact backend selected for this boot.
+    const remote = await resolveRemoteBackend(selectedProfile)
+    assertPrimaryConnectionCurrent(selectedProfile, generation)
 
     if (remote) {
       await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
+      assertPrimaryConnectionCurrent(selectedProfile, generation)
       await waitForHermes(remote.baseUrl, remote.token)
+      assertPrimaryConnectionCurrent(selectedProfile, generation)
       updateBootProgress({
         phase: 'backend.ready',
         message: 'Remote Hermes backend is ready',
@@ -6772,10 +6939,13 @@ async function startHermes() {
       })
 
       return {
+        authorityId: remote.authorityId,
         baseUrl: remote.baseUrl,
         mode: 'remote',
         source: remote.source,
         authMode: remote.authMode || 'token',
+        profile: selectedProfile,
+        generation,
         token: remote.token,
         wsUrl: remote.wsUrl,
         logs: hermesLog.slice(-80),
@@ -6790,33 +6960,30 @@ async function startHermes() {
     // is detected stale), THEN start the backend. Local backends only; remote
     // connections returned above and never touch the install tree.
     await waitForUpdateToFinish()
+    assertPrimaryConnectionCurrent(selectedProfile, generation)
 
     const token = crypto.randomBytes(32).toString('base64url')
-    // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
-    const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
-    // Pin the desktop's chosen profile via the global --profile flag. This is
-    // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
-    // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
-    // unset preference keeps the legacy launch so existing installs are
-    // unaffected.
-    const activeProfile = readActiveDesktopProfile()
-
-    if (activeProfile) {
-      backendArgs.unshift('--profile', activeProfile)
-    }
+    // --port 0: the OS assigns an ephemeral port; the child announces it on
+    // stdout. Always pass the exact captured profile, including `default`, so a
+    // sticky CLI active_profile can never disagree with the public descriptor.
+    const backendArgs = buildPrimaryBackendArgs(selectedProfile)
 
     await advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28)
+    assertPrimaryConnectionCurrent(selectedProfile, generation)
     const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
+    assertPrimaryConnectionCurrent(selectedProfile, generation)
     // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
     backend.args = getBackendArgsForRuntime(backend)
     const hermesCwd = resolveHermesCwd()
     const webDist = resolveWebDist()
     const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
+    ownedReadyFile = readyFile
 
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
+    assertPrimaryConnectionCurrent(selectedProfile, generation)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
 
-    hermesProcess = spawn(
+    const child = spawn(
       backend.command,
       backend.args,
       hiddenWindowsChildOptions({
@@ -6845,9 +7012,11 @@ async function startHermes() {
         stdio: ['ignore', 'pipe', 'pipe']
       })
     )
+    ownedChild = child
+    hermesProcess = child
 
-    hermesProcess.stdout.on('data', rememberLog)
-    hermesProcess.stderr.on('data', rememberLog)
+    child.stdout.on('data', rememberLog)
+    child.stderr.on('data', rememberLog)
     let backendReady = false
     let rejectBackendStart = null
 
@@ -6855,39 +7024,59 @@ async function startHermes() {
       rejectBackendStart = reject
     })
 
-    hermesProcess.once('error', error => {
+    child.once('error', error => {
       rememberLog(`Hermes backend failed to start: ${error.message}`)
-      updateBootProgress(
-        {
-          error: error.message,
-          message: `Hermes backend failed to start: ${error.message}`,
-          phase: 'backend.error',
-          running: false
-        },
-        { allowDecrease: true }
-      )
-      hermesProcess = null
-      connectionPromise = null
-      sendBackendExit({ code: null, signal: null, error: error.message })
-      rejectBackendStart?.(error)
-    })
-    hermesProcess.once('exit', (code, signal) => {
-      rememberLog(`Hermes backend exited (${signal || code})`)
-      hermesProcess = null
-      connectionPromise = null
-      sendBackendExit({ code, signal })
+      const ownsCurrentPrimary = hermesProcess === child && primaryConnectionIsCurrent(selectedProfile, generation)
 
-      if (!backendReady) {
-        const message = `Hermes backend exited before it became ready (${signal || code}).`
+      if (ownsCurrentPrimary) {
         updateBootProgress(
           {
-            error: message,
-            message,
+            error: error.message,
+            message: `Hermes backend failed to start: ${error.message}`,
             phase: 'backend.error',
             running: false
           },
           { allowDecrease: true }
         )
+      }
+      if (hermesProcess === child) {
+        hermesProcess = null
+      }
+      if (ownsCurrentPrimary) {
+        sendBackendExit({ code: null, signal: null, error: error.message })
+      }
+      rejectBackendStart?.(error)
+    })
+    child.once('exit', (code, signal) => {
+      rememberLog(`Hermes backend exited (${signal || code})`)
+      const ownsCurrentPrimary = hermesProcess === child && primaryConnectionIsCurrent(selectedProfile, generation)
+
+      if (hermesProcess === child) {
+        hermesProcess = null
+      }
+      if (backendReady && ownsCurrentPrimary) {
+        connectionPromise = null
+        connectionPromiseProfile = null
+        connectionPromiseGeneration = 0
+      }
+      if (ownsCurrentPrimary) {
+        sendBackendExit({ code, signal })
+      }
+
+      if (!backendReady) {
+        const message = `Hermes backend exited before it became ready (${signal || code}).`
+
+        if (ownsCurrentPrimary) {
+          updateBootProgress(
+            {
+              error: message,
+              message,
+              phase: 'backend.error',
+              running: false
+            },
+            { allowDecrease: true }
+          )
+        }
         rejectBackendStart?.(
           new Error(
             `Hermes backend exited before it became ready (${signal || code}). Log: ${DESKTOP_LOG_PATH}\n${recentHermesLog()}`
@@ -6897,28 +7086,31 @@ async function startHermes() {
     })
 
     await advanceBootProgress('backend.port', 'Waiting for Hermes backend to launch', 86)
+    assertPrimaryConnectionCurrent(selectedProfile, generation)
 
     // Discover the ephemeral port the child bound to
-    const port = await Promise.race([
-      waitForDashboardPortAnnouncement(hermesProcess, { readyFile }),
-      backendStartFailed
-    ])
+    const port = await Promise.race([waitForDashboardPortAnnouncement(child, { readyFile }), backendStartFailed])
+    assertPrimaryConnectionCurrent(selectedProfile, generation)
 
     if (readyFile) {
       fs.unlink(readyFile, () => {})
+      ownedReadyFile = null
     }
 
     const baseUrl = `http://127.0.0.1:${port}`
     await advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
+    assertPrimaryConnectionCurrent(selectedProfile, generation)
     await Promise.race([waitForHermes(baseUrl, token), backendStartFailed])
+    assertPrimaryConnectionCurrent(selectedProfile, generation)
     backendReady = true
     backendStartFailure = null
 
     const authToken = await adoptServedDashboardToken(baseUrl, token, {
       // The exit/error handlers null hermesProcess when the child dies.
-      childAlive: () => hermesProcess !== null && hermesProcess.exitCode === null && !hermesProcess.killed,
+      childAlive: () => hermesProcess === child && child.exitCode === null && !child.killed,
       rememberLog
     })
+    assertPrimaryConnectionCurrent(selectedProfile, generation)
 
     updateBootProgress({
       phase: 'backend.ready',
@@ -6933,24 +7125,46 @@ async function startHermes() {
       mode: 'local',
       source: 'local',
       authMode: 'token',
+      profile: selectedProfile,
+      generation,
       token: authToken,
-      wsUrl: `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`,
+      wsUrl: buildGatewayWsUrl(baseUrl, authToken, selectedProfile),
       logs: hermesLog.slice(-80),
       ...getWindowState()
     }
   })().catch(error => {
     const message = error instanceof Error ? error.message : String(error)
-    backendStartFailure = error instanceof Error ? error : new Error(message)
-    updateBootProgress(
-      {
-        error: message,
-        message: `Desktop boot failed: ${message}`,
-        phase: 'backend.error',
-        running: false
-      },
-      { allowDecrease: true }
-    )
-    connectionPromise = null
+
+    if (ownedChild) {
+      stopBackendChild(ownedChild)
+
+      if (hermesProcess === ownedChild) {
+        hermesProcess = null
+      }
+    }
+
+    if (ownedReadyFile) {
+      fs.unlink(ownedReadyFile, () => {})
+      ownedReadyFile = null
+    }
+
+    if (connectionPromiseProfile === selectedProfile && connectionPromiseGeneration === generation) {
+      if ((error as any)?.code !== 'HERMES_STALE_CONNECTION') {
+        backendStartFailure = error instanceof Error ? error : new Error(message)
+        updateBootProgress(
+          {
+            error: message,
+            message: `Desktop boot failed: ${message}`,
+            phase: 'backend.error',
+            running: false
+          },
+          { allowDecrease: true }
+        )
+      }
+      connectionPromise = null
+      connectionPromiseProfile = null
+      connectionPromiseGeneration = 0
+    }
     throw error
   })
 
@@ -7384,13 +7598,25 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
     return { ok: true, rebuilt: false }
   }
 
+  const cachedPromise = connectionPromise
+  const cachedProfile = connectionPromiseProfile
+  const cachedGeneration = connectionPromiseGeneration
   let conn = null
 
   try {
-    conn = await connectionPromise
+    conn = await cachedPromise
   } catch {
     // The cached boot already rejected (its own catch nulls connectionPromise);
     // nothing to revalidate — the next getConnection() builds fresh.
+    return { ok: true, rebuilt: false }
+  }
+
+  if (
+    connectionPromise !== cachedPromise ||
+    connectionPromiseProfile !== cachedProfile ||
+    connectionPromiseGeneration !== cachedGeneration ||
+    !resolvedConnectionIsCurrent(conn)
+  ) {
     return { ok: true, rebuilt: false }
   }
 
@@ -7405,6 +7631,14 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
 
     return { ok: true, rebuilt: false }
   } catch {
+    if (
+      connectionPromise !== cachedPromise ||
+      connectionPromiseProfile !== cachedProfile ||
+      connectionPromiseGeneration !== cachedGeneration
+    ) {
+      return { ok: true, rebuilt: false }
+    }
+
     // Unreachable remote: drop the stale cache so the renderer's next reconnect
     // tick rebuilds a fresh, reachable descriptor. resetHermesConnection only
     // nulls connectionPromise for a remote (no child to SIGTERM).
@@ -7419,7 +7653,17 @@ ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
 
   return { ok: true }
 })
-ipcMain.handle('hermes:gateway:ws-url', async (_event, profile) => freshGatewayWsUrl(profile))
+ipcMain.handle('hermes:gateway:ws-url', async (_event, profile, generation) => {
+  try {
+    return { ok: true, url: await freshGatewayWsUrl(profile, generation) }
+  } catch (error) {
+    return {
+      ok: false,
+      code: (error as any)?.code || null,
+      error: error instanceof Error ? error.message : String(error)
+    }
+  }
+})
 ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
   if (typeof sessionId !== 'string' || !sessionId.trim()) {
     return { ok: false, error: 'invalid-session-id' }
@@ -7719,12 +7963,17 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
 
 ipcMain.handle('hermes:profile:get', async () => ({ profile: readActiveDesktopProfile() }))
 ipcMain.handle('hermes:profile:set', async (_event, name) => {
-  const next = writeActiveDesktopProfile(name)
+  const requested = normalizeActiveDesktopProfile(name)
 
   // Switching profiles is a backend re-home: relaunch the dashboard under the
-  // new HERMES_HOME. Pool backends keep their own homes, so only the primary
-  // is torn down.
-  await teardownPrimaryBackendAndWait()
+  // new HERMES_HOME. If the destination is already live in the secondary pool,
+  // fully stop that child first; otherwise primary spawn would create a second
+  // process against the same profile state.
+  const next = await promoteProfileToPrimary(requested, {
+    teardownPoolProfile: teardownPoolBackendAndWait,
+    teardownPrimary: teardownPrimaryBackendAndWait,
+    writePreference: () => writeActiveDesktopProfile(requested)
+  })
   mainWindow?.reload()
 
   return { profile: next }
@@ -7969,7 +8218,10 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
     focusWindow(mainWindow)
 
     if (payload?.sessionId) {
-      mainWindow.webContents.send('hermes:focus-session', payload.sessionId)
+      mainWindow.webContents.send('hermes:focus-session', {
+        gatewayScope: payload.gatewayScope,
+        sessionId: payload.sessionId
+      })
     }
   })
   notification.on('action', (_actionEvent, index) => {
@@ -7979,7 +8231,11 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
     const action = actions[index]
 
     if (action?.id) {
-      mainWindow.webContents.send('hermes:notification-action', { sessionId: payload?.sessionId, actionId: action.id })
+      mainWindow.webContents.send('hermes:notification-action', {
+        actionId: action.id,
+        actionNonce: payload?.actionNonce,
+        sessionId: payload?.sessionId
+      })
     }
   })
   notification.show()

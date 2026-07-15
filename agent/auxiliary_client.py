@@ -173,6 +173,10 @@ def _openai_http_client_kwargs(
 
 
 def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode():
+        raise RuntimeError("auxiliary LLM calls are unavailable in governed mode")
     kwargs = {**_openai_http_client_kwargs(base_url), **kwargs}
     # Hermes owns auxiliary retry + provider/model fallback policy (the
     # same-provider transient retry in call_llm plus the except-chain
@@ -4431,6 +4435,10 @@ def resolve_provider_client(
     Returns:
         (client, resolved_model) or (None, None) if auth is unavailable.
     """
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode():
+        raise RuntimeError("auxiliary LLM calls are unavailable in governed mode")
     _validate_proxy_env_urls()
     # Preserve the original provider name before alias normalization so a
     # user-declared ``custom_providers`` entry whose name coincidentally

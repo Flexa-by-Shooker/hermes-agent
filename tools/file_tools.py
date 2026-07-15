@@ -2039,6 +2039,12 @@ def _check_file_reqs():
     from tools import check_file_requirements
     return check_file_requirements()
 
+
+def _check_read_attachment_reqs():
+    from hermes_cli.flexa_governed import governed_mode
+
+    return governed_mode() and _check_file_reqs()
+
 READ_FILE_SCHEMA = {
     "name": "read_file",
     "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
@@ -2051,6 +2057,40 @@ READ_FILE_SCHEMA = {
         },
         "required": ["path"]
     }
+}
+
+READ_ATTACHMENT_SCHEMA = {
+    "name": "read_attachment",
+    "description": (
+        "Read a managed user attachment by its exact attachment_id. "
+        "This broker decrypts only attachments owned by the current governed "
+        "turn and renders UTF-8 text, PDF, DOCX, or XLSX content with pagination."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "attachment_id": {
+                "type": "string",
+                "description": "Exact opaque attachment_id shown in the user prompt.",
+                "pattern": "^[a-f0-9]{32}\\.[a-z0-9]{1,8}$",
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Line number to start reading from (1-indexed).",
+                "default": 1,
+                "minimum": 1,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of lines (default/max: 500).",
+                "default": 500,
+                "minimum": 1,
+                "maximum": 500,
+            },
+        },
+        "required": ["attachment_id"],
+        "additionalProperties": False,
+    },
 }
 
 WRITE_FILE_SCHEMA = {
@@ -2147,6 +2187,16 @@ def _handle_read_file(args, **kw):
     return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
 
 
+def _handle_read_attachment(args, **_kw):
+    from agent.flexa_enforcement import read_governed_attachment
+
+    return read_governed_attachment(
+        args.get("attachment_id", ""),
+        offset=args.get("offset", 1),
+        limit=args.get("limit", 500),
+    )
+
+
 def _handle_write_file(args, **kw):
     tid = kw.get("task_id") or "default"
     if not args.get("path") or not isinstance(args.get("path"), str):
@@ -2197,6 +2247,7 @@ def _handle_search_files(args, **kw):
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
+registry.register(name="read_attachment", toolset="file", schema=READ_ATTACHMENT_SCHEMA, handler=_handle_read_attachment, check_fn=_check_read_attachment_reqs, emoji="📎", max_result_size_chars=100_000)
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
 registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)

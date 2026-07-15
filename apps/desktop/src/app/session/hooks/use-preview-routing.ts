@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect } from 'react'
 
 import { gatewayEventCompletedFileDiff } from '@/lib/gateway-events'
+import { gatewayEventMatchesActiveOrigin } from '@/store/gateway'
 import {
   $previewTarget,
   $sessionPreviewRegistry,
@@ -99,6 +100,10 @@ export function usePreviewRouting({
 
   const handleDesktopGatewayEvent = useCallback<EventHandler>(
     event => {
+      if (!gatewayEventMatchesActiveOrigin(event)) {
+        return
+      }
+
       baseHandleGatewayEvent(event)
 
       if (event.type === 'preview.restart.complete') {

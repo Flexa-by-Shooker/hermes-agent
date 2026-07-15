@@ -1907,8 +1907,34 @@ class PluginManager:
         are reused.  All injected context is ephemeral — never
         persisted to session DB.
         """
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        _governed = _flexa_governed_mode()
+        _governed_disclosure_hooks = {
+            "pre_llm_call": "_pre_llm_call",
+            "transform_llm_output": "_transform_llm_output",
+        }
+        if (
+            _governed
+            and hook_name not in {"pre_tool_call", "post_tool_call"}
+            and hook_name not in _governed_disclosure_hooks
+        ):
+            return []
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
+        if _governed and hook_name in _governed_disclosure_hooks:
+            expected_name = _governed_disclosure_hooks[hook_name]
+            callbacks = [
+                callback
+                for callback in callbacks
+                if getattr(callback, "__module__", "")
+                == "hermes_plugins.flexa_disclosure_boundary"
+                and getattr(callback, "__name__", "") == expected_name
+            ]
+            if len(callbacks) != 1:
+                raise RuntimeError(
+                    "governed disclosure hook is missing or ambiguous: " + hook_name
+                )
         results: List[Any] = []
         for cb in callbacks:
             try:

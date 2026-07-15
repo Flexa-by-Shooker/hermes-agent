@@ -669,6 +669,54 @@ def _file_to_data_url(path: Path) -> Optional[str]:
     return f"data:{mime};base64,{b64}"
 
 
+def image_bytes_to_data_url(raw: bytes, suffix: str) -> Optional[str]:
+    """Encode trusted in-memory image bytes without creating a plaintext file."""
+
+    if not isinstance(raw, bytes) or not raw:
+        return None
+    path_hint = Path(f"attachment{str(suffix or '').lower()}")
+    mime = _guess_mime(path_hint, raw=raw)
+    if mime not in _UNIVERSALLY_SUPPORTED_MIMES:
+        transcoded = _transcode_to_png(raw)
+        if transcoded is None:
+            return None
+        raw = transcoded
+        mime = "image/png"
+    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+
+def build_native_content_parts_from_bytes(
+    user_text: str,
+    images: List[Tuple[str, str, bytes, str]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Build native image parts from ``(id, display, bytes, suffix)`` tuples."""
+
+    skipped: List[str] = []
+    image_parts: List[Dict[str, Any]] = []
+    hints: List[str] = []
+    for attachment_id, display_name, raw, suffix in images:
+        data_url = image_bytes_to_data_url(raw, suffix)
+        if data_url is None:
+            skipped.append(attachment_id)
+            continue
+        image_parts.append(
+            {"type": "image_url", "image_url": {"url": data_url}}
+        )
+        hints.append(
+            "[Image attachment_id: "
+            f"{attachment_id}, display_name: {display_name}]"
+        )
+    text = (user_text or "").strip()
+    if image_parts:
+        base_text = text or "What do you see in this image?"
+        return (
+            [{"type": "text", "text": f"{base_text}\n\n" + "\n".join(hints)}]
+            + image_parts,
+            skipped,
+        )
+    return ([{"type": "text", "text": text}] if text else []), skipped
+
+
 def build_native_content_parts(
     user_text: str,
     image_paths: List[str],
@@ -761,5 +809,7 @@ def build_native_content_parts(
 __all__ = [
     "decide_image_input_mode",
     "build_native_content_parts",
+    "build_native_content_parts_from_bytes",
     "extract_image_refs",
+    "image_bytes_to_data_url",
 ]

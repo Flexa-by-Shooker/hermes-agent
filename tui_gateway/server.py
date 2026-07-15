@@ -3,6 +3,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -39,9 +40,17 @@ from tui_gateway.transport import (
 logger = logging.getLogger(__name__)
 
 _hermes_home = get_hermes_home()
-load_hermes_dotenv(
-    hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env"
+from hermes_cli.flexa_governed import (
+    ensure_governed_content_free_logging,
+    governed_mode as _flexa_governed_mode,
 )
+
+if not _flexa_governed_mode():
+    load_hermes_dotenv(
+        hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env"
+    )
+else:
+    ensure_governed_content_free_logging()
 
 
 # ── Panic logger ─────────────────────────────────────────────────────
@@ -57,6 +66,23 @@ _CRASH_LOG = os.path.join(_hermes_home, "logs", "tui_gateway_crash.log")
 
 
 def _panic_hook(exc_type, exc_value, exc_tb):
+    if _flexa_governed_mode():
+        audit_id = uuid.uuid4().hex
+        try:
+            os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
+            with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+                f.write(
+                    f"governed gateway failure audit_id={audit_id} "
+                    f"at={time.strftime('%Y-%m-%dT%H:%M:%S')}\n"
+                )
+        except Exception:
+            pass
+        print(
+            f"[gateway-crash] managed gateway failed (audit_id={audit_id})",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
     import traceback
 
     trace = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
@@ -87,6 +113,23 @@ sys.excepthook = _panic_hook
 
 def _thread_panic_hook(args):
     # threading.excepthook signature: SimpleNamespace(exc_type, exc_value, exc_traceback, thread)
+    if _flexa_governed_mode():
+        audit_id = uuid.uuid4().hex
+        try:
+            os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
+            with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+                f.write(
+                    f"governed gateway thread failure audit_id={audit_id} "
+                    f"at={time.strftime('%Y-%m-%dT%H:%M:%S')}\n"
+                )
+        except Exception:
+            pass
+        print(
+            f"[gateway-crash] managed gateway thread failed (audit_id={audit_id})",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
     import traceback
 
     trace = "".join(
@@ -132,6 +175,9 @@ _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
 _answers: dict[str, str] = {}
 _db = None
 _db_error: str | None = None
+_governed_dbs: dict[str, Any] = {}
+_governed_db_errors: dict[str, str] = {}
+_governed_db_lock = threading.RLock()
 _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
@@ -561,11 +607,46 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
 
     agent = session.get("agent")
     lock = session.get("history_lock")
-    if lock is not None:
-        with lock:
+    try:
+        if lock is not None:
+            with lock:
+                history = list(session.get("history", []))
+        else:
             history = list(session.get("history", []))
-    else:
-        history = list(session.get("history", []))
+    except Exception:
+        history = []
+        if _flexa_governed_mode():
+            session["_governed_persistence_unsafe"] = True
+
+    _persistence_quarantined = bool(
+        session.get("_governed_persistence_unsafe")
+    )
+    if agent is not None:
+        try:
+            from agent.flexa_enforcement import (
+                governed_persistence_quarantined,
+                quarantine_governed_persistence,
+                turn_active,
+            )
+
+            if turn_active(agent):
+                session["_governed_persistence_unsafe"] = True
+                quarantine_governed_persistence(
+                    agent,
+                    _safe_governed_committed_history(history),
+                )
+            _persistence_quarantined = (
+                _persistence_quarantined
+                or governed_persistence_quarantined(agent)
+            )
+        except Exception:
+            # A safety-check failure may never fall back to persisting the
+            # potentially raw in-flight agent snapshot.
+            _persistence_quarantined = (
+                _persistence_quarantined
+                or bool(session.get("_governed_persistence_unsafe"))
+                or bool(_flexa_governed_mode() and session.get("running"))
+            )
 
     # ── Persist unflushed messages to SQLite ──────────────────────────
     # Flush ``agent._session_messages`` via ``_persist_session``'s marker-based
@@ -578,7 +659,11 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     # failure). Markers persist the genuinely-unflushed tail without duplicating
     # durable rows (including a resumed-but-not-run session's already-in-DB
     # transcript, which stays in ``session["history"]`` only).
-    if agent is not None and hasattr(agent, "_persist_session"):
+    if (
+        agent is not None
+        and not _persistence_quarantined
+        and hasattr(agent, "_persist_session")
+    ):
         snapshot = getattr(agent, "_session_messages", None)
         if snapshot:
             try:
@@ -686,6 +771,66 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         pass
 
 
+def _approval_scope_key(session: dict, session_key: str | None = None) -> str:
+    """Profile-qualify process-global approval registries.
+
+    Different managed employees may legitimately have the same durable Hermes
+    session id.  Approval/yolo registries live process-wide, so the verified
+    profile home is hashed into their internal key while persistence continues
+    to use the unchanged durable id.
+    """
+
+    durable = str(session_key if session_key is not None else session.get("session_key") or "")
+    profile_home = str(session.get("profile_home") or "").strip()
+    if not profile_home:
+        return durable
+    try:
+        canonical = os.path.normcase(str(Path(profile_home).resolve(strict=False)))
+    except (OSError, RuntimeError, ValueError):
+        canonical = os.path.normcase(os.path.abspath(profile_home))
+    profile_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"profile:{profile_digest}:{durable}"
+
+
+def _contains_governed_native_data(value: Any, seen: set[int] | None = None) -> bool:
+    """Return whether a committed-history candidate contains a native data URL."""
+
+    if isinstance(value, str):
+        return "data:image/" in value.lower()
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return False
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen:
+        return False
+    if isinstance(value, dict):
+        seen.add(identity)
+        return any(
+            _contains_governed_native_data(item, seen)
+            for item in value.values()
+        )
+    if isinstance(value, (list, tuple, set)):
+        seen.add(identity)
+        return any(_contains_governed_native_data(item, seen) for item in value)
+    return False
+
+
+def _safe_governed_committed_history(history: Any) -> list[dict]:
+    """Copy committed history or discard it entirely if native data appears."""
+
+    if not isinstance(history, list):
+        return []
+    copied = copy.deepcopy(
+        [message for message in history if isinstance(message, dict)]
+    )
+    if len(copied) != len(history) or _contains_governed_native_data(copied):
+        return []
+    for message in copied:
+        message.pop("_hermes_governed_current_turn", None)
+    return copied
+
+
 def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> None:
     """Fully tear down a session: finalize, unregister, close agent + worker.
 
@@ -698,20 +843,107 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     """
     if not session:
         return
-    _finalize_session(session, end_reason=end_reason)
-    try:
-        from tools.approval import unregister_gateway_notify
-
-        if key := session.get("session_key"):
-            unregister_gateway_notify(key)
-    except Exception:
-        pass
+    with _session_attachment_lock(session):
+        if session.get("_teardown_started"):
+            return
+        session["_teardown_started"] = True
+    home_token = _governed_attachment_home(session)
     try:
         agent = session.get("agent")
-        if agent is not None and hasattr(agent, "close"):
-            agent.close()
-    except Exception:
-        pass
+        if agent is not None:
+            run_thread = session.get("_run_thread")
+            thread_inflight = bool(
+                run_thread is not None
+                and run_thread is not threading.current_thread()
+                and getattr(run_thread, "is_alive", lambda: False)()
+            )
+            possible_governed_inflight = bool(
+                _flexa_governed_mode()
+                and (
+                    session.get("running")
+                    or thread_inflight
+                    or getattr(agent, "_flexa_turn_id", None)
+                )
+            )
+            if possible_governed_inflight:
+                # Set the session-level fail-closed bit before importing,
+                # copying, locking, or quarantining. Any failure below leaves
+                # finalization unable to flush the potentially raw snapshot.
+                session["_governed_persistence_unsafe"] = True
+            try:
+                from agent.flexa_enforcement import (
+                    quarantine_governed_persistence,
+                    turn_active,
+                )
+
+                unsafe_inflight = bool(
+                    _flexa_governed_mode()
+                    and (
+                        possible_governed_inflight
+                        or turn_active(agent)
+                    )
+                )
+                if unsafe_inflight:
+                    session["_governed_persistence_unsafe"] = True
+                    lock = session.get("history_lock")
+                    if lock is not None:
+                        with lock:
+                            committed_history = list(session.get("history", []))
+                    else:
+                        committed_history = list(session.get("history", []))
+                    quarantine_governed_persistence(
+                        agent,
+                        _safe_governed_committed_history(committed_history),
+                    )
+            except Exception:
+                if _flexa_governed_mode():
+                    session["_governed_persistence_unsafe"] = True
+        try:
+            if agent is not None and hasattr(agent, "interrupt"):
+                agent.interrupt()
+        except Exception:
+            pass
+        try:
+            if agent is not None:
+                from agent.flexa_enforcement import revoke_turn
+
+                revoke_turn(agent)
+        except Exception:
+            pass
+        run_thread = session.get("_run_thread")
+        if (
+            run_thread is not None
+            and run_thread is not threading.current_thread()
+            and getattr(run_thread, "is_alive", lambda: False)()
+        ):
+            try:
+                run_thread.join(timeout=1.0)
+            except Exception:
+                pass
+        if agent is not None:
+            try:
+                from agent.flexa_enforcement import restore_governed_quarantine_snapshot
+
+                restore_governed_quarantine_snapshot(agent)
+            except Exception:
+                pass
+        _cleanup_governed_session_uploads(session)
+        _finalize_session(session, end_reason=end_reason)
+        try:
+            from tools.approval import unregister_gateway_notify
+
+            if session.get("session_key"):
+                unregister_gateway_notify(_approval_scope_key(session))
+        except Exception:
+            pass
+        try:
+            if agent is not None and hasattr(agent, "close"):
+                agent.close()
+        except Exception:
+            pass
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
     # NOTE: the slash-worker is closed inside _finalize_session (the single
     # _finalized-guarded chokepoint that main folded it into), exactly once.
     # We deliberately do NOT re-close it here — _teardown_session's job beyond
@@ -969,8 +1201,36 @@ _start_idle_reaper()
 # ── Plumbing ──────────────────────────────────────────────────────────
 
 
+def _current_hermes_home() -> Path:
+    """Return the verified request/session-scoped home in governed mode."""
+
+    home = Path(get_hermes_home())
+    if _flexa_governed_mode():
+        from hermes_cli.flexa_governed import binding_for_current_home
+
+        binding_for_current_home()
+    return home
+
+
 def _get_db():
     global _db, _db_error
+    if _flexa_governed_mode():
+        home = _current_hermes_home().resolve()
+        key = str(home)
+        with _governed_db_lock:
+            if key not in _governed_dbs:
+                from hermes_state import SessionDB
+
+                try:
+                    _governed_dbs[key] = SessionDB(db_path=home / "state.db")
+                    _governed_db_errors.pop(key, None)
+                except Exception as exc:
+                    _governed_db_errors[key] = str(exc)
+                    logger.warning(
+                        "Managed TUI session store unavailable for %s: %s", home, exc
+                    )
+                    return None
+            return _governed_dbs[key]
     if _db is None:
         from hermes_state import SessionDB
 
@@ -988,7 +1248,14 @@ def _get_db():
 
 
 def _db_unavailable_error(rid, *, code: int):
-    detail = _db_error or "state.db unavailable"
+    if _flexa_governed_mode():
+        try:
+            detail = _governed_db_errors.get(str(_current_hermes_home().resolve()))
+        except Exception:
+            detail = None
+    else:
+        detail = _db_error
+    detail = detail or "state.db unavailable"
     return _err(rid, code, f"state.db unavailable: {detail}")
 
 
@@ -1003,6 +1270,17 @@ def _db_unavailable_error(rid, *, code: int):
 def _profile_home(profile: str | None) -> Path | None:
     """Resolve a named profile's home on THIS host, or None for the launch profile."""
     name = (profile or "").strip()
+    from hermes_cli.flexa_governed import (
+        binding_for_current_home,
+        governed_mode,
+        verified_profile_home,
+    )
+
+    if governed_mode():
+        # Omitted request data means the connection's already-verified profile,
+        # never the unmanaged root and never an arbitrary tenant primary.
+        selected = name or binding_for_current_home()[0].slug
+        return verified_profile_home(selected)
     if not name:
         return None
     try:
@@ -1138,6 +1416,15 @@ def write_json(obj: dict) -> bool:
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
+    if _flexa_governed_mode():
+        if event == "session.info":
+            from hermes_cli.flexa_governed import project_governed_session_info
+
+            payload = project_governed_session_info(payload)
+        elif event == "error":
+            from hermes_cli.flexa_governed import project_governed_error_event
+
+            payload = project_governed_error_event(payload)
     params = {"type": event, "session_id": sid}
     if payload is not None:
         params["payload"] = payload
@@ -1242,10 +1529,36 @@ def handle_request(req: dict) -> dict | None:
         return normalized
 
     rid, method, params = normalized
+    try:
+        from hermes_cli.flexa_governed import (
+            GovernedProfileError,
+            authorize_governed_rpc,
+            verified_profile_home,
+        )
+
+        governed_profile = authorize_governed_rpc(method, params)
+        if governed_profile is not None:
+            session_id = str(params.get("session_id") or "").strip()
+            live_session = _sessions.get(session_id) if session_id else None
+            expected_home = verified_profile_home(governed_profile.slug).resolve()
+            if live_session is None and method == "session.resume" and session_id:
+                live = _find_live_session_by_key(session_id, expected_home)
+                live_session = live[1] if live is not None else None
+            if live_session is not None:
+                stored_home = str(live_session.get("profile_home") or "").strip()
+                if not stored_home or Path(stored_home).resolve() != expected_home:
+                    raise GovernedProfileError(
+                        "live session does not belong to the connection profile"
+                    )
+    except GovernedProfileError:
+        return _err(rid, 4030, "method unavailable in managed profile")
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
-    return fn(rid, params)
+    response = fn(rid, params)
+    from hermes_cli.flexa_governed import redact_governed_rpc_response
+
+    return redact_governed_rpc_response(method, response)
 
 
 def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
@@ -1278,7 +1591,10 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             try:
                 resp = handle_request(req)
             except Exception as exc:
-                resp = _err(req.get("id"), -32000, f"handler error: {exc}")
+                if _flexa_governed_mode():
+                    resp = _err(req.get("id"), -32000, "managed request failed")
+                else:
+                    resp = _err(req.get("id"), -32000, f"handler error: {exc}")
             if resp is not None:
                 t.write(resp)
 
@@ -1316,7 +1632,9 @@ def _start_agent_build(sid: str, session: dict) -> None:
     # to a full agent mid-stream and silently kill the mirror (the mirror bails
     # once agent is set). Once the child completes, the guard lifts and the next
     # prompt/RPC builds the agent normally so the user can talk to the session.
-    if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+    if session.get("lazy") and _child_run_active(
+        str(session.get("session_key") or ""), session.get("profile_home")
+    ):
         return
     lock = session.setdefault("agent_build_lock", threading.Lock())
     with lock:
@@ -1340,7 +1658,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
         home_token = None
         profile_home = current.get("profile_home")
         try:
-            tokens = _set_session_context(key)
+            tokens = _set_session_context(
+                key,
+                cwd=str(current.get("cwd") or ""),
+                ui_session_id=sid,
+                source=_session_source(current),
+            )
             # Build against the session's profile (global-remote): bind its
             # HERMES_HOME so config/skills/model resolve to it, and hand the
             # agent that profile's db so turns persist to the right state.db.
@@ -1407,7 +1730,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 )
 
                 register_gateway_notify(
-                    key, lambda data: _emit_approval_request(sid, data)
+                    _approval_scope_key(current, key),
+                    lambda data: _emit_approval_request(sid, data),
                 )
                 notify_registered = True
                 load_permanent_allowlist()
@@ -1468,7 +1792,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 try:
                     from tools.approval import unregister_gateway_notify
 
-                    unregister_gateway_notify(key)
+                    unregister_gateway_notify(_approval_scope_key(current, key))
                 except Exception:
                     pass
             ready.set()
@@ -1904,7 +2228,7 @@ def _load_cfg() -> dict:
         # launch profile's _hermes_home. Cache is keyed on the resolved path, so
         # profiles don't clobber each other.
         override = get_hermes_home_override()
-        home = override if isinstance(override, str) and override else _hermes_home
+        home = override if isinstance(override, str) and override else _current_hermes_home()
         p = Path(home) / "config.yaml"
         mtime = p.stat().st_mtime if p.exists() else None
         with _cfg_lock:
@@ -1950,7 +2274,7 @@ def _save_cfg(cfg: dict):
 
     from hermes_cli.config import atomic_config_write
 
-    path = _hermes_home / "config.yaml"
+    path = _current_hermes_home() / "config.yaml"
     atomic_config_write(path, cfg)
     with _cfg_lock:
         _cfg_cache = copy.deepcopy(cfg)
@@ -1982,6 +2306,7 @@ def _set_session_context(
     cwd: str | None = None,
     *,
     ui_session_id: str = "",
+    source: str | None = None,
 ) -> list:
     try:
         from gateway.session_context import set_session_vars
@@ -1990,16 +2315,28 @@ def _set_session_context(
         # reverse-map returns "" and would clear the cwd override. Callers that
         # know the parent workspace pass it explicitly so spawned agents inherit
         # it instead of falling back to the gateway launch dir.
-        resolved = cwd if cwd is not None else _cwd_for_session_key(session_key)
-        source = _resolve_session_platform()
+        matched_session = None
         with _sessions_lock:
-            for sess in list(_sessions.values()):
-                if sess.get("session_key") == session_key:
-                    source = _session_source(sess)
-                    break
+            if ui_session_id:
+                matched_session = _sessions.get(ui_session_id)
+            if matched_session is None:
+                for sess in list(_sessions.values()):
+                    if sess.get("session_key") == session_key:
+                        matched_session = sess
+                        break
+        resolved = (
+            cwd
+            if cwd is not None
+            else str((matched_session or {}).get("cwd") or "")
+        )
+        resolved_source = source or (
+            _session_source(matched_session)
+            if matched_session is not None
+            else _resolve_session_platform()
+        )
         return set_session_vars(
             session_key=session_key,
-            source=source,
+            source=resolved_source,
             cwd=resolved,
             ui_session_id=ui_session_id,
         )
@@ -3142,6 +3479,8 @@ def _sync_session_key_after_compress(
             new_session_id,
         )
 
+    old_approval_key = _approval_scope_key(session, old_key)
+    new_approval_key = _approval_scope_key(session, new_session_id)
     try:
         from tools.approval import (
             disable_session_yolo,
@@ -3152,23 +3491,23 @@ def _sync_session_key_after_compress(
         )
 
         try:
-            unregister_gateway_notify(old_key)
+            unregister_gateway_notify(old_approval_key)
         except Exception:
             pass
         session["session_key"] = new_session_id
         try:
-            yolo_was_on = is_session_yolo_enabled(old_key)
+            yolo_was_on = is_session_yolo_enabled(old_approval_key)
         except Exception:
             yolo_was_on = False
         if yolo_was_on:
             try:
-                enable_session_yolo(new_session_id)
-                disable_session_yolo(old_key)
+                enable_session_yolo(new_approval_key)
+                disable_session_yolo(old_approval_key)
             except Exception:
                 pass
         try:
             register_gateway_notify(
-                new_session_id,
+                new_approval_key,
                 lambda data: _emit_approval_request(sid, data),
             )
         except Exception:
@@ -3349,7 +3688,13 @@ def _session_info(agent, session: dict | None = None) -> dict:
         )
 
         session_yolo = (
-            bool(is_session_yolo_enabled(session_key)) if session_key else False
+            bool(
+                is_session_yolo_enabled(
+                    _approval_scope_key(session or {}, session_key)
+                )
+            )
+            if session_key
+            else False
         )
         yolo = bool(_YOLO_MODE_FROZEN) or session_yolo or _get_approval_mode() == "off"
     except Exception:
@@ -3765,7 +4110,12 @@ def _on_tool_progress(
         # catch-all. The mirror keys off the child sid and is unaffected.
         if event_type != "subagent.text":
             _emit(event_type, sid, payload)
-        _mirror_subagent_to_child(event_type, payload)
+        parent_session = _sessions.get(sid) or {}
+        _mirror_subagent_to_child(
+            event_type,
+            payload,
+            profile_home=parent_session.get("profile_home"),
+        )
 
 
 # ── Child-session live mirror ────────────────────────────────────────
@@ -3777,47 +4127,64 @@ def _on_tool_progress(
 # persists. Translate the relayed events into the native stream events the
 # window already renders — emitted on the CHILD sid, routed to its transport
 # by write_json — so the window shows a real midstream turn.
-_child_mirrors: dict[str, dict] = {}
+_child_mirrors: dict[object, dict] = {}
 _child_mirrors_lock = threading.Lock()
 # Stored child session ids with a delegation run currently in flight (refreshed
 # on every relayed subagent.* event, popped on subagent.complete). Lets a lazy
 # watch resume report running=true so the window shows a busy indicator even
 # while the child is silent inside a long tool call (no events for 25s+).
-_active_child_runs: dict[str, float] = {}
+_active_child_runs: dict[object, float] = {}
 # Staleness bound for the registry: entries refresh on every relayed event, so
 # anything this quiet means the completion event was lost (callback raised,
 # parent crashed) — don't let a leaked entry pin "running" forever.
 _CHILD_RUN_STALE_S = 3600.0
 
 
-def _child_run_active(child_key: str) -> bool:
-    ts = _active_child_runs.get(child_key)
+def _child_registry_key(child_key: str, profile_home: Any = None) -> object:
+    scope = profile_home
+    if scope is None and _flexa_governed_mode():
+        scope = _current_hermes_home()
+    canonical = _canonical_profile_scope(scope) if scope is not None else None
+    return (canonical, child_key) if canonical is not None else child_key
+
+
+def _child_run_active(child_key: str, profile_home: Any = None) -> bool:
+    ts = _active_child_runs.get(_child_registry_key(child_key, profile_home))
     return ts is not None and (time.time() - ts) < _CHILD_RUN_STALE_S
 
 
-def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
+def _mirror_subagent_to_child(
+    event_type: str,
+    payload: dict,
+    *,
+    profile_home: Any = None,
+) -> None:
     child_key = str(payload.get("child_session_id") or "")
     if not child_key:
         return
+    registry_key = _child_registry_key(child_key, profile_home)
     # Liveness registry first — it must be accurate even when no window is
     # open, so a window opened mid-run can immediately know the child is busy.
     if event_type == "subagent.complete":
-        _active_child_runs.pop(child_key, None)
+        _active_child_runs.pop(registry_key, None)
     else:
-        _active_child_runs[child_key] = time.time()
+        _active_child_runs[registry_key] = time.time()
     # Mirror only into a live watch session (keyed by session_key; its live sid
     # differs from the stored id) that has NOT been upgraded to a full agent.
     # No window / closed → nothing to mirror; an upgraded session owns a real
     # native stream and mirroring on top would interleave two turns on one sid.
     # Either way drop state so a reopened window starts a fresh synthetic turn.
-    live = _find_live_session_by_key(child_key)
+    live = _find_live_session_by_key(child_key, profile_home)
     if live is None or live[1].get("agent") is not None:
         with _child_mirrors_lock:
-            _child_mirrors.pop(child_key, None)
+            _child_mirrors.pop(registry_key, None)
         return
     csid = live[0]
     with _child_mirrors_lock:
-        st = _child_mirrors.setdefault(child_key, {"seq": 0, "open_tool": None, "started": False})
+        st = _child_mirrors.setdefault(
+            registry_key,
+            {"seq": 0, "open_tool": None, "started": False},
+        )
         if not st["started"]:
             st["started"] = True
             _emit("message.start", csid)
@@ -3853,7 +4220,7 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
                 _emit("tool.complete", csid, st["open_tool"])
             summary = str(payload.get("summary") or payload.get("text") or "")
             _emit("message.complete", csid, {"text": summary})
-            _child_mirrors.pop(child_key, None)
+            _child_mirrors.pop(registry_key, None)
 
 
 def _agent_cbs(sid: str) -> dict:
@@ -4314,7 +4681,12 @@ def _preview_restart_callbacks(parent: str, task_id: str) -> dict:
 
 
 def _reset_session_agent(sid: str, session: dict) -> dict:
-    tokens = _set_session_context(session["session_key"])
+    tokens = _set_session_context(
+        session["session_key"],
+        cwd=_session_cwd(session),
+        ui_session_id=sid,
+        source=_session_source(session),
+    )
     try:
         # Preserve this session's chosen model AND reasoning across /new so a
         # reset doesn't silently revert to global config (or to a model
@@ -4338,6 +4710,8 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     session["agent"] = new_agent
     session["config_model_seen"] = _config_model_target()
     session["attached_images"] = []
+    session["attachment_display_names"] = {}
+    session["attachment_sizes"] = {}
     session["edit_snapshots"] = {}
     session["image_counter"] = 0
     session["running"] = False
@@ -4645,7 +5019,9 @@ def _init_session(
     cwd: str | None = None,
     session_db=None,
     source: str | None = None,
+    profile_home: Path | str | None = None,
 ):
+    _maybe_prune_governed_uploads(profile_home)
     now = time.time()
     with _sessions_lock:
         _sessions[sid] = {
@@ -4659,6 +5035,15 @@ def _init_session(
             "last_active": now,
             "running": False,
             "attached_images": [],
+            "attached_file_uploads": {},
+            "turn_file_uploads": {},
+            "turn_image_uploads": {},
+            "preturn_attachment_claims": {},
+            "attachment_lock": threading.RLock(),
+            "attachment_upload_nonces": {},
+            "detached_attachment_ids": [],
+            "attachment_display_names": {},
+            "attachment_sizes": {},
             "image_counter": 0,
             "cwd": cwd or _completion_cwd(),
             "cols": cols,
@@ -4672,6 +5057,7 @@ def _init_session(
             # Honored on rebuild (/new, resume) so a switch in THIS session
             # never leaks into siblings via process-global env vars.
             "model_override": None,
+            "profile_home": str(profile_home) if profile_home is not None else None,
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
@@ -4708,7 +5094,10 @@ def _init_session(
     try:
         from tools.approval import register_gateway_notify, load_permanent_allowlist
 
-        register_gateway_notify(key, lambda data: _emit_approval_request(sid, data))
+        register_gateway_notify(
+            _approval_scope_key(_sessions[sid], key),
+            lambda data: _emit_approval_request(sid, data),
+        )
         load_permanent_allowlist()
     except Exception:
         pass
@@ -5057,7 +5446,44 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
+def _merge_queued_attachment_claims(
+    session: dict,
+    target_claim_id: str | None,
+    source_claim_id: str | None,
+) -> str | None:
+    if source_claim_id is None:
+        return target_claim_id
+    if target_claim_id is None:
+        return source_claim_id
+    if target_claim_id == source_claim_id:
+        return target_claim_id
+    with _session_attachment_lock(session):
+        claims = session.setdefault("preturn_attachment_claims", {})
+        target = claims.get(target_claim_id)
+        source = claims.get(source_claim_id)
+        if not isinstance(target, dict) or not isinstance(source, dict):
+            raise RuntimeError("queued attachment claim is unavailable")
+        target_images = target.setdefault("images", {})
+        target_files = target.setdefault("files", {})
+        source_images = source.get("images", {})
+        source_files = source.get("files", {})
+        if set(target_images).intersection(source_images) or set(target_files).intersection(
+            source_files
+        ):
+            raise RuntimeError("queued attachment ownership overlaps")
+        target_images.update(source_images)
+        target_files.update(source_files)
+        claims.pop(source_claim_id, None)
+    return target_claim_id
+
+
+def _enqueue_prompt(
+    session: dict,
+    text: Any,
+    transport: Any,
+    *,
+    attachment_claim_id: str | None = None,
+) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
@@ -5074,7 +5500,16 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     ):
         prev = existing["text"]
         text = f"{prev}\n\n{text}" if prev and text else (prev or text)
-    session["queued_prompt"] = {"text": text, "transport": transport}
+    merged_claim_id = _merge_queued_attachment_claims(
+        session,
+        existing.get("attachment_claim_id") if isinstance(existing, dict) else None,
+        attachment_claim_id,
+    )
+    session["queued_prompt"] = {
+        "attachment_claim_id": merged_claim_id,
+        "text": text,
+        "transport": transport,
+    }
 
 
 def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any) -> dict:
@@ -5094,7 +5529,16 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
     """
     mode = _load_busy_input_mode()
     agent = session.get("agent")
-    if mode == "steer" and agent is not None and hasattr(agent, "steer"):
+    try:
+        attachment_claim_id = _claim_accepted_prompt_attachments(session, text)
+    except Exception:
+        return _err(rid, 4018, "managed attachment claim failed")
+    if (
+        attachment_claim_id is None
+        and mode == "steer"
+        and agent is not None
+        and hasattr(agent, "steer")
+    ):
         try:
             if agent.steer(text):
                 session["last_active"] = time.time()
@@ -5106,7 +5550,16 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
             agent.interrupt()
         except Exception:
             pass
-    _enqueue_prompt(session, text, transport)
+    try:
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            attachment_claim_id=attachment_claim_id,
+        )
+    except Exception:
+        _cleanup_prompt_attachment_claim(session, attachment_claim_id)
+        return _err(rid, 4018, "managed attachment queue failed")
     session["last_active"] = time.time()
     return _ok(rid, {"status": "queued"})
 
@@ -5127,8 +5580,17 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     try:
-        _run_prompt_submit(rid, sid, session, queued["text"])
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            queued["text"],
+            attachment_claim_id=queued.get("attachment_claim_id"),
+        )
     except Exception as exc:
+        _cleanup_prompt_attachment_claim(
+            session, queued.get("attachment_claim_id")
+        )
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
             f"{type(exc).__name__}: {exc}",
@@ -5226,6 +5688,15 @@ def _(rid, params: dict) -> dict:
             "agent_error": None,
             "agent_ready": ready,
             "attached_images": [],
+            "attached_file_uploads": {},
+            "turn_file_uploads": {},
+            "turn_image_uploads": {},
+            "preturn_attachment_claims": {},
+            "attachment_lock": threading.RLock(),
+            "attachment_upload_nonces": {},
+            "detached_attachment_ids": [],
+            "attachment_display_names": {},
+            "attachment_sizes": {},
             "close_on_disconnect": is_truthy_value(params.get("close_on_disconnect", False)),
             "active_session_lease": lease,
             "cols": cols,
@@ -5477,6 +5948,15 @@ def _deferred_session_record(
         "agent_error": None,
         "agent_ready": threading.Event(),
         "attached_images": [],
+        "attached_file_uploads": {},
+        "turn_file_uploads": {},
+        "turn_image_uploads": {},
+        "preturn_attachment_claims": {},
+        "attachment_lock": threading.RLock(),
+        "attachment_upload_nonces": {},
+        "detached_attachment_ids": [],
+        "attachment_display_names": {},
+        "attachment_sizes": {},
         "close_on_disconnect": close_on_disconnect,
         "active_session_lease": lease,
         "cols": cols,
@@ -5515,7 +5995,7 @@ def _claim_or_reuse_live(
     resume lock, or — if a concurrent resume already won — release ``lease`` and
     return the winner for the caller to reuse."""
     with _session_resume_lock:
-        live = _find_live_session_by_key(session_key)
+        live = _find_live_session_by_key(session_key, record.get("profile_home"))
         if live is not None:
             if lease is not None:
                 lease.release()
@@ -5570,7 +6050,9 @@ def _(rid, params: dict) -> dict:
         found = db.get_session_by_title(target)
         if found:
             target = found["id"]
-        elif is_truthy_value(params.get("lazy", False)) and _child_run_active(target):
+        elif is_truthy_value(params.get("lazy", False)) and _child_run_active(
+            target, profile_home
+        ):
             # Race: a watch window opened on a freshly-spawned subagent. The
             # child relays `subagent.start` (which carries child_session_id and
             # triggers the window) BEFORE its first run_conversation() flushes
@@ -5622,14 +6104,16 @@ def _(rid, params: dict) -> dict:
         # A lazy watch session never owns a run loop, so its payload's running
         # flag is always False — overlay the child-run registry so a reconnecting
         # watch window keeps its busy indicator while the child is still mid-run.
-        if session.get("agent") is None and _child_run_active(target):
+        if session.get("agent") is None and _child_run_active(
+            target, session.get("profile_home")
+        ):
             payload["running"] = True
             payload["status"] = "streaming"
         return payload
 
     # Fast path: if the session is already live, reuse it under the lock.
     with _session_resume_lock:
-        live = _find_live_session_by_key(target)
+        live = _find_live_session_by_key(target, profile_home)
         if live is not None:
             return _ok(rid, _reuse_live_payload(*live))
 
@@ -5673,7 +6157,7 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, _reuse_live_payload(*live))
         # A delegated child mid-run emits no session events of its own — report
         # its liveness from the relay registry so the window shows a busy turn.
-        child_running = _child_run_active(target)
+        child_running = _child_run_active(target, profile_home)
         messages = _history_to_messages(history)
         return _ok(
             rid,
@@ -5807,7 +6291,12 @@ def _(rid, params: dict) -> dict:
         ]
         history = sanitize_replay_history(raw_history)
         messages = _history_to_messages(display_history)
-        tokens = _set_session_context(target)
+        tokens = _set_session_context(
+            target,
+            cwd=profile_resume_cwd or _default_session_cwd(),
+            ui_session_id=sid,
+            source=source,
+        )
         try:
             # Pass the profile's db so the agent persists turns to the right
             # state.db; home override is active here so config/skills/model
@@ -5837,7 +6326,7 @@ def _(rid, params: dict) -> dict:
     # live session while we were building. Re-check under the lock; if it won,
     # discard our just-built agent and reuse theirs (no worker/poller wired yet).
     with _session_resume_lock:
-        live = _find_live_session_by_key(target)
+        live = _find_live_session_by_key(target, profile_home)
         if live is not None:
             try:
                 if hasattr(agent, "close"):
@@ -5872,6 +6361,7 @@ def _(rid, params: dict) -> dict:
                     cwd=profile_resume_cwd,
                     session_db=db,
                     source=source,
+                    profile_home=profile_home,
                 )
             finally:
                 if init_home_token is not None:
@@ -5882,11 +6372,6 @@ def _(rid, params: dict) -> dict:
                         "model_override"
                     ]
                 _sessions[sid]["display_history_prefix"] = display_history_prefix
-                # Remember the profile home so each turn re-binds HERMES_HOME (the
-                # agent persists to its own db, but mid-turn home reads — memory,
-                # skills — must resolve to the resumed profile too).
-                if profile_home is not None:
-                    _sessions[sid]["profile_home"] = str(profile_home)
                 _sessions[sid]["active_session_lease"] = lease
         except Exception as e:
             if lease is not None:
@@ -6010,9 +6495,36 @@ def _session_lookup_key(session: dict, *, fallback: str = "") -> str:
     )
 
 
-def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
+_PROFILE_SCOPE_UNSET = object()
+
+
+def _canonical_profile_scope(profile_home: Any) -> str | None:
+    if profile_home is None:
+        return None
+    try:
+        return os.path.normcase(str(Path(str(profile_home)).resolve(strict=False)))
+    except (OSError, RuntimeError, ValueError):
+        return os.path.normcase(os.path.abspath(str(profile_home)))
+
+
+def _find_live_session_by_key(
+    session_key: str,
+    profile_home: Any = _PROFILE_SCOPE_UNSET,
+) -> tuple[str, dict] | None:
+    expected_scope: Any = profile_home
+    if (
+        expected_scope is _PROFILE_SCOPE_UNSET or expected_scope is None
+    ) and _flexa_governed_mode():
+        expected_scope = _current_hermes_home()
+    if expected_scope is not _PROFILE_SCOPE_UNSET:
+        expected_scope = _canonical_profile_scope(expected_scope)
     for sid, session in list(_sessions.items()):
         if session.get("_finalized"):
+            continue
+        if (
+            expected_scope is not _PROFILE_SCOPE_UNSET
+            and _canonical_profile_scope(session.get("profile_home")) != expected_scope
+        ):
             continue
         if _session_lookup_key(session, fallback=sid) == session_key:
             return sid, session
@@ -8084,7 +8596,12 @@ def _(rid, params: dict) -> dict:
             lease.release()
         return _err(rid, 5008, f"branch failed: {e}")
     try:
-        tokens = _set_session_context(new_key)
+        tokens = _set_session_context(
+            new_key,
+            cwd=_session_cwd(session),
+            ui_session_id=new_sid,
+            source=source,
+        )
         try:
             agent = _make_agent(
                 new_sid,
@@ -8101,6 +8618,7 @@ def _(rid, params: dict) -> dict:
             list(history),
             cols=session.get("cols", 80),
             source=source,
+            profile_home=session.get("profile_home"),
         )
         if new_sid in _sessions:
             _sessions[new_sid]["active_session_lease"] = lease
@@ -8128,9 +8646,14 @@ def _(rid, params: dict) -> dict:
     should_interrupt = bool(session.get("running"))
     if should_interrupt and hasattr(session["agent"], "interrupt"):
         session["agent"].interrupt()
+    queued_claim_id = None
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
+        queued = session.get("queued_prompt")
+        if isinstance(queued, dict):
+            queued_claim_id = queued.get("attachment_claim_id")
         session["queued_prompt"] = None
+    _cleanup_prompt_attachment_claim(session, queued_claim_id)
     if not run_thread_alive:
         with session["history_lock"]:
             if session.get("running"):
@@ -8149,7 +8672,9 @@ def _(rid, params: dict) -> dict:
     try:
         from tools.approval import resolve_gateway_approval
 
-        resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
+        resolve_gateway_approval(
+            _approval_scope_key(session), "deny", resolve_all=True
+        )
     except Exception:
         pass
     return _ok(rid, {"status": "interrupted"})
@@ -8429,6 +8954,7 @@ def _(rid, params: dict) -> dict:
     # or fallback moved the session transport to stdio.
     if (t := current_transport()) is not None:
         session["transport"] = t
+    attachment_claim_id: str | None = None
     with session["history_lock"]:
         if session.get("running"):
             # Don't reject a mid-turn prompt — queue it (and, by default,
@@ -8441,7 +8967,9 @@ def _(rid, params: dict) -> dict:
         # racing the in-flight child on the same stored session (interleaved
         # transcript, stale fork). After the run completes, submitting is fine:
         # the upgrade resumes the child's transcript as a normal conversation.
-        if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+        if session.get("lazy") and _child_run_active(
+            str(session.get("session_key") or ""), session.get("profile_home")
+        ):
             return _err(rid, 4009, "subagent still running — wait for it to finish")
         if truncate_user_ordinal is not None:
             try:
@@ -8464,22 +8992,37 @@ def _(rid, params: dict) -> dict:
                 try:
                     db.replace_messages(session["session_key"], truncated)
                 except Exception as exc:
-                    print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
+                    if not _flexa_governed_mode():
+                        print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
+        try:
+            attachment_claim_id = _claim_accepted_prompt_attachments(
+                session, text
+            )
+        except Exception:
+            return _err(rid, 4030, "managed attachment claim failed")
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
 
-    # Persist the DB row lazily, now that the user has actually sent a message.
-    _ensure_session_db_row(session)
-    # A branch becomes real here: copy its parent's transcript into the row so it
-    # resumes with full context (the agent won't persist the seed itself).
-    _persist_branch_seed(session)
-    _start_agent_build(sid, session)
+    try:
+        # Persist the DB row lazily, now that the user has actually sent a message.
+        _ensure_session_db_row(session)
+        # A branch becomes real here: copy its parent's transcript into the row so it
+        # resumes with full context (the agent won't persist the seed itself).
+        _persist_branch_seed(session)
+        _start_agent_build(sid, session)
+    except Exception:
+        _cleanup_prompt_attachment_claim(session, attachment_claim_id)
+        with session["history_lock"]:
+            session["running"] = False
+            _clear_inflight_turn(session)
+        return _err(rid, 5032, "agent initialization failed")
 
     def run_after_agent_ready() -> None:
         err = _wait_agent(session, rid)
         if err:
+            _cleanup_prompt_attachment_claim(session, attachment_claim_id)
             _emit(
                 "error",
                 sid,
@@ -8495,10 +9038,17 @@ def _(rid, params: dict) -> dict:
             return
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
+                _cleanup_prompt_attachment_claim(session, attachment_claim_id)
                 session["running"] = False
                 _clear_inflight_turn(session)
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            attachment_claim_id=attachment_claim_id,
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -8763,11 +9313,12 @@ def _notification_poller_loop(
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)
         except Exception as exc:
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
+            if not _flexa_governed_mode():
+                print(
+                    f"[tui_gateway] notification poller dispatch failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
             with session["history_lock"]:
                 session["running"] = False
 
@@ -8841,6 +9392,9 @@ def _wire_agent_terminal_output() -> None:
 
     has_output_sink = getattr(process_registry, "on_output", None) is not None
     has_close_sink = getattr(process_registry, "on_close", None) is not None
+    if _flexa_governed_mode():
+        process_registry.on_output = lambda _session, _chunk: None
+        has_output_sink = True
     if has_output_sink and has_close_sink:
         return
 
@@ -8855,6 +9409,8 @@ def _wire_agent_terminal_output() -> None:
         return ""
 
     def _emit_agent_terminal_output(session, chunk):
+        if _flexa_governed_mode():
+            return
         _emit(
             "agent.terminal.output",
             _owner_sid_for_process(session),
@@ -8886,12 +9442,17 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+def _run_prompt_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    attachment_claim_id: str | None = None,
+) -> None:
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
-        images = list(session.get("attached_images", []))
-        session["attached_images"] = []
         if not isinstance(session.get("inflight_turn"), dict):
             _start_inflight_turn(session, text)
     agent = session["agent"]
@@ -8907,13 +9468,18 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
+        images: list[str] = []
+        attachment_display_names: dict[str, str] = {}
+        turn_file_upload_ids: set[str] = set()
+        turn_tool_upload_ids: set[str] = set()
+        governed_image_ids: set[str] = set()
         try:
             from tools.approval import (
                 reset_current_session_key,
                 set_current_session_key,
             )
 
-            approval_token = set_current_session_key(session["session_key"])
+            approval_token = set_current_session_key(_approval_scope_key(session))
             session_tokens = _set_session_context(
                 session["session_key"],
                 ui_session_id=sid,
@@ -8921,12 +9487,18 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             _profile_home_str = session.get("profile_home")
             if _profile_home_str:
                 home_token = set_hermes_home_override(_profile_home_str)
+            (
+                images,
+                attachment_display_names,
+                claimed_file_ids,
+            ) = _activate_prompt_attachment_claim(session, attachment_claim_id)
+            turn_file_upload_ids.update(claimed_file_ids)
             # The sudo password callback is thread-local (tools.terminal_tool
             # _callback_tls), so wiring it on the build thread doesn't reach this
             # turn thread — terminal sudo prompts would fall through to /dev/tty
             # and hang the headless gateway. Re-wire here so the prompt routes to
-            # the sudo.request overlay. (secret capture is a module global, so
-            # re-running is a harmless no-op.)
+            # the sudo.request overlay. Secret capture is ContextVar-scoped, so
+            # re-wiring also binds it to this exact profile turn.
             _wire_callbacks(sid)
             _sync_agent_model_with_config(sid, session)
             cwd = _session_cwd(session)
@@ -8937,7 +9509,18 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
 
             if isinstance(prompt, str) and "@" in prompt:
                 from agent.context_references import preprocess_context_references
+                from agent.flexa_enforcement import FlexaEnforcementError
                 from agent.model_metadata import get_model_context_length
+
+                owned_uploads, ownership_error = _governed_prompt_staged_file_uploads(
+                    session,
+                    prompt,
+                    cwd,
+                    ownership_key="turn_file_uploads",
+                )
+                turn_file_upload_ids.update(owned_uploads)
+                if ownership_error:
+                    raise FlexaEnforcementError(ownership_error)
 
                 ctx_len = get_model_context_length(
                     getattr(agent, "model", "") or _resolve_model(),
@@ -8954,6 +9537,20 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     allowed_root=cwd,
                     context_length=ctx_len,
                 )
+                turn_tool_upload_ids.update(
+                    _governed_upload_ids_for_paths(
+                        session, turn_file_upload_ids, ctx.tool_files
+                    )
+                )
+                if not ctx.blocked:
+                    materialized_uploads = _governed_upload_ids_for_paths(
+                        session, turn_file_upload_ids, ctx.materialized_files
+                    )
+                    _delete_governed_file_uploads(
+                        session,
+                        materialized_uploads,
+                        suppress_errors=False,
+                    )
                 if ctx.blocked:
                     _emit(
                         "error",
@@ -8971,12 +9568,31 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # parts (adapters translate for Anthropic/Gemini/Bedrock/etc.).
             # "text"   → pre-analyze with vision_analyze and prepend the text.
             # See agent/image_routing.py for the full decision table.
+            governed = _flexa_governed_mode()
             run_message: Any = prompt
-            if images:
+            if governed and images:
+                descriptors: list[str] = []
+                for image_path in images:
+                    attachment_id = Path(image_path).name
+                    governed_image_ids.add(attachment_id)
+                    display_name = attachment_display_names.get(
+                        image_path, Path(image_path).name
+                    )
+                    descriptors.append(
+                        "attachment_id="
+                        f"{attachment_id}, display_name={json.dumps(display_name, ensure_ascii=False)}"
+                    )
+                run_message = (
+                    f"{str(prompt or '').strip()}\n\n"
+                    "[Managed image attachments: "
+                    + "; ".join(descriptors)
+                    + "]"
+                ).strip()
+            elif images:
                 try:
                     from agent.image_routing import (
-                        decide_image_input_mode,
                         build_native_content_parts,
+                        decide_image_input_mode,
                     )
                     from agent.auxiliary_client import (
                         _read_main_model,
@@ -8984,36 +9600,30 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     )
                     from hermes_cli.config import load_config as _tui_load_config
 
-                    _cfg = _tui_load_config()
                     _mode = decide_image_input_mode(
                         _read_main_provider(),
                         _read_main_model(),
-                        _cfg,
+                        _tui_load_config(),
                     )
-                    if getattr(agent, "api_mode", "") == "codex_app_server":
-                        _mode = "text"
                 except Exception as _img_exc:
                     print(
                         f"[tui_gateway] image_routing decision failed, defaulting to text: {_img_exc}",
                         file=sys.stderr,
                     )
                     _mode = "text"
-
                 if _mode == "native":
                     try:
-                        _parts, _skipped = build_native_content_parts(
-                            prompt,
-                            images,
-                        )
+                        _parts, _skipped = build_native_content_parts(prompt, images)
                         if _skipped:
                             print(
                                 f"[tui_gateway] native image attachment skipped {len(_skipped)} unreadable path(s)",
                                 file=sys.stderr,
                             )
-                        if any(p.get("type") == "image_url" for p in _parts):
-                            run_message = _parts
-                        else:
-                            run_message = _enrich_with_attached_images(prompt, images)
+                        run_message = (
+                            _parts
+                            if any(p.get("type") == "image_url" for p in _parts)
+                            else _enrich_with_attached_images(prompt, images)
+                        )
                     except Exception as _img_exc:
                         print(
                             f"[tui_gateway] native attach failed, falling back to text: {_img_exc}",
@@ -9040,7 +9650,100 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     run_kwargs["task_id"] = session["session_key"]
             except (TypeError, ValueError):
                 pass
-            result = agent.run_conversation(run_message, **run_kwargs)
+            governed_attachment_ids = tuple(
+                sorted(governed_image_ids | turn_tool_upload_ids)
+            )
+            if governed_attachment_ids:
+                from agent.flexa_enforcement import GovernedAttachmentPrompt
+
+                cleanup_ids = tuple(
+                    dict.fromkeys(
+                        (
+                            *tuple(getattr(run_message, "attachment_ids", ())),
+                            *governed_attachment_ids,
+                        )
+                    )
+                )
+                run_message = GovernedAttachmentPrompt(
+                    str(run_message), cleanup_ids
+                )
+            from agent.flexa_enforcement import channel_ingress as _flexa_channel_ingress
+
+            governed_run_message = _flexa_channel_ingress(
+                agent,
+                run_message,
+                platform="desktop-tui",
+                session_id=session["session_key"],
+                persistence_content=(
+                    str(run_message) if governed_attachment_ids else None
+                ),
+            )
+            if governed_image_ids:
+                from agent.flexa_enforcement import (
+                    FlexaEnforcementError,
+                    governed_native_attachment_input,
+                    revoke_turn,
+                    trusted_gateway_attachment_bytes,
+                )
+
+                try:
+                    from agent.auxiliary_client import (
+                        _read_main_model,
+                        _read_main_provider,
+                    )
+                    from agent.image_routing import (
+                        build_native_content_parts_from_bytes,
+                        decide_image_input_mode,
+                    )
+                    from hermes_cli.config import load_config as _tui_load_config
+
+                    image_mode = decide_image_input_mode(
+                        _read_main_provider(),
+                        _read_main_model(),
+                        _tui_load_config(),
+                    )
+                    if image_mode != "native":
+                        raise FlexaEnforcementError(
+                            "managed image input requires native model vision support"
+                        )
+                    governed_images: list[tuple[str, str, bytes, str]] = []
+                    ordered_image_ids: list[str] = []
+                    for image_path in images:
+                        attachment_id = Path(image_path).name
+                        raw, suffix = trusted_gateway_attachment_bytes(attachment_id)
+                        ordered_image_ids.append(attachment_id)
+                        governed_images.append(
+                            (
+                                attachment_id,
+                                attachment_display_names.get(
+                                    image_path, f"attachment{suffix}"
+                                ),
+                                raw,
+                                suffix,
+                            )
+                        )
+                    native_parts, skipped = build_native_content_parts_from_bytes(
+                        str(governed_run_message.model_message), governed_images
+                    )
+                    if skipped or not any(
+                        part.get("type") == "image_url" for part in native_parts
+                    ):
+                        raise FlexaEnforcementError(
+                            "managed image input could not be decoded"
+                        )
+                    governed_run_message = governed_native_attachment_input(
+                        governed_run_message,
+                        native_parts,
+                        tuple(ordered_image_ids),
+                    )
+                except Exception as exc:
+                    revoke_turn(agent)
+                    if isinstance(exc, FlexaEnforcementError):
+                        raise
+                    raise FlexaEnforcementError(
+                        "managed image input failed"
+                    ) from exc
+            result = agent.run_conversation(governed_run_message, **run_kwargs)
             if "moa_one_shot_restore" in session:
                 _restore = session.pop("moa_one_shot_restore", None)
                 # Restore the model the user was on before the /moa one-shot.
@@ -9281,24 +9984,68 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 except Exception as e:
                     logger.warning("voice TTS dispatch failed: %s", e)
         except Exception as e:
-            import traceback
+            if _flexa_governed_mode():
+                audit_id = uuid.uuid4().hex
+                failure_type = type(e).__name__
+                if (
+                    not failure_type
+                    or len(failure_type) > 64
+                    or not failure_type.replace("_", "a").isalnum()
+                ):
+                    failure_type = "Exception"
+                try:
+                    os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
+                    with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+                        f.write(
+                            f"governed turn failure audit_id={audit_id} "
+                            f"type={failure_type} "
+                            f"at={time.strftime('%Y-%m-%dT%H:%M:%S')}\n"
+                        )
+                except Exception:
+                    pass
+                print(
+                    f"[gateway-turn] managed turn failed "
+                    f"(audit_id={audit_id}, type={failure_type})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _emit(
+                    "error",
+                    sid,
+                    {
+                        "message": "managed turn failed",
+                        "audit_id": audit_id,
+                        "type": failure_type,
+                    },
+                )
+            else:
+                import traceback
 
-            trace = traceback.format_exc()
-            try:
-                os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-                with open(_CRASH_LOG, "a", encoding="utf-8") as f:
-                    f.write(
-                        f"\n=== turn-dispatcher exception · "
-                        f"{time.strftime('%Y-%m-%d %H:%M:%S')} · sid={sid} ===\n"
-                    )
-                    f.write(trace)
-            except Exception:
-                pass
-            print(
-                f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
-            )
-            _emit("error", sid, {"message": str(e)})
+                trace = traceback.format_exc()
+                try:
+                    os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
+                    with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+                        f.write(
+                            f"\n=== turn-dispatcher exception · "
+                            f"{time.strftime('%Y-%m-%d %H:%M:%S')} · sid={sid} ===\n"
+                        )
+                        f.write(trace)
+                except Exception:
+                    pass
+                print(
+                    f"[gateway-turn] {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _emit("error", sid, {"message": str(e)})
         finally:
+            _cleanup_prompt_attachment_claim(session, attachment_claim_id)
+            _finish_turn_image_uploads(session)
+            _delete_governed_file_uploads(
+                session,
+                turn_file_upload_ids,
+                suppress_errors=True,
+            )
             try:
                 if approval_token is not None:
                     reset_current_session_key(approval_token)
@@ -9392,13 +10139,15 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    if _flexa_governed_mode():
+        return _err(rid, 4030, "method unavailable in managed profile")
     try:
         from hermes_cli.clipboard import has_clipboard_image, save_clipboard_image
     except Exception as e:
         return _err(rid, 5027, f"clipboard unavailable: {e}")
 
     session["image_counter"] = session.get("image_counter", 0) + 1
-    img_dir = _hermes_home / "images"
+    img_dir = _current_hermes_home() / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
     img_path = (
         img_dir
@@ -9432,6 +10181,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    if _flexa_governed_mode():
+        return _err(rid, 4030, "method unavailable in managed profile")
     raw = str(params.get("path", "") or "").strip()
     if not raw:
         return _err(rid, 4015, "path required")
@@ -9473,8 +10224,242 @@ def _(rid, params: dict) -> dict:
 # Byte-upload attach caps. 25 MB matches Anthropic's per-image limit; 50 MB / 25
 # pages bounds a single PDF drop so it can't blow the context budget.
 _ATTACH_BYTES_MAX_BYTES = 25 * 1024 * 1024
+_GOVERNED_ATTACH_MAX_COUNT = 8
+_GOVERNED_ATTACH_MAX_TOTAL_BYTES = 50 * 1024 * 1024
+_GOVERNED_BROKER_FILE_SUFFIXES = frozenset(
+    {".csv", ".docx", ".json", ".md", ".pdf", ".txt", ".xlsx"}
+)
+_GOVERNED_IMAGE_SUFFIXES = frozenset(
+    {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
+)
 _PDF_ATTACH_MAX_BYTES = 50 * 1024 * 1024
 _PDF_ATTACH_MAX_PAGES = 25
+
+
+class _GovernedAttachmentQuotaError(RuntimeError):
+    """Content-free signal for a per-session attachment quota denial."""
+
+
+class _GovernedAttachmentNonceError(RuntimeError):
+    """Content-free signal for an invalid/conflicting upload retry."""
+
+
+class _GovernedAttachmentTypeError(RuntimeError):
+    """Content-free signal for an attachment the broker cannot consume."""
+
+
+def _session_attachment_lock(session: dict) -> threading.RLock:
+    lock = session.get("attachment_lock")
+    if lock is None:
+        with _sessions_lock:
+            lock = session.get("attachment_lock")
+            if lock is None:
+                lock = threading.RLock()
+                session["attachment_lock"] = lock
+    return lock
+
+
+def _governed_attachment_usage(session: dict) -> tuple[int, int]:
+    """Return one authoritative count/byte total for images and files."""
+
+    images = list(session.setdefault("attached_images", []))
+    image_sizes = session.setdefault("attachment_sizes", {})
+    files = session.setdefault("attached_file_uploads", {})
+    turn_images = session.setdefault("turn_image_uploads", {})
+    turn_files = session.setdefault("turn_file_uploads", {})
+    claims = session.setdefault("preturn_attachment_claims", {})
+    total = 0
+    for path in images:
+        size = image_sizes.get(path)
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise _GovernedAttachmentQuotaError(
+                "managed attachment accounting is unavailable"
+            )
+        total += size
+    for item in (*files.values(), *turn_files.values()):
+        size = item.get("size") if isinstance(item, dict) else None
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise _GovernedAttachmentQuotaError(
+                "managed attachment accounting is unavailable"
+            )
+        total += size
+    for item in turn_images.values():
+        size = item.get("size") if isinstance(item, dict) else None
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise _GovernedAttachmentQuotaError(
+                "managed attachment accounting is unavailable"
+            )
+        total += size
+    claim_count = 0
+    for claim in claims.values():
+        if not isinstance(claim, dict):
+            raise _GovernedAttachmentQuotaError(
+                "managed attachment accounting is unavailable"
+            )
+        claim_items = (
+            *claim.get("images", {}).values(),
+            *claim.get("files", {}).values(),
+        )
+        for item in claim_items:
+            size = item.get("size") if isinstance(item, dict) else None
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                raise _GovernedAttachmentQuotaError(
+                    "managed attachment accounting is unavailable"
+                )
+            total += size
+            claim_count += 1
+    return (
+        len(images)
+        + len(files)
+        + len(turn_images)
+        + len(turn_files)
+        + claim_count,
+        total,
+    )
+
+
+def _store_governed_session_attachment(
+    session: dict,
+    payload: bytes,
+    suffix: str,
+    *,
+    kind: str,
+    upload_nonce: str,
+    display_name: str = "",
+) -> tuple[Path, int, bool]:
+    """Atomically quota-check, store, and register one managed attachment."""
+
+    if kind == "file" and suffix not in _GOVERNED_BROKER_FILE_SUFFIXES:
+        raise _GovernedAttachmentTypeError(
+            "managed attachment type is unavailable"
+        )
+    if kind == "image" and suffix not in _GOVERNED_IMAGE_SUFFIXES:
+        raise _GovernedAttachmentTypeError(
+            "managed image type is unavailable"
+        )
+    _prune_and_reconcile_governed_uploads(session.get("profile_home"))
+    lock = _session_attachment_lock(session)
+    with lock:
+        digest = hashlib.sha256(
+            kind.encode("ascii")
+            + b"\0"
+            + suffix.encode("ascii")
+            + b"\0"
+            + payload
+        ).hexdigest()
+        nonce_records = session.setdefault("attachment_upload_nonces", {})
+        existing = nonce_records.get(upload_nonce)
+        if existing is not None:
+            if (
+                not isinstance(existing, dict)
+                or existing.get("digest") != digest
+                or existing.get("kind") != kind
+            ):
+                raise _GovernedAttachmentNonceError(
+                    "managed upload nonce conflicts with prior bytes"
+                )
+            attachment_id = str(existing.get("attachment_id") or "")
+            registered_path = str(existing.get("path") or "")
+            claim_registered = any(
+                attachment_id in claim.get("files", {})
+                or registered_path in claim.get("images", {})
+                for claim in session.setdefault(
+                    "preturn_attachment_claims", {}
+                ).values()
+                if isinstance(claim, dict)
+            )
+            is_registered = (
+                registered_path in session.setdefault("attached_images", [])
+                or registered_path in session.setdefault("turn_image_uploads", {})
+                or attachment_id in session.setdefault("attached_file_uploads", {})
+                or attachment_id in session.setdefault("turn_file_uploads", {})
+                or claim_registered
+            )
+            if not is_registered:
+                raise _GovernedAttachmentNonceError(
+                    "managed upload nonce is no longer active"
+                )
+            count, _total = _governed_attachment_usage(session)
+            return Path(registered_path), count, True
+
+        count, total = _governed_attachment_usage(session)
+        if count >= _GOVERNED_ATTACH_MAX_COUNT:
+            raise _GovernedAttachmentQuotaError(
+                "managed attachment count limit reached"
+            )
+        if total + len(payload) > _GOVERNED_ATTACH_MAX_TOTAL_BYTES:
+            raise _GovernedAttachmentQuotaError(
+                "managed attachment batch is too large"
+            )
+
+        from agent.flexa_enforcement import (
+            delete_governed_upload,
+            store_governed_upload,
+        )
+
+        stored_path: Path | None = None
+        registered_path = ""
+        attachment_id = ""
+        try:
+            stored_path = store_governed_upload(payload, suffix=suffix)
+            attachment_id = stored_path.name
+            registered_path = str(stored_path)
+            if kind == "image":
+                session.setdefault("attached_images", []).append(registered_path)
+                session.setdefault("attachment_display_names", {})[
+                    registered_path
+                ] = display_name or f"upload{suffix}"
+                session.setdefault("attachment_sizes", {})[
+                    registered_path
+                ] = len(payload)
+            elif kind == "file":
+                ref_text = f"@file:.flexa/inbox/{attachment_id}"
+                session.setdefault("attached_file_uploads", {})[attachment_id] = {
+                    "path": registered_path,
+                    "size": len(payload),
+                    "ref_text": ref_text,
+                }
+            else:
+                raise RuntimeError("managed attachment kind is invalid")
+            nonce_records[upload_nonce] = {
+                "attachment_id": attachment_id,
+                "digest": digest,
+                "kind": kind,
+                "path": registered_path,
+            }
+            return stored_path, count + 1, False
+        except Exception:
+            if registered_path:
+                session.setdefault("attached_images", [])[:] = [
+                    path
+                    for path in session.get("attached_images", [])
+                    if path != registered_path
+                ]
+                session.setdefault("attachment_display_names", {}).pop(
+                    registered_path, None
+                )
+                session.setdefault("attachment_sizes", {}).pop(
+                    registered_path, None
+                )
+            if attachment_id:
+                session.setdefault("attached_file_uploads", {}).pop(
+                    attachment_id, None
+                )
+                if nonce_records.get(upload_nonce, {}).get("attachment_id") == attachment_id:
+                    nonce_records.pop(upload_nonce, None)
+            if stored_path is not None:
+                try:
+                    delete_governed_upload(stored_path.name)
+                except Exception:
+                    pass
+            raise
+
+
+def _forget_governed_upload_nonce(session: dict, attachment_id: str) -> None:
+    records = session.setdefault("attachment_upload_nonces", {})
+    for nonce, item in list(records.items()):
+        if isinstance(item, dict) and item.get("attachment_id") == attachment_id:
+            records.pop(nonce, None)
 
 # Leading magic bytes → file extension, for filename-less uploads.
 _IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
@@ -9538,24 +10523,55 @@ def _allowed_image_extensions() -> frozenset[str]:
         return frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
 
 
-def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: str) -> Path:
+def _queue_attached_image(
+    session: dict,
+    img_bytes: bytes,
+    ext: str,
+    *,
+    prefix: str,
+    display_name: str | None = None,
+    upload_nonce: str | None = None,
+) -> Path:
     """Write image bytes into the gateway's images dir and queue them.
 
     Mirrors what ``image.attach`` does for a local path: appends to
     ``session["attached_images"]`` so the next ``prompt.submit`` picks it up via
     the existing native-image-attach pipeline. Returns the written path.
     """
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode():
+        if not upload_nonce:
+            raise _GovernedAttachmentNonceError(
+                "managed image upload nonce is required"
+            )
+        img_path, _count, _reused = _store_governed_session_attachment(
+            session,
+            img_bytes,
+            ext,
+            kind="image",
+            upload_nonce=upload_nonce,
+            display_name=display_name or f"{prefix}{ext}",
+        )
+        session["image_counter"] = session.get("image_counter", 0) + 1
+        return img_path
+
     session["image_counter"] = session.get("image_counter", 0) + 1
-    img_dir = _hermes_home / "images"
-    img_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    img_path = img_dir / f"{prefix}_{ts}_{session['image_counter']}{ext}"
+
     try:
+        img_dir = _current_hermes_home() / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        img_path = img_dir / f"{prefix}_{ts}_{session['image_counter']}{ext}"
         img_path.write_bytes(img_bytes)
     except Exception:
         session["image_counter"] = max(0, session["image_counter"] - 1)
         raise
     session.setdefault("attached_images", []).append(str(img_path))
+    session.setdefault("attachment_display_names", {})[str(img_path)] = (
+        display_name or f"{prefix}{ext}"
+    )
+    session.setdefault("attachment_sizes", {})[str(img_path)] = len(img_bytes)
     return img_path
 
 
@@ -9581,8 +10597,16 @@ def _(rid, params: dict) -> dict:
         return err
 
     raw_b64 = str(params.get("content_base64") or params.get("data") or "").strip()
+    upload_nonce = str(params.get("upload_nonce") or "").strip()
     if not raw_b64:
         return _err(rid, 4015, "content_base64 required")
+
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode():
+        maximum_encoded = ((_ATTACH_BYTES_MAX_BYTES + 2) // 3) * 4 + 1024
+        if len(raw_b64) > maximum_encoded:
+            return _err(rid, 4018, "managed image upload is too large")
 
     img_bytes = _decode_attach_base64(raw_b64, mime_prefix="image/")
     if img_bytes is None:
@@ -9592,7 +10616,6 @@ def _(rid, params: dict) -> dict:
     if len(img_bytes) > _ATTACH_BYTES_MAX_BYTES:
         mb = _ATTACH_BYTES_MAX_BYTES // (1024 * 1024)
         return _err(rid, 4018, f"image too large ({len(img_bytes)} bytes; cap is {mb} MB)")
-
     filename = str(params.get("filename", "") or "")
     ext_hint = str(params.get("ext", "") or "").strip().lower()
     if ext_hint and not ext_hint.startswith("."):
@@ -9602,22 +10625,45 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4016, f"unsupported image extension: {ext}")
 
     try:
-        img_path = _queue_attached_image(session, img_bytes, ext, prefix="upload")
+        img_path = _queue_attached_image(
+            session,
+            img_bytes,
+            ext,
+            prefix="upload",
+            display_name=filename or f"upload{ext}",
+            upload_nonce=upload_nonce,
+        )
+    except _GovernedAttachmentNonceError as e:
+        return _err(rid, 4018, str(e))
+    except _GovernedAttachmentTypeError as e:
+        return _err(rid, 4016, str(e))
+    except _GovernedAttachmentQuotaError as e:
+        return _err(rid, 4018, str(e))
     except Exception as e:
+        if _flexa_governed_mode():
+            return _err(rid, 5027, "managed image upload failed")
         return _err(rid, 5027, f"write failed: {e}")
 
-    return _ok(
-        rid,
-        {
-            "attached": True,
-            "path": str(img_path),
-            "count": len(session["attached_images"]),
-            "remainder": "",
-            "text": f"[User attached image: {img_path.name}]",
-            "bytes": len(img_bytes),
-            **_image_meta(img_path),
-        },
-    )
+    if _flexa_governed_mode():
+        with _session_attachment_lock(session):
+            result_count, _total = _governed_attachment_usage(session)
+    else:
+        result_count = len(session["attached_images"])
+
+    result = {
+        "attached": True,
+        "path": str(img_path),
+        "count": result_count,
+        "remainder": "",
+        "text": f"[User attached image: {filename or f'upload{ext}'}]",
+        "bytes": len(img_bytes),
+        "attachment_id": img_path.name,
+    }
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if not _flexa_governed_mode():
+        result.update(_image_meta(img_path))
+    return _ok(rid, result)
 
 
 @method("pdf.attach")
@@ -9639,6 +10685,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    if _flexa_governed_mode():
+        return _err(rid, 4030, "method unavailable in managed profile")
 
     if shutil.which("pdftoppm") is None:
         return _err(rid, 5028, "pdftoppm not installed (poppler-utils package required)")
@@ -9727,7 +10775,13 @@ def _(rid, params: dict) -> dict:
                 page_int = int(page_num)
             except ValueError:
                 page_int = first_page + len(attached_pages)
-            dst = _queue_attached_image(session, src.read_bytes(), ".png", prefix=f"pdf_p{page_num}")
+            dst = _queue_attached_image(
+                session,
+                src.read_bytes(),
+                ".png",
+                prefix=f"pdf_p{page_num}",
+                display_name=f"{display_name} page {page_int}.png",
+            )
             attached_pages.append({"path": str(dst), "page": page_int, **_image_meta(dst)})
 
         return _ok(
@@ -9887,6 +10941,486 @@ def _stage_session_file_attachment(
     return target.resolve(), True
 
 
+def _governed_attachment_home(session: dict):
+    """Bind the verified profile home while operating on its opaque inbox."""
+
+    profile_home = str(session.get("profile_home") or "").strip()
+    return set_hermes_home_override(profile_home) if profile_home else None
+
+
+_GOVERNED_UPLOAD_PRUNE_INTERVAL_S = 60 * 60
+_governed_upload_prune_lock = threading.Lock()
+_governed_upload_pruned_at: dict[str, float] = {}
+
+
+def _reconcile_expired_governed_attachment_ids(
+    expired_ids: set[str],
+    profile_home: Path | str | None,
+) -> None:
+    if not expired_ids:
+        return
+    target_scope = _canonical_profile_scope(
+        profile_home or _current_hermes_home()
+    )
+    for session in list(_sessions.values()):
+        if _canonical_profile_scope(session.get("profile_home")) != target_scope:
+            continue
+        with _session_attachment_lock(session):
+            staged_images = session.setdefault("attached_images", [])
+            removed_paths = [
+                path for path in staged_images if Path(str(path)).name in expired_ids
+            ]
+            session["attached_images"] = [
+                path for path in staged_images if path not in removed_paths
+            ]
+            for path in removed_paths:
+                session.setdefault("attachment_display_names", {}).pop(path, None)
+                session.setdefault("attachment_sizes", {}).pop(path, None)
+            for mapping_name in (
+                "attached_file_uploads",
+                "turn_file_uploads",
+            ):
+                mapping = session.setdefault(mapping_name, {})
+                for attachment_id in expired_ids:
+                    mapping.pop(attachment_id, None)
+            turn_images = session.setdefault("turn_image_uploads", {})
+            for path in list(turn_images):
+                item = turn_images.get(path)
+                attachment_id = (
+                    str(item.get("attachment_id") or "")
+                    if isinstance(item, dict)
+                    else Path(str(path)).name
+                )
+                if attachment_id in expired_ids:
+                    turn_images.pop(path, None)
+            for claim in session.setdefault("preturn_attachment_claims", {}).values():
+                if not isinstance(claim, dict):
+                    continue
+                claim_files = claim.setdefault("files", {})
+                for attachment_id in expired_ids:
+                    claim_files.pop(attachment_id, None)
+                claim_images = claim.setdefault("images", {})
+                for path in list(claim_images):
+                    item = claim_images.get(path)
+                    attachment_id = (
+                        str(item.get("attachment_id") or "")
+                        if isinstance(item, dict)
+                        else Path(str(path)).name
+                    )
+                    if attachment_id in expired_ids:
+                        claim_images.pop(path, None)
+            for attachment_id in expired_ids:
+                _forget_governed_upload_nonce(session, attachment_id)
+
+
+def _prune_and_reconcile_governed_uploads(
+    profile_home: Path | str | None,
+) -> tuple[int, int]:
+    token = (
+        set_hermes_home_override(str(profile_home))
+        if profile_home is not None
+        else None
+    )
+    try:
+        from agent.flexa_enforcement import prune_governed_uploads
+
+        count, total, expired = prune_governed_uploads(
+            include_expired_ids=True
+        )
+        _reconcile_expired_governed_attachment_ids(set(expired), profile_home)
+        return count, total
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+
+
+def _maybe_prune_governed_uploads(profile_home: Path | str | None) -> None:
+    """Validate the shared inbox and prune only beyond the enforced expiry."""
+
+    if not _flexa_governed_mode():
+        return
+    scope = _canonical_profile_scope(profile_home or _current_hermes_home()) or ""
+    now = time.monotonic()
+    with _governed_upload_prune_lock:
+        previous = _governed_upload_pruned_at.get(scope, 0.0)
+        if now - previous < _GOVERNED_UPLOAD_PRUNE_INTERVAL_S:
+            return
+        # Reserve the interval before I/O so concurrent session startups do not
+        # race the same descriptor-safe sweep. Failure clears the reservation.
+        _governed_upload_pruned_at[scope] = now
+    try:
+        _prune_and_reconcile_governed_uploads(profile_home)
+    except Exception:
+        with _governed_upload_prune_lock:
+            _governed_upload_pruned_at.pop(scope, None)
+        raise
+
+
+def _claim_turn_image_uploads(
+    session: dict,
+) -> tuple[list[str], dict[str, str]]:
+    """Atomically move staged images into exclusive turn ownership."""
+
+    with _session_attachment_lock(session):
+        turn_images = session.setdefault("turn_image_uploads", {})
+        if turn_images:
+            raise RuntimeError("turn image ownership is already active")
+        images = list(session.setdefault("attached_images", []))
+        display_map = session.setdefault("attachment_display_names", {})
+        size_map = session.setdefault("attachment_sizes", {})
+        records: dict[str, dict[str, Any]] = {}
+        for path in images:
+            size = size_map.get(path)
+            if _flexa_governed_mode() and (
+                not isinstance(size, int)
+                or isinstance(size, bool)
+                or size < 0
+            ):
+                raise _GovernedAttachmentQuotaError(
+                    "managed attachment accounting is unavailable"
+                )
+            records[path] = {
+                "attachment_id": Path(path).name,
+                "display_name": display_map.get(path, Path(path).name),
+                "size": size if isinstance(size, int) and size >= 0 else 0,
+            }
+        turn_images.update(records)
+        session["attached_images"] = []
+        for path in images:
+            display_map.pop(path, None)
+            size_map.pop(path, None)
+        return images, {
+            path: str(item["display_name"]) for path, item in records.items()
+        }
+
+
+def _cleanup_governed_session_uploads(session: dict) -> None:
+    """Delete only opaque uploads recorded as owned by this live session."""
+
+    if not _flexa_governed_mode():
+        return
+    lock = _session_attachment_lock(session)
+    with lock:
+        owned_images = {
+            Path(str(path)).name
+            for path in session.get("attached_images", [])
+            if str(path)
+        }
+        owned_images.update(
+            str(item.get("attachment_id") or "")
+            for item in session.get("turn_image_uploads", {}).values()
+            if isinstance(item, dict) and item.get("attachment_id")
+        )
+        owned_files = set(session.get("attached_file_uploads", {}))
+        owned_files.update(session.get("turn_file_uploads", {}))
+        for claim in session.get("preturn_attachment_claims", {}).values():
+            if not isinstance(claim, dict):
+                continue
+            owned_images.update(
+                str(item.get("attachment_id") or "")
+                for item in claim.get("images", {}).values()
+                if isinstance(item, dict) and item.get("attachment_id")
+            )
+            owned_files.update(claim.get("files", {}))
+        token = _governed_attachment_home(session)
+        try:
+            from agent.flexa_enforcement import delete_governed_upload
+
+            for attachment_id in owned_images | owned_files:
+                try:
+                    delete_governed_upload(attachment_id)
+                except Exception:
+                    pass
+        finally:
+            if token is not None:
+                reset_hermes_home_override(token)
+        session["attached_images"] = []
+        session["attached_file_uploads"] = {}
+        session["turn_file_uploads"] = {}
+        session["turn_image_uploads"] = {}
+        session["preturn_attachment_claims"] = {}
+        session["attachment_upload_nonces"] = {}
+        session["detached_attachment_ids"] = []
+        session["attachment_display_names"] = {}
+        session["attachment_sizes"] = {}
+
+
+def _delete_governed_file_uploads(
+    session: dict,
+    attachment_ids: set[str] | list[str] | tuple[str, ...],
+    *,
+    suppress_errors: bool,
+) -> set[str]:
+    """Delete and unregister only file uploads this session still owns."""
+
+    if not _flexa_governed_mode() or not attachment_ids:
+        return set()
+    removed: set[str] = set()
+    lock = _session_attachment_lock(session)
+    with lock:
+        uploads = session.setdefault("turn_file_uploads", {})
+        token = _governed_attachment_home(session)
+        try:
+            from agent.flexa_enforcement import delete_governed_upload
+
+            for attachment_id in set(attachment_ids):
+                if attachment_id not in uploads:
+                    continue
+                try:
+                    delete_governed_upload(attachment_id)
+                except Exception:
+                    if not suppress_errors:
+                        raise
+                finally:
+                    if suppress_errors:
+                        uploads.pop(attachment_id, None)
+                        _forget_governed_upload_nonce(session, attachment_id)
+                if not suppress_errors:
+                    uploads.pop(attachment_id, None)
+                    _forget_governed_upload_nonce(session, attachment_id)
+                removed.add(attachment_id)
+        finally:
+            if token is not None:
+                reset_hermes_home_override(token)
+    return removed
+
+
+def _finish_turn_image_uploads(session: dict) -> None:
+    """Release in-flight image quota and delete managed opaque image objects."""
+
+    with _session_attachment_lock(session):
+        turn_images = session.setdefault("turn_image_uploads", {})
+        paths = list(turn_images)
+        if not paths:
+            return
+        if _flexa_governed_mode():
+            token = _governed_attachment_home(session)
+            try:
+                from agent.flexa_enforcement import delete_governed_upload
+
+                for path in paths:
+                    item = turn_images.get(path)
+                    attachment_id = (
+                        str(item.get("attachment_id") or "")
+                        if isinstance(item, dict)
+                        else Path(str(path)).name
+                    )
+                    try:
+                        delete_governed_upload(attachment_id)
+                    except Exception:
+                        pass
+                    _forget_governed_upload_nonce(session, attachment_id)
+            finally:
+                if token is not None:
+                    reset_hermes_home_override(token)
+        for path in paths:
+            turn_images.pop(path, None)
+
+
+def _governed_prompt_staged_file_uploads(
+    session: dict,
+    prompt: str,
+    cwd: str,
+    *,
+    ownership_key: str = "attached_file_uploads",
+) -> tuple[set[str], str | None]:
+    """Resolve managed inbox refs and prove each belongs to this session."""
+
+    if not _flexa_governed_mode() or not isinstance(prompt, str):
+        return set(), None
+    from agent.context_references import parse_context_references
+    from hermes_cli.flexa_governed import binding_for_current_home
+
+    _profile, binding = binding_for_current_home()
+    workspace = Path(str(binding.get("working_directory") or "")).resolve()
+    inbox = (workspace / ".flexa" / "inbox").resolve()
+    cwd_path = Path(cwd).resolve()
+    owned: set[str] = set()
+    invalid = False
+    lock = _session_attachment_lock(session)
+    with lock:
+        uploads = dict(session.setdefault(ownership_key, {}))
+    for ref in parse_context_references(prompt):
+        if ref.kind not in {"file", "folder"}:
+            continue
+        try:
+            target = Path(os.path.expanduser(ref.target))
+            resolved = (target if target.is_absolute() else cwd_path / target).resolve()
+            relative = resolved.relative_to(inbox)
+        except ValueError:
+            continue
+        except (OSError, RuntimeError):
+            invalid = True
+            continue
+        if (
+            ref.kind != "file"
+            or relative.parent != Path(".")
+            or relative.name not in uploads
+        ):
+            invalid = True
+            continue
+        item = uploads.get(relative.name)
+        try:
+            recorded_path = Path(str(item.get("path") or "")).resolve()
+        except (AttributeError, OSError, RuntimeError, ValueError):
+            invalid = True
+            continue
+        if recorded_path != resolved:
+            invalid = True
+            continue
+        owned.add(relative.name)
+    return owned, (
+        "managed attachment reference is unavailable" if invalid else None
+    )
+
+
+def _claim_accepted_prompt_attachments(
+    session: dict, prompt: Any
+) -> str | None:
+    """Move attachments present at prompt acceptance into a pre-turn claim."""
+
+    text = prompt if isinstance(prompt, str) else ""
+    file_ids, ownership_error = _governed_prompt_staged_file_uploads(
+        session, text, _session_cwd(session)
+    )
+    if ownership_error:
+        raise RuntimeError(ownership_error)
+    with _session_attachment_lock(session):
+        staged_images = session.setdefault("attached_images", [])
+        staged_files = session.setdefault("attached_file_uploads", {})
+        display_map = session.setdefault("attachment_display_names", {})
+        size_map = session.setdefault("attachment_sizes", {})
+        images: dict[str, dict[str, Any]] = {}
+        for path in list(staged_images):
+            size = size_map.get(path)
+            if _flexa_governed_mode() and (
+                not isinstance(size, int)
+                or isinstance(size, bool)
+                or size < 0
+            ):
+                raise _GovernedAttachmentQuotaError(
+                    "managed attachment accounting is unavailable"
+                )
+            images[path] = {
+                "attachment_id": Path(path).name,
+                "display_name": display_map.get(path, Path(path).name),
+                "size": size if isinstance(size, int) and size >= 0 else 0,
+            }
+        files: dict[str, dict[str, Any]] = {}
+        for attachment_id in file_ids:
+            item = staged_files.get(attachment_id)
+            if not isinstance(item, dict):
+                raise RuntimeError("managed attachment ownership changed")
+            files[attachment_id] = item
+        if not images and not files:
+            return None
+        claim_id = uuid.uuid4().hex
+        session.setdefault("preturn_attachment_claims", {})[claim_id] = {
+            "files": files,
+            "images": images,
+        }
+        session["attached_images"] = [
+            path for path in staged_images if path not in images
+        ]
+        for path in images:
+            display_map.pop(path, None)
+            size_map.pop(path, None)
+        for attachment_id in files:
+            staged_files.pop(attachment_id, None)
+        return claim_id
+
+
+def _activate_prompt_attachment_claim(
+    session: dict, claim_id: str | None
+) -> tuple[list[str], dict[str, str], set[str]]:
+    """Transfer one accepted claim into exclusive live-turn ownership."""
+
+    if claim_id is None:
+        return [], {}, set()
+    with _session_attachment_lock(session):
+        claims = session.setdefault("preturn_attachment_claims", {})
+        claim = claims.get(claim_id)
+        if not isinstance(claim, dict):
+            raise RuntimeError("accepted attachment claim is unavailable")
+        turn_images = session.setdefault("turn_image_uploads", {})
+        turn_files = session.setdefault("turn_file_uploads", {})
+        if turn_images or turn_files:
+            raise RuntimeError("turn attachment ownership is already active")
+        images = dict(claim.get("images", {}))
+        files = dict(claim.get("files", {}))
+        turn_images.update(images)
+        turn_files.update(files)
+        claims.pop(claim_id, None)
+        return (
+            list(images),
+            {
+                path: str(item.get("display_name") or Path(path).name)
+                for path, item in images.items()
+                if isinstance(item, dict)
+            },
+            set(files),
+        )
+
+
+def _cleanup_prompt_attachment_claim(session: dict, claim_id: str | None) -> None:
+    if claim_id is None:
+        return
+    with _session_attachment_lock(session):
+        claim = session.setdefault("preturn_attachment_claims", {}).pop(
+            claim_id, None
+        )
+        if not isinstance(claim, dict):
+            return
+        attachment_ids = {
+            str(item.get("attachment_id") or "")
+            for item in claim.get("images", {}).values()
+            if isinstance(item, dict) and item.get("attachment_id")
+        }
+        attachment_ids.update(claim.get("files", {}))
+        if _flexa_governed_mode():
+            token = _governed_attachment_home(session)
+            try:
+                from agent.flexa_enforcement import delete_governed_upload
+
+                for attachment_id in attachment_ids:
+                    try:
+                        delete_governed_upload(attachment_id)
+                    except Exception:
+                        pass
+            finally:
+                if token is not None:
+                    reset_hermes_home_override(token)
+        for attachment_id in attachment_ids:
+            _forget_governed_upload_nonce(session, attachment_id)
+
+
+def _governed_upload_ids_for_paths(
+    session: dict,
+    attachment_ids: set[str],
+    paths: list[str],
+) -> set[str]:
+    resolved_paths: set[Path] = set()
+    for value in paths:
+        try:
+            resolved_paths.add(Path(value).resolve())
+        except (OSError, RuntimeError, ValueError):
+            continue
+    matched: set[str] = set()
+    with _session_attachment_lock(session):
+        uploads = session.setdefault("turn_file_uploads", {})
+        for attachment_id in attachment_ids:
+            item = uploads.get(attachment_id)
+            if not isinstance(item, dict):
+                continue
+            try:
+                path = Path(str(item.get("path") or "")).resolve()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if path in resolved_paths:
+                matched.add(attachment_id)
+    return matched
+
+
 @method("file.attach")
 def _(rid, params: dict) -> dict:
     """Stage a non-image file attachment into the session workspace.
@@ -9909,11 +11443,60 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
-    raw = str(params.get("path", "") or "").strip()
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    raw = (
+        ""
+        if _flexa_governed_mode()
+        else str(params.get("path", "") or "").strip()
+    )
     data_url = str(params.get("data_url", "") or "").strip()
     name = str(params.get("name", "") or "").strip()
+    upload_nonce = str(params.get("upload_nonce", "") or "").strip()
     if not raw and not data_url:
         return _err(rid, 4015, "path or data_url required")
+    if _flexa_governed_mode():
+        if not data_url:
+            return _err(rid, 4015, "managed file upload bytes are required")
+        maximum_encoded = ((_ATTACH_BYTES_MAX_BYTES + 2) // 3) * 4 + 4096
+        if len(data_url) > maximum_encoded:
+            return _err(rid, 4018, "managed file upload is too large")
+        try:
+            payload = _decode_attachment_data_url(data_url)
+            if not payload or len(payload) > _ATTACH_BYTES_MAX_BYTES:
+                return _err(rid, 4018, "managed file upload size is invalid")
+            display_name = _sanitize_attachment_name(
+                name or Path(raw.replace("\\", "/")).name
+            )
+            suffix = Path(display_name).suffix.lower()
+            stored_path, combined_count, _reused = _store_governed_session_attachment(
+                session,
+                payload,
+                suffix,
+                kind="file",
+                upload_nonce=upload_nonce,
+                display_name=display_name,
+            )
+            attachment_id = stored_path.name
+            ref_text = f"@file:.flexa/inbox/{attachment_id}"
+            return _ok(
+                rid,
+                {
+                    "attached": True,
+                    "attachment_id": attachment_id,
+                    "ref_text": ref_text,
+                    "bytes": len(payload),
+                    "count": combined_count,
+                },
+            )
+        except _GovernedAttachmentQuotaError as exc:
+            return _err(rid, 4018, str(exc))
+        except _GovernedAttachmentNonceError as exc:
+            return _err(rid, 4018, str(exc))
+        except _GovernedAttachmentTypeError as exc:
+            return _err(rid, 4016, str(exc))
+        except Exception:
+            return _err(rid, 5028, "managed file upload failed")
     try:
         stored_path, uploaded = _stage_session_file_attachment(
             session, raw_path=raw, data_url=data_url, name=name
@@ -9939,17 +11522,79 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
-    raw = str(params.get("path", "") or "").strip()
+    raw = str(
+        params.get("attachment_id", "")
+        if _flexa_governed_mode()
+        else params.get("path", "")
+    ).strip()
     if not raw:
-        return _err(rid, 4015, "path required")
+        return _err(rid, 4015, "attachment identifier required")
+    if _flexa_governed_mode():
+        with _session_attachment_lock(session):
+            images = session.setdefault("attached_images", [])
+            files = session.setdefault("attached_file_uploads", {})
+            detached_ids = session.setdefault("detached_attachment_ids", [])
+            removed_paths = [path for path in images if Path(path).name == raw]
+            removed_file = files.get(raw)
+            if not removed_paths and removed_file is None:
+                try:
+                    count, _total = _governed_attachment_usage(session)
+                except _GovernedAttachmentQuotaError:
+                    count = len(images) + len(files)
+                if raw in detached_ids:
+                    return _ok(
+                        rid,
+                        {
+                            "already_detached": True,
+                            "count": count,
+                            "detached": True,
+                        },
+                    )
+                return _ok(rid, {"detached": False, "count": count})
+
+            from agent.flexa_enforcement import delete_governed_upload
+
+            try:
+                delete_governed_upload(raw, revoke_on_failure=False)
+            except Exception:
+                return _err(rid, 5027, "managed attachment removal failed")
+            session["attached_images"] = [
+                path for path in images if path not in removed_paths
+            ]
+            for removed in removed_paths:
+                session.setdefault("attachment_display_names", {}).pop(
+                    removed, None
+                )
+                session.setdefault("attachment_sizes", {}).pop(removed, None)
+            if removed_file is not None:
+                files.pop(raw, None)
+            _forget_governed_upload_nonce(session, raw)
+            detached_ids.append(raw)
+            if len(detached_ids) > 64:
+                del detached_ids[:-64]
+            count, _total = _governed_attachment_usage(session)
+            return _ok(rid, {"detached": True, "count": count})
+
     images = session.setdefault("attached_images", [])
-    before = len(images)
-    session["attached_images"] = [path for path in images if path != raw]
+    files = session.setdefault("attached_file_uploads", {})
+    before = len(images) + len(files)
+    removed_paths = [
+        path
+        for path in images
+        if (Path(path).name if _flexa_governed_mode() else path) == raw
+    ]
+    removed_file = files.get(raw) if _flexa_governed_mode() else None
+    session["attached_images"] = [path for path in images if path not in removed_paths]
+    for removed in removed_paths:
+        session.setdefault("attachment_display_names", {}).pop(removed, None)
+        session.setdefault("attachment_sizes", {}).pop(removed, None)
+    if removed_file is not None:
+        files.pop(raw, None)
     return _ok(
         rid,
         {
-            "detached": len(session["attached_images"]) != before,
-            "count": len(session["attached_images"]),
+            "detached": len(session["attached_images"]) + len(files) != before,
+            "count": len(session["attached_images"]) + len(files),
         },
     )
 
@@ -9959,6 +11604,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if _flexa_governed_mode():
+        return _err(rid, 4030, "method unavailable in managed profile")
     try:
         from cli import _detect_file_drop
 
@@ -10208,7 +11855,7 @@ def _(rid, params: dict) -> dict:
             rid,
             {
                 "resolved": resolve_gateway_approval(
-                    session["session_key"],
+                    _approval_scope_key(session),
                     params.get("choice", "deny"),
                     resolve_all=params.get("all", False),
                 )
@@ -10432,13 +12079,14 @@ def _(rid, params: dict) -> dict:
                 return _ok(rid, {"key": key, "value": nv, "scope": "global"})
 
             if session:
-                current = is_session_yolo_enabled(session["session_key"])
+                approval_key = _approval_scope_key(session)
+                current = is_session_yolo_enabled(approval_key)
                 enable = _resolve_toggle(current)
                 if enable:
-                    enable_session_yolo(session["session_key"])
+                    enable_session_yolo(approval_key)
                     nv = "1"
                 else:
-                    disable_session_yolo(session["session_key"])
+                    disable_session_yolo(approval_key)
                     nv = "0"
                 agent = session.get("agent")
                 if agent is not None:
@@ -11202,7 +12850,7 @@ def _(rid, params: dict) -> dict:
     if key == "profile":
         from hermes_constants import display_hermes_home
 
-        return _ok(rid, {"home": str(_hermes_home), "display": display_hermes_home()})
+        return _ok(rid, {"home": str(_current_hermes_home()), "display": display_hermes_home()})
     if key == "project":
         cfg_terminal = _load_cfg().get("terminal") or {}
         raw = str(params.get("cwd", "") or cfg_terminal.get("cwd", "") or "").strip()
@@ -11322,7 +12970,7 @@ def _(rid, params: dict) -> dict:
         display = _load_cfg().get("display")
         return _ok(rid, {"value": _display_mouse_tracking(display)})
     if key == "mtime":
-        cfg_path = _hermes_home / "config.yaml"
+        cfg_path = _current_hermes_home() / "config.yaml"
         try:
             return _ok(
                 rid, {"mtime": cfg_path.stat().st_mtime if cfg_path.exists() else 0}
@@ -12294,7 +13942,7 @@ def _(rid, params: dict) -> dict:
 
     _paste_counter += 1
     line_count = text.count("\n") + 1
-    paste_dir = _hermes_home / "pastes"
+    paste_dir = _current_hermes_home() / "pastes"
     paste_dir.mkdir(parents=True, exist_ok=True)
 
     from datetime import datetime
@@ -13838,7 +15486,7 @@ def _(rid, params: dict) -> dict:
                 "title": "Environment",
                 "rows": [
                     ["Working Dir", os.getcwd()],
-                    ["Config File", str(_hermes_home / "config.yaml")],
+                    ["Config File", str(_current_hermes_home() / "config.yaml")],
                 ],
             },
         ]

@@ -986,6 +986,7 @@ def _emit_post_tool_call_hook(
     error_type: Optional[str] = None,
     error_message: Optional[str] = None,
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    governed_approved: bool = False,
 ) -> None:
     """Emit the ``post_tool_call`` observer hook.
 
@@ -997,6 +998,10 @@ def _emit_post_tool_call_hook(
     listener will actually consume it).
     """
     try:
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode() and not governed_approved:
+            return
         from hermes_cli.plugins import has_hook, invoke_hook
         if not has_hook("post_tool_call"):
             return
@@ -1066,6 +1071,15 @@ def handle_function_call(
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
+    from agent.flexa_enforcement import require_tool_dispatch
+
+    require_tool_dispatch(
+        function_name,
+        arguments=function_args,
+        operation_id=tool_call_id,
+        session_id=session_id,
+        turn_id=turn_id,
+    )
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
@@ -1134,6 +1148,8 @@ def handle_function_call(
                 task_id=task_id,
                 tool_call_id=tool_call_id,
                 session_id=session_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
@@ -1318,9 +1334,11 @@ def handle_function_call(
         # valid string return wins; non-string returns are ignored.
         # Gated on has_hook so the no-listener path skips both the result
         # field derivation and the payload dispatch.
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
         try:
             from hermes_cli.plugins import has_hook, invoke_hook
-            if has_hook("transform_tool_result"):
+            if not _flexa_governed_mode() and has_hook("transform_tool_result"):
                 status, error_type, error_message = _tool_result_observer_fields(result)
                 hook_results = invoke_hook(
                     "transform_tool_result",

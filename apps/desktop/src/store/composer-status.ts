@@ -1,11 +1,14 @@
 import { atom, computed } from 'nanostores'
 
 import { translateNow } from '@/i18n'
+import { sameConnectionIdentity } from '@/lib/desktop-gateway-connection'
 import type { TodoItem, TodoStatus } from '@/lib/todos'
 
-import { $gateway } from './gateway'
+import { $gateway, gatewayMatchesConnection } from './gateway'
+import { $tenantRuntimeEpoch } from './gateway-switch'
 import { dispatchNativeNotification } from './native-notifications'
 import { notifyError } from './notifications'
+import { $connection } from './session'
 import { $subagentsBySession, type SubagentProgress } from './subagents'
 import { $todosBySession } from './todos'
 
@@ -45,6 +48,18 @@ const dismissedBySession = new Map<string, Set<string>>()
 const SUCCESS_LINGER_MS = 4_000
 const FAILURE_LINGER_MS = 12_000
 const autoClearTimers = new Map<string, Map<string, ReturnType<typeof setTimeout>>>()
+
+export function clearAllBackgroundProcesses() {
+  for (const timers of autoClearTimers.values()) {
+    for (const timer of timers.values()) {
+      clearTimeout(timer)
+    }
+  }
+
+  autoClearTimers.clear()
+  dismissedBySession.clear()
+  $backgroundStatusBySession.set({})
+}
 
 function scheduleAutoDismiss(sid: string, id: string, delayMs: number) {
   let timers = autoClearTimers.get(sid)
@@ -287,13 +302,24 @@ export function reconcileBackgroundProcesses(sid: string, procs: GatewayProcessE
 /** Pull the session's live process snapshot from the gateway. */
 export async function refreshBackgroundProcesses(sid: string): Promise<void> {
   const gateway = $gateway.get()
+  const connection = $connection.get()
+  const tenantEpoch = $tenantRuntimeEpoch.get()
 
-  if (!sid || !gateway) {
+  if (!sid || !gateway || !connection || !gatewayMatchesConnection(gateway, connection)) {
     return
   }
 
   try {
     const result = await gateway.request<{ processes?: GatewayProcessEntry[] }>('process.list', { session_id: sid })
+
+    if (
+      $tenantRuntimeEpoch.get() !== tenantEpoch ||
+      gateway !== $gateway.get() ||
+      !sameConnectionIdentity(connection, $connection.get()) ||
+      !gatewayMatchesConnection(gateway, connection)
+    ) {
+      return
+    }
 
     reconcileBackgroundProcesses(sid, result?.processes ?? [])
   } catch {
@@ -322,10 +348,32 @@ export function dismissBackgroundProcess(sid: string, id: string) {
  *  row while the process lived on, stranding rogue tasks. On failure the row
  *  stays so the user can retry / see it didn't die. */
 export async function stopBackgroundProcess(sid: string, id: string): Promise<void> {
+  const gateway = $gateway.get()
+  const connection = $connection.get()
+  const tenantEpoch = $tenantRuntimeEpoch.get()
+
+  if (!gateway || !connection || !gatewayMatchesConnection(gateway, connection)) {
+    return
+  }
+
   try {
-    await $gateway.get()?.request('process.kill', { process_id: id, session_id: sid })
+    await gateway.request('process.kill', { process_id: id, session_id: sid })
+
+    if (
+      $tenantRuntimeEpoch.get() !== tenantEpoch ||
+      gateway !== $gateway.get() ||
+      !sameConnectionIdentity(connection, $connection.get()) ||
+      !gatewayMatchesConnection(gateway, connection)
+    ) {
+      return
+    }
+
     dismissBackgroundProcess(sid, id)
   } catch (err) {
+    if ($tenantRuntimeEpoch.get() !== tenantEpoch || gateway !== $gateway.get()) {
+      return
+    }
+
     notifyError(err, 'Could not stop the process')
   }
 }

@@ -28,3 +28,7 @@ export function setPreviewDirty(url: string, dirty: boolean): void {
   delete next[url]
   $dirtyPreviewUrls.set(next)
 }
+
+export function clearPreviewEditState(): void {
+  $dirtyPreviewUrls.set({})
+}

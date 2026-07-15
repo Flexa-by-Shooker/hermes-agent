@@ -4,16 +4,19 @@ import { PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import type { Translations } from '@/i18n'
 import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { optimisticAttachmentRef } from '@/lib/chat-runtime'
+import { composerGatewayScope, composerSessionScope } from '@/lib/composer-scope'
 import { setMutableRef } from '@/lib/mutable-ref'
 import {
   $composerAttachments,
   clearComposerAttachments,
+  clearComposerTerminalSelections,
   type ComposerAttachment,
   terminalContextBlocksFromDraft
 } from '@/store/composer'
+import { $gatewaySwitching } from '@/store/gateway-switch'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
-import { setAwaitingResponse, setBusy, setMessages } from '@/store/session'
+import { $connection, setAwaitingResponse, setBusy, setMessages } from '@/store/session'
 
 import type { ClientSessionState } from '../../../types'
 
@@ -67,8 +70,20 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
   return useCallback(
     async (rawText: string, options?: SubmitTextOptions) => {
+      if ($gatewaySwitching.get()) {
+        return false
+      }
+
       const visibleText = rawText.trim()
       const usingComposerAttachments = !options?.attachments
+      const startingActiveSessionId = activeSessionIdRef.current
+      const startingStoredSessionId = selectedStoredSessionIdRef.current
+      const startingRouteToken = getRouteToken()
+      const startingGatewayScope = composerGatewayScope($connection.get())
+      const composerScope = composerSessionScope(
+        $connection.get(),
+        startingStoredSessionId || startingActiveSessionId || activeSessionId
+      )
 
       // Drop undefined/null holes a session switch or draft restore can leave in
       // the attachments array (same bug class as AttachmentList #49624). Without
@@ -79,7 +94,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         Boolean(a)
       )
 
-      const terminalContextBlocks = terminalContextBlocksFromDraft(rawText).join('\n\n')
+      const terminalContextBlocks = terminalContextBlocksFromDraft(composerScope, rawText).join('\n\n')
       const hasImage = attachments.some(a => a.kind === 'image')
 
       // Refs are recomputed after sync (file.attach rewrites @file: refs to
@@ -118,12 +133,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // Pin the session context for the whole async submit pipeline. Without
       // this, a fast session switch during session.resume / file.attach can
       // redirect the user's text into a different chat (#54527).
-      const startingActiveSessionId = activeSessionIdRef.current
-      const startingStoredSessionId = selectedStoredSessionIdRef.current
-      const startingRouteToken = getRouteToken()
-
       const sessionContextDrifted = (): boolean =>
+        $gatewaySwitching.get() ||
         selectedStoredSessionIdRef.current !== startingStoredSessionId ||
+        composerGatewayScope($connection.get()) !== startingGatewayScope ||
         getRouteToken() !== startingRouteToken
 
       // One submit in flight per session — drop any concurrent re-fire so a
@@ -322,10 +335,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             requestGateway('prompt.submit', { session_id: sessionId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
           )
         } catch (firstErr) {
-          if (
-            (isSessionNotFoundError(firstErr) || isGatewayTimeoutError(firstErr)) &&
-            startingStoredSessionId
-          ) {
+          if ((isSessionNotFoundError(firstErr) || isGatewayTimeoutError(firstErr)) && startingStoredSessionId) {
             // Re-register the session in the gateway and get a fresh live ID.
             // Timeouts recover the same way as "session not found": a starved
             // backend loop (#55578 symptom d) rejects the submit even though
@@ -362,6 +372,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         if (usingComposerAttachments) {
           clearComposerAttachments()
         }
+
+        clearComposerTerminalSelections(composerScope)
 
         // Submit landed — the turn now runs (busy stays true), but the submit
         // window is closed, so release the lock for the next (sequential) send.

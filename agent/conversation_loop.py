@@ -16,6 +16,7 @@ resolved through :func:`_ra` so those patches keep working.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -32,7 +33,11 @@ from agent.conversation_compression import conversation_history_after_compressio
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
-from agent.turn_context import build_turn_context
+from agent.turn_context import (
+    GOVERNED_TURN_MARKER_FIELD,
+    build_turn_context,
+    governed_current_user_index,
+)
 from agent.turn_retry_state import TurnRetryState
 from agent.memory_manager import build_memory_context_block
 from agent.message_sanitization import (
@@ -520,7 +525,7 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
-def run_conversation(
+def _run_conversation_impl(
     agent,
     user_message: str,
     system_message: str = None,
@@ -601,6 +606,9 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    _governed_turn = _flexa_governed_mode()
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -789,9 +797,14 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
+        if _governed_turn:
+            current_turn_user_idx = governed_current_user_index(messages, turn_id)
+            agent._persist_user_message_idx = current_turn_user_idx
+
         api_messages = []
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
+            api_msg.pop(GOVERNED_TURN_MARKER_FIELD, None)
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks
@@ -2762,7 +2775,7 @@ def run_conversation(
                 ):
                     _retry.nous_auth_retry_attempted = True
                     if agent._try_refresh_nous_client_credentials(force=True):
-                        print(f"{agent.log_prefix}🔐 Nous agent key refreshed after 401. Retrying request...")
+                        agent._safe_print(f"{agent.log_prefix}🔐 Nous agent key refreshed after 401. Retrying request...")
                         continue
                     # Credential refresh didn't help — show diagnostic info.
                     # Most common causes: Portal OAuth expired/revoked,
@@ -2776,16 +2789,18 @@ def run_conversation(
                             _body_text = str(_body)[:200]
                     except Exception:
                         pass
-                    print(f"{agent.log_prefix}🔐 Nous 401 — Portal authentication failed.")
+                    agent._safe_print(f"{agent.log_prefix}🔐 Nous 401 — Portal authentication failed.")
                     if _body_text:
-                        print(f"{agent.log_prefix}   Response: {_body_text}")
-                    if not _print_nous_entitlement_guidance(agent, "Nous model access"):
-                        print(f"{agent.log_prefix}   Most likely: Portal OAuth expired, account out of credits, or agent key revoked.")
-                    print(f"{agent.log_prefix}   Troubleshooting:")
-                    print(f"{agent.log_prefix}     • Re-authenticate: hermes auth add nous")
-                    print(f"{agent.log_prefix}     • Check credits / billing: https://portal.nousresearch.com")
-                    print(f"{agent.log_prefix}     • Verify stored credentials: {_dhh}/auth.json")
-                    print(f"{agent.log_prefix}     • Switch providers temporarily: /model <model> --provider openrouter")
+                        agent._safe_print(f"{agent.log_prefix}   Response: {_body_text}")
+                    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+                    if not _flexa_governed_mode() and not _print_nous_entitlement_guidance(agent, "Nous model access"):
+                        agent._safe_print(f"{agent.log_prefix}   Most likely: Portal OAuth expired, account out of credits, or agent key revoked.")
+                    agent._safe_print(f"{agent.log_prefix}   Troubleshooting:")
+                    agent._safe_print(f"{agent.log_prefix}     • Re-authenticate: hermes auth add nous")
+                    agent._safe_print(f"{agent.log_prefix}     • Check credits / billing: https://portal.nousresearch.com")
+                    agent._safe_print(f"{agent.log_prefix}     • Verify stored credentials: {_dhh}/auth.json")
+                    agent._safe_print(f"{agent.log_prefix}     • Switch providers temporarily: /model <model> --provider openrouter")
                 if (
                     agent.provider == "copilot"
                     and status_code == 401
@@ -2805,33 +2820,33 @@ def run_conversation(
                     from agent.anthropic_adapter import _is_oauth_token
                     from agent.azure_identity_adapter import is_token_provider
                     if agent._try_refresh_anthropic_client_credentials():
-                        print(f"{agent.log_prefix}🔐 Anthropic credentials refreshed after 401. Retrying request...")
+                        agent._safe_print(f"{agent.log_prefix}🔐 Anthropic credentials refreshed after 401. Retrying request...")
                         continue
                     # Credential refresh didn't help — show diagnostic info
                     key = agent._anthropic_api_key
-                    print(f"{agent.log_prefix}🔐 Anthropic 401 — authentication failed.")
+                    agent._safe_print(f"{agent.log_prefix}🔐 Anthropic 401 — authentication failed.")
                     if is_token_provider(key):
                         # Azure Foundry Entra ID — the bearer token is
                         # minted per-request by an httpx event hook on a
                         # custom http_client passed to the SDK. The 401
                         # means Azure rejected the JWT (RBAC role missing,
                         # az login expired, IMDS unreachable, etc.).
-                        print(f"{agent.log_prefix}   Auth method: Microsoft Entra ID (httpx event hook)")
-                        print(f"{agent.log_prefix}   Run `hermes doctor` for credential-chain diagnostics, or")
-                        print(f"{agent.log_prefix}   `az login` if your developer session expired.")
+                        agent._safe_print(f"{agent.log_prefix}   Auth method: Microsoft Entra ID (httpx event hook)")
+                        agent._safe_print(f"{agent.log_prefix}   Run `hermes doctor` for credential-chain diagnostics, or")
+                        agent._safe_print(f"{agent.log_prefix}   `az login` if your developer session expired.")
                     else:
                         auth_method = "Bearer (OAuth/setup-token)" if _is_oauth_token(key) else "x-api-key (API key)"
-                        print(f"{agent.log_prefix}   Auth method: {auth_method}")
-                        print(f"{agent.log_prefix}   Token prefix: {key[:12]}..." if isinstance(key, str) and len(key) > 12 else f"{agent.log_prefix}   Token: (empty or short)")
-                    print(f"{agent.log_prefix}   Troubleshooting:")
+                        agent._safe_print(f"{agent.log_prefix}   Auth method: {auth_method}")
+                        agent._safe_print(f"{agent.log_prefix}   Token prefix: {key[:12]}..." if isinstance(key, str) and len(key) > 12 else f"{agent.log_prefix}   Token: (empty or short)")
+                    agent._safe_print(f"{agent.log_prefix}   Troubleshooting:")
                     from hermes_constants import display_hermes_home as _dhh_fn
                     _dhh = _dhh_fn()
-                    print(f"{agent.log_prefix}     • Check ANTHROPIC_TOKEN in {_dhh}/.env for Hermes-managed OAuth/setup tokens")
-                    print(f"{agent.log_prefix}     • Check ANTHROPIC_API_KEY in {_dhh}/.env for API keys or legacy token values")
-                    print(f"{agent.log_prefix}     • For API keys: verify at https://platform.claude.com/settings/keys")
-                    print(f"{agent.log_prefix}     • For Claude Code: run 'claude /login' to refresh, then retry")
-                    print(f"{agent.log_prefix}     • Legacy cleanup: hermes config set ANTHROPIC_TOKEN \"\"")
-                    print(f"{agent.log_prefix}     • Clear stale keys: hermes config set ANTHROPIC_API_KEY \"\"")
+                    agent._safe_print(f"{agent.log_prefix}     • Check ANTHROPIC_TOKEN in {_dhh}/.env for Hermes-managed OAuth/setup tokens")
+                    agent._safe_print(f"{agent.log_prefix}     • Check ANTHROPIC_API_KEY in {_dhh}/.env for API keys or legacy token values")
+                    agent._safe_print(f"{agent.log_prefix}     • For API keys: verify at https://platform.claude.com/settings/keys")
+                    agent._safe_print(f"{agent.log_prefix}     • For Claude Code: run 'claude /login' to refresh, then retry")
+                    agent._safe_print(f"{agent.log_prefix}     • Legacy cleanup: hermes config set ANTHROPIC_TOKEN \"\"")
+                    agent._safe_print(f"{agent.log_prefix}     • Clear stale keys: hermes config set ANTHROPIC_API_KEY \"\"")
 
                 # Thinking block signature recovery.
                 #
@@ -4706,7 +4721,8 @@ def run_conversation(
                 # flushing here prevents it from wrapping tool feed lines.
                 # Only signal the display callback — TTS (_stream_callback)
                 # should NOT receive None (it uses None as end-of-stream).
-                if agent.stream_delta_callback:
+                from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+                if agent.stream_delta_callback and not _flexa_governed_mode():
                     try:
                         agent.stream_delta_callback(None)
                     except Exception:
@@ -4727,9 +4743,10 @@ def run_conversation(
                     # was flushed (callback(None)) before tool execution,
                     # but the callback is still alive — fire the text
                     # through it so SSE/TUI clients see the explanation.
-                    if final_response:
+                    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+                    if final_response and not _flexa_governed_mode():
                         agent._safe_print(f"\n{final_response}\n")
-                        if agent.stream_delta_callback:
+                        if agent.stream_delta_callback and not _flexa_governed_mode():
                             try:
                                 agent.stream_delta_callback(final_response)
                                 agent.stream_delta_callback(None)
@@ -5274,10 +5291,13 @@ def run_conversation(
             
         except Exception as e:
             error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
-            try:
-                print(f"❌ {error_msg}")
-            except (OSError, ValueError):
-                logger.error(error_msg)
+            from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+            if not _flexa_governed_mode():
+                try:
+                    print(f"❌ {error_msg}")
+                except (OSError, ValueError):
+                    logger.error(error_msg)
 
             # Emit the full traceback at ERROR level so it lands in both
             # agent.log AND errors.log.  Previously this was logged at DEBUG,
@@ -5350,6 +5370,306 @@ def run_conversation(
         _pending_verification_response=_pending_verification_response,
     )
 
+
+
+def _contains_governed_native_data(value: Any, seen: set[int] | None = None) -> bool:
+    """Detect API-only native image data recursively without serializing it."""
+
+    if isinstance(value, str):
+        return "data:image/" in value.lower()
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return False
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen:
+        return False
+    if isinstance(value, dict):
+        seen.add(identity)
+        return any(
+            _contains_governed_native_data(item, seen)
+            for item in value.values()
+        )
+    if isinstance(value, (list, tuple, set)):
+        seen.add(identity)
+        return any(_contains_governed_native_data(item, seen) for item in value)
+    return False
+
+
+def _copy_safe_governed_messages(messages: Any) -> List[Dict[str, Any]]:
+    """Copy a transcript fragment, strip private markers, and reject pixels."""
+
+    if not isinstance(messages, list):
+        raise RuntimeError("managed transcript is invalid")
+    copied: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise RuntimeError("managed transcript message is invalid")
+        item = copy.deepcopy(message)
+        item.pop(GOVERNED_TURN_MARKER_FIELD, None)
+        copied.append(item)
+    if _contains_governed_native_data(copied):
+        raise RuntimeError("managed transcript contains native image data")
+    return copied
+
+
+def _governed_success_staging_messages(
+    messages: Any,
+    turn_marker: str,
+    persistence_message: Any,
+) -> List[Dict[str, Any]]:
+    """Build the pre-output safe history for one governed successful turn."""
+
+    if not isinstance(messages, list) or not isinstance(persistence_message, str):
+        raise RuntimeError("managed current turn cannot be sanitized")
+    current_index = governed_current_user_index(messages, turn_marker)
+    safe_messages = _copy_safe_governed_messages(messages[:current_index])
+    safe_user = {"role": "user", "content": persistence_message}
+    current_user = messages[current_index]
+    if current_user.get("_db_persisted"):
+        safe_user["_db_persisted"] = True
+    if isinstance(current_user.get("timestamp"), (int, float)):
+        safe_user["timestamp"] = current_user["timestamp"]
+    if _contains_governed_native_data(safe_user):
+        raise RuntimeError("managed current user message is unsafe")
+    safe_messages.append(safe_user)
+    return safe_messages
+
+
+def _discard_failed_governed_turn_messages(
+    agent,
+    result: Optional[Dict[str, Any]],
+    conversation_history: Optional[List[Dict[str, Any]]],
+    persistence_message: Any,
+) -> None:
+    """Roll a failed governed turn back to its prior committed transcript."""
+
+    try:
+        safe_messages = _copy_safe_governed_messages(
+            list(conversation_history or [])
+        )
+    except Exception:
+        safe_messages = []
+    if isinstance(result, dict):
+        result["messages"] = [dict(message) for message in safe_messages]
+        result["last_reasoning"] = None
+    agent._session_messages = [dict(message) for message in safe_messages]
+    agent._current_streamed_assistant_text = ""
+    agent._last_content_with_tools = None
+
+
+def run_conversation(
+    agent,
+    user_message: str,
+    system_message: str = None,
+    conversation_history: List[Dict[str, Any]] = None,
+    task_id: str = None,
+    stream_callback: Optional[callable] = None,
+    persist_user_message: Optional[str] = None,
+    persist_user_timestamp: Optional[float] = None,
+    moa_config: Optional[dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run one turn, wrapping every governed exit in output allow/revocation.
+
+    Keeping this wrapper outside the large implementation is deliberate: the
+    upstream loop has several provider-specific early returns.  A single outer
+    ``try/finally`` makes interruption, retry exhaustion, provider failure and
+    future early-return paths fail closed without relying on each branch to
+    remember cleanup.
+    """
+
+    from agent.flexa_enforcement import (
+        FlexaEnforcementError,
+        GovernedTurnInput,
+        channel_ingress,
+        has_channel_handoff,
+        output as enforce_output,
+        release_buffered_output,
+        require_governed_runtime,
+        revoke_turn,
+        scrub_reasoning,
+        user_input as enforce_user_input,
+    )
+    from hermes_cli.flexa_governed import governed_mode
+
+    if not governed_mode():
+        return _run_conversation_impl(
+            agent,
+            user_message,
+            system_message,
+            conversation_history,
+            task_id,
+            stream_callback,
+            persist_user_message,
+            persist_user_timestamp,
+            moa_config,
+        )
+
+    require_governed_runtime(agent)
+    _observer_names = (
+        "status_callback",
+        "thinking_callback",
+        "reasoning_callback",
+        "interim_assistant_callback",
+        "tool_progress_callback",
+        "tool_start_callback",
+        "tool_complete_callback",
+        "tool_gen_callback",
+        "notice_callback",
+        "notice_clear_callback",
+        "reaction_callback",
+        "step_callback",
+    )
+    _saved_observers = {
+        name: getattr(agent, name, None)
+        for name in _observer_names
+    }
+    for _observer_name in _observer_names:
+        if hasattr(agent, _observer_name):
+            setattr(agent, _observer_name, None)
+    _saved_quiet_mode = getattr(agent, "quiet_mode", None)
+    _saved_verbose_logging = getattr(agent, "verbose_logging", None)
+    _saved_suppress_status = getattr(agent, "suppress_status_output", None)
+    if hasattr(agent, "quiet_mode"):
+        agent.quiet_mode = True
+    if hasattr(agent, "verbose_logging"):
+        agent.verbose_logging = False
+    agent.suppress_status_output = True
+    discard_memory = getattr(agent, "_discard_governed_external_memory", None)
+    if callable(discard_memory):
+        discard_memory()
+    try:
+        if not has_channel_handoff(agent):
+            user_message = channel_ingress(
+                agent,
+                user_message,
+                platform=str(getattr(agent, "platform", None) or "local"),
+                session_id=task_id,
+                persistence_content=persist_user_message,
+            )
+        if not isinstance(user_message, GovernedTurnInput):
+            raise FlexaEnforcementError("trusted channel handoff is required")
+        governed_input = enforce_user_input(agent, user_message)
+        if not isinstance(governed_input, GovernedTurnInput):
+            raise FlexaEnforcementError("governed input envelope is invalid")
+        user_message = governed_input.model_message
+        persist_user_message = governed_input.persistence_message
+        governed_turn_id = governed_input.key.turn_id
+        result = _run_conversation_impl(
+            agent,
+            user_message,
+            system_message,
+            conversation_history,
+            task_id,
+            stream_callback,
+            persist_user_message,
+            persist_user_timestamp,
+            moa_config,
+        )
+        if not isinstance(result, dict):
+            revoke_turn(agent)
+            raise FlexaEnforcementError("governed runtime returned an invalid result")
+        raw_output = result.get("final_response")
+        failed = bool(
+            result.get("interrupted")
+            or result.get("failed")
+            or result.get("error")
+            or not isinstance(raw_output, str)
+            or not raw_output
+        )
+        if failed:
+            _discard_failed_governed_turn_messages(
+                agent,
+                result,
+                conversation_history,
+                persist_user_message,
+            )
+            if callable(discard_memory):
+                discard_memory()
+            revoke_turn(agent)
+            result["final_response"] = None
+            result["last_reasoning"] = None
+            if result.get("error"):
+                result["error"] = "managed turn failed"
+            return result
+
+        messages = result.get("messages")
+        safe_staging = _governed_success_staging_messages(
+            messages,
+            governed_turn_id,
+            persist_user_message,
+        )
+        # Publish a plaintext-free snapshot before terminal output revokes the
+        # turn. A concurrent close/finalizer can now only observe committed
+        # history plus the sanitized current user, never native parts, broker
+        # pages, tool state, or an unapproved assistant draft.
+        result["messages"] = _copy_safe_governed_messages(safe_staging)
+        agent._session_messages = _copy_safe_governed_messages(safe_staging)
+
+        sanitized = enforce_output(agent, raw_output)
+        if _contains_governed_native_data(sanitized):
+            raise FlexaEnforcementError("managed output contains native image data")
+        commit_memory = getattr(agent, "_commit_governed_external_memory", None)
+        if callable(commit_memory):
+            commit_memory(turn_id=governed_turn_id)
+        final_messages = _copy_safe_governed_messages(safe_staging)
+        final_messages.append({"role": "assistant", "content": sanitized})
+        scrub_reasoning(final_messages)
+        if _contains_governed_native_data(final_messages):
+            raise FlexaEnforcementError("managed transcript contains native image data")
+        try:
+            agent._persist_session(final_messages)
+        except Exception:
+            logger.warning(
+                "governed sanitized session persistence failed",
+                exc_info=True,
+            )
+        result["messages"] = _copy_safe_governed_messages(final_messages)
+        if not getattr(agent, "_flexa_persistence_quarantined", False):
+            agent._session_messages = _copy_safe_governed_messages(final_messages)
+        result["final_response"] = sanitized
+        result["last_reasoning"] = None
+        if callable(stream_callback):
+            agent._stream_callback = stream_callback
+        release_buffered_output(agent, sanitized)
+        agent._stream_callback = None
+        return result
+    except Exception as exc:
+        import uuid as _uuid
+
+        audit_id = _uuid.uuid4().hex
+        _discard_failed_governed_turn_messages(
+            agent,
+            None,
+            conversation_history,
+            persist_user_message,
+        )
+        if callable(discard_memory):
+            discard_memory()
+        revoke_turn(agent)
+        logger.error(
+            "governed turn failed: audit_id=%s error_type=%s",
+            audit_id,
+            type(exc).__name__,
+        )
+        raise FlexaEnforcementError(
+            f"managed turn failed (audit_id={audit_id})"
+        ) from None
+    finally:
+        for _observer_name, _observer in _saved_observers.items():
+            if hasattr(agent, _observer_name):
+                setattr(agent, _observer_name, _observer)
+        if _saved_quiet_mode is not None:
+            agent.quiet_mode = _saved_quiet_mode
+        if _saved_verbose_logging is not None:
+            agent.verbose_logging = _saved_verbose_logging
+        if _saved_suppress_status is None:
+            try:
+                delattr(agent, "suppress_status_output")
+            except AttributeError:
+                pass
+        else:
+            agent.suppress_status_output = _saved_suppress_status
 
 
 __all__ = ["run_conversation"]

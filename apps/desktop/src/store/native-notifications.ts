@@ -1,10 +1,12 @@
 import { atom } from 'nanostores'
 
+import { composerGatewayScope } from '@/lib/composer-scope'
+import type { GatewayEventOrigin } from '@/lib/gateway-event-origin'
 import { persistString, storedString } from '@/lib/storage'
 
-import { $gateway } from './gateway'
+import { gatewayMatchesConnection } from './gateway'
 import { clearApprovalRequest } from './prompts'
-import { $activeSessionId } from './session'
+import { $activeSessionId, $connection } from './session'
 
 // Native OS notifications (Electron `Notification`), separate from the in-app
 // toast feed in `notifications.ts`. Each kind toggles independently.
@@ -150,6 +152,34 @@ export interface NativeNotificationInput {
   global?: boolean
   silent?: boolean
   actions?: NativeNotificationAction[]
+  /** Exact gateway that emitted an actionable approval event. */
+  origin?: GatewayEventOrigin | null
+}
+
+interface PendingApprovalAction extends GatewayEventOrigin {
+  gatewayScope: string
+  sessionId: null | string
+}
+
+const pendingApprovalActions = new Map<string, PendingApprovalAction>()
+
+export function clearNativeNotificationTenantState(): void {
+  pendingApprovalActions.clear()
+  lastFiredAt.clear()
+}
+
+export interface NotificationFocusTarget {
+  gatewayScope?: string
+  sessionId?: string
+}
+
+export function notificationFocusMatchesActiveScope(
+  target: NotificationFocusTarget,
+  connection = $connection.get()
+): boolean {
+  const activeScope = composerGatewayScope(connection)
+
+  return Boolean(target.sessionId && target.gatewayScope && activeScope && target.gatewayScope === activeScope)
 }
 
 export function dispatchNativeNotification(input: NativeNotificationInput): void {
@@ -163,14 +193,41 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
     return
   }
 
-  if (throttled(`${input.kind}:${input.sessionId ?? (input.global ? 'global' : '')}`, Date.now())) {
+  const originScope = composerGatewayScope(input.origin?.connection)
+  const gatewayScope = input.sessionId ? (originScope ?? composerGatewayScope($connection.get())) : undefined
+
+  if (
+    throttled(
+      `${input.kind}:${originScope ?? 'unscoped'}:${input.sessionId ?? (input.global ? 'global' : '')}`,
+      Date.now()
+    )
+  ) {
     return
   }
 
+  const actionNonce =
+    input.kind === 'approval' && input.actions?.length && input.origin && originScope
+      ? (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`)
+      : undefined
+
+  if (actionNonce && input.origin && originScope) {
+    pendingApprovalActions.set(actionNonce, {
+      ...input.origin,
+      gatewayScope: originScope,
+      sessionId: input.sessionId ?? null
+    })
+
+    while (pendingApprovalActions.size > 100) {
+      pendingApprovalActions.delete(pendingApprovalActions.keys().next().value!)
+    }
+  }
+
   void window.hermesDesktop?.notify({
+    actionNonce,
     actions: input.actions,
     body: input.body,
     kind: input.kind,
+    gatewayScope: gatewayScope ?? undefined,
     sessionId: input.sessionId ?? undefined,
     silent: input.silent,
     title: input.title
@@ -179,22 +236,35 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
 
 // Resolve a pending approval from a notification button, mirroring the in-app
 // Run/Reject bar. Keyed by session id — a background approval has no local guard.
-export async function respondToApprovalAction(sessionId: null | string, actionId: string): Promise<void> {
+export async function respondToApprovalAction(
+  sessionId: null | string,
+  actionId: string,
+  actionNonce?: string
+): Promise<void> {
   const choice = actionId === 'approve' ? 'once' : actionId === 'reject' ? 'deny' : null
 
   if (!choice) {
     return
   }
 
-  const gateway = $gateway.get()
+  const origin = actionNonce ? pendingApprovalActions.get(actionNonce) : null
 
-  if (!gateway) {
+  if (!origin || origin.sessionId !== sessionId) {
+    return
+  }
+
+  pendingApprovalActions.delete(actionNonce!)
+
+  if (!gatewayMatchesConnection(origin.gateway, origin.connection) || origin.gateway.connectionState !== 'open') {
     return
   }
 
   try {
-    await gateway.request('approval.respond', { choice, session_id: sessionId ?? undefined })
-    clearApprovalRequest(sessionId)
+    await origin.gateway.request('approval.respond', { choice, session_id: sessionId ?? undefined })
+
+    if (composerGatewayScope($connection.get()) === origin.gatewayScope) {
+      clearApprovalRequest(sessionId)
+    }
   } catch {
     // Leave the prompt parked so the user can still resolve it in-app.
   }

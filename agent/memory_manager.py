@@ -508,6 +508,10 @@ class MemoryManager:
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
+                from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+                if _flexa_governed_mode():
+                    raise
                 logger.debug(
                     "Memory provider '%s' prefetch failed (non-fatal): %s",
                     provider.name, e,
@@ -521,6 +525,10 @@ class MemoryManager:
         wedged provider can never block the caller. See ``sync_all`` for
         the full rationale (agent stuck "running" minutes after a turn).
         """
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            raise RuntimeError("background memory prefetch is unavailable in governed mode")
         providers = list(self._providers)
         if not providers:
             return
@@ -530,6 +538,8 @@ class MemoryManager:
             return
 
         def _run() -> None:
+            from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
             for provider in providers:
                 try:
                     provider.queue_prefetch(clean_query, session_id=session_id)
@@ -606,12 +616,19 @@ class MemoryManager:
                             session_id=session_id,
                         )
                 except Exception as e:
+                    if _flexa_governed_mode():
+                        raise
                     logger.warning(
                         "Memory provider '%s' sync_turn failed: %s",
                         provider.name, e,
                     )
 
-        self._submit_background(_run)
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            _run()
+        else:
+            self._submit_background(_run)
 
     # -- Background dispatch -------------------------------------------------
 
@@ -766,6 +783,10 @@ class MemoryManager:
             try:
                 provider.on_turn_start(turn_number, message, **kwargs)
             except Exception as e:
+                from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+                if _flexa_governed_mode():
+                    raise
                 logger.debug(
                     "Memory provider '%s' on_turn_start failed: %s",
                     provider.name, e,
@@ -773,6 +794,10 @@ class MemoryManager:
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Notify all providers of session end."""
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            return
         for provider in self._providers:
             try:
                 provider.on_session_end(messages)
@@ -811,7 +836,9 @@ class MemoryManager:
         ``_submit_background`` degrades to inline execution — the pre-#16454
         synchronous behavior, slow but correct.
         """
-        if not self._providers:
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode() or not self._providers:
             return
         snapshot = list(messages or [])
 
@@ -1039,6 +1066,10 @@ class MemoryManager:
     def on_delegation(self, task: str, result: str, *,
                       child_session_id: str = "", **kwargs) -> None:
         """Notify all providers that a subagent completed."""
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            return
         for provider in self._providers:
             try:
                 provider.on_delegation(

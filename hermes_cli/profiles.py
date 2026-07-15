@@ -849,6 +849,9 @@ def write_profile_meta(
     fields preserve existing values. Creates the file if missing.
     Profile directory itself must exist.
     """
+    from hermes_cli.flexa_governed import deny_protected_mutation
+
+    deny_protected_mutation()
     if not profile_dir.is_dir():
         raise FileNotFoundError(f"profile directory does not exist: {profile_dir}")
     import yaml
@@ -876,6 +879,29 @@ def write_profile_meta(
 
 def list_profiles() -> List[ProfileInfo]:
     """Return info for all profiles, including the default."""
+    from hermes_cli.flexa_governed import governed_mode, managed_profiles, verified_profile_home
+
+    if governed_mode():
+        governed: List[ProfileInfo] = []
+        for item in managed_profiles():
+            entry = verified_profile_home(item.slug)
+            model, provider = _read_config_model(entry)
+            governed.append(ProfileInfo(
+                name=item.slug,
+                path=entry,
+                # Presentation only: the signed primary named profile is the
+                # single home profile. The unmanaged root default never resolves.
+                is_default=item.primary,
+                gateway_running=_check_gateway_running(entry),
+                model=model,
+                provider=provider,
+                has_env=False,
+                skill_count=_count_skills(entry),
+                description=item.description,
+                description_auto=False,
+            ))
+        return governed
+
     profiles = []
     wrapper_dir = _get_wrapper_dir()
 
@@ -966,6 +992,24 @@ def profiles_to_serve(multiplex: bool) -> List[Tuple[str, Path]]:
     The returned ``hermes_home`` is the path to pass to
     ``set_hermes_home_override`` when scoping a turn to that profile.
     """
+    from hermes_cli.flexa_governed import governed_mode, managed_profiles, verified_profile_home
+
+    if governed_mode():
+        governed = managed_profiles()
+        if multiplex:
+            return [(item.slug, verified_profile_home(item.slug)) for item in governed]
+        if len(governed) == 1:
+            selected = governed[0]
+        else:
+            active_managed = get_active_profile_name() or ""
+            matches = [item for item in governed if item.slug == active_managed]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    "governed multi-profile gateway requires multiplex mode or one active managed profile"
+                )
+            selected = matches[0]
+        return [(selected.slug, verified_profile_home(selected.slug))]
+
     active = get_active_profile_name() or "default"
     if not multiplex:
         return [(active, get_profile_dir(active))]
@@ -1023,6 +1067,9 @@ def create_profile(
     Path
         The newly created profile directory.
     """
+    from hermes_cli.flexa_governed import deny_protected_mutation
+
+    deny_protected_mutation()
     if no_skills and (clone_from is not None or clone_config or clone_all):
         raise ValueError(
             "--no-skills is mutually exclusive with --clone / --clone-from / --clone-all "
@@ -1468,6 +1515,9 @@ def delete_profile(name: str, yes: bool = False) -> Path:
 
     Returns the path that was removed.
     """
+    from hermes_cli.flexa_governed import deny_protected_mutation
+
+    deny_protected_mutation()
     canon = normalize_profile_name(name)
     validate_profile_name(canon)
 
@@ -2152,6 +2202,9 @@ def rename_profile(old_name: str, new_name: str) -> Path:
 
     Returns the new profile directory.
     """
+    from hermes_cli.flexa_governed import deny_protected_mutation
+
+    deny_protected_mutation()
     old_canon = normalize_profile_name(old_name)
     new_canon = normalize_profile_name(new_name)
     validate_profile_name(old_canon)

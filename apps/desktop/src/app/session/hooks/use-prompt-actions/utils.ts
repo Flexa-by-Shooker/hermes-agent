@@ -6,7 +6,7 @@ import { type CommandsCatalogLike, filterDesktopCommandsCatalog } from '@/lib/de
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import type { ComposerAttachment } from '@/store/composer'
 
-export type GatewayRequest = <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
+export type { GatewayRequest } from '@/lib/gateway-request'
 
 export function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))

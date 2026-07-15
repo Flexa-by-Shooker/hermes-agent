@@ -1060,6 +1060,19 @@ def _profile_cache_roots() -> List[Path]:
     is consulted (which otherwise wins when HERMES_HOME is symlinked under a
     denied prefix and $HOME is not that prefix). See issue #31733.
     """
+    from hermes_cli.flexa_governed import binding_for_current_home, governed_mode
+    if governed_mode():
+        # Media delivery is connection/turn scoped to exactly one verified
+        # employee. Never enumerate another profile or a stray cache directory.
+        binding_for_current_home()
+        from hermes_constants import get_hermes_home
+
+        current = Path(get_hermes_home())
+        return [
+            current / "cache" / subdir
+            for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS
+        ]
+
     roots: List[Path] = []
     profiles_dir = _HERMES_ROOT / "profiles"
     try:

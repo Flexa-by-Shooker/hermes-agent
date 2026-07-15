@@ -9,13 +9,14 @@ import { translateNow } from '@/i18n'
 import { type GatewayEventPayload, textPart } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText, normalizePersonalityValue } from '@/lib/chat-runtime'
 import { playCompletionSound } from '@/lib/completion-sound'
+import { gatewayEventOrigin } from '@/lib/gateway-event-origin'
 import { gatewayEventRequiresSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
-import { $gateway } from '@/store/gateway'
+import { $gateway, gatewayEventMatchesActiveOrigin } from '@/store/gateway'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { notify } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
@@ -95,6 +96,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
   return useCallback(
     (event: RpcEvent) => {
+      if (!gatewayEventMatchesActiveOrigin(event)) {
+        return
+      }
+
       const payload = event.payload as GatewayEventPayload | undefined
       const explicitSid = event.session_id || ''
 
@@ -489,6 +494,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           ],
           body: command || description,
           kind: 'approval',
+          origin: gatewayEventOrigin(event),
           sessionId,
           title: translateNow('notifications.native.approvalTitle')
         })

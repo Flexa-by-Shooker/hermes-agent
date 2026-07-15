@@ -4,7 +4,17 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
-  getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
+  getGatewayWsUrl: async (profile, generation) => {
+    const result = await ipcRenderer.invoke('hermes:gateway:ws-url', profile, generation)
+
+    if (!result?.ok || typeof result.url !== 'string') {
+      const error = new Error(result?.error || 'Hermes could not mint a gateway URL.')
+      ;(error as Error & { code?: null | string }).code = result?.code || null
+      throw error
+    }
+
+    return result.url
+  },
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
   openNewSessionWindow: () => ipcRenderer.invoke('hermes:window:openNewSession'),
   petOverlay: {
@@ -181,7 +191,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     return () => ipcRenderer.removeListener('hermes:window-state-changed', listener)
   },
   onFocusSession: callback => {
-    const listener = (_event, sessionId) => callback(sessionId)
+    const listener = (_event, payload) => callback(payload)
     ipcRenderer.on('hermes:focus-session', listener)
 
     return () => ipcRenderer.removeListener('hermes:focus-session', listener)
