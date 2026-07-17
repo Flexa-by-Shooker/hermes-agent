@@ -19,6 +19,7 @@ import { useI18n } from '@/i18n'
 import { Check, ChevronDown, ChevronRight, KeyRound, Loader2, Terminal, Trash2 } from '@/lib/icons'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
+import { $gatewaySwitching, $tenantRuntimeEpoch } from '@/store/gateway-switch'
 import { notify, notifyError } from '@/store/notifications'
 import { $desktopOnboarding, startManualProviderOAuth } from '@/store/onboarding'
 import type { EnvVarInfo, OAuthProvider } from '@/types/hermes'
@@ -308,25 +309,35 @@ export function ProvidersSettings({ onClose, onViewChange, view }: ProvidersSett
   // re-read connection state when the user finishes (or dismisses) a sign-in
   // they launched from this page — otherwise the cards keep their stale status.
   const onboardingActive = useStore($desktopOnboarding).manual
+  const tenantEpoch = useStore($tenantRuntimeEpoch)
+  const gatewaySwitching = useStore($gatewaySwitching)
 
   const refreshOAuthProviders = useCallback(async () => {
+    const originEpoch = tenantEpoch
     // OAuth providers are best-effort — a failure here just hides the panel.
     const { providers } = await listOAuthProviders()
-    setOauthProviders(providers)
-  }, [])
+    if ($tenantRuntimeEpoch.get() === originEpoch && !$gatewaySwitching.get()) {
+      setOauthProviders(providers)
+    }
+  }, [tenantEpoch])
 
   useEffect(() => {
     let cancelled = false
+    const originEpoch = tenantEpoch
+
+    setOauthProviders([])
+    setDisconnecting(null)
+    setOpenProvider(null)
 
     void (async () => {
-      if (onboardingActive) {
+      if (onboardingActive || gatewaySwitching) {
         return
       }
 
       try {
         const { providers } = await listOAuthProviders()
 
-        if (!cancelled) {
+        if (!cancelled && $tenantRuntimeEpoch.get() === originEpoch && !$gatewaySwitching.get()) {
           setOauthProviders(providers)
         }
       } catch {
@@ -335,7 +346,7 @@ export function ProvidersSettings({ onClose, onViewChange, view }: ProvidersSett
     })()
 
     return () => void (cancelled = true)
-  }, [onboardingActive])
+  }, [gatewaySwitching, onboardingActive, tenantEpoch])
 
   // External (CLI-managed) providers can't be cleared via the API by design —
   // Hermes never deletes creds another tool owns behind a silent API call.
@@ -372,9 +383,16 @@ export function ProvidersSettings({ onClose, onViewChange, view }: ProvidersSett
     }
 
     setDisconnecting(provider.id)
+    const originEpoch = tenantEpoch
+    const isCurrent = () => $tenantRuntimeEpoch.get() === originEpoch && !$gatewaySwitching.get()
 
     try {
       await disconnectOAuthProvider(provider.id)
+
+      if (!isCurrent()) {
+        return
+      }
+
       notify({
         durationMs: 3_000,
         kind: 'success',
@@ -383,9 +401,13 @@ export function ProvidersSettings({ onClose, onViewChange, view }: ProvidersSett
       })
       await refreshOAuthProviders().catch(() => undefined)
     } catch (err) {
-      notifyError(err, t.settings.providers.failedRemove(name))
+      if (isCurrent()) {
+        notifyError(err, t.settings.providers.failedRemove(name))
+      }
     } finally {
-      setDisconnecting(null)
+      if (isCurrent()) {
+        setDisconnecting(null)
+      }
     }
   }
 

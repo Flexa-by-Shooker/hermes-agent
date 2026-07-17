@@ -1,6 +1,7 @@
+import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type { ChangeEvent, ReactNode } from 'react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 
 import { Button } from '@/components/ui/button'
@@ -11,11 +12,11 @@ import { Textarea } from '@/components/ui/textarea'
 import { getElevenLabsVoices, getHermesConfigSchema, saveHermesConfig } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
+import { $gatewaySwitching, $tenantRuntimeEpoch } from '@/store/gateway-switch'
 import { notify, notifyError } from '@/store/notifications'
 import type { ConfigFieldSchema, HermesConfigRecord } from '@/types/hermes'
 
 import { setHermesConfigCache, useHermesConfigRecord } from '../hooks/use-config-record'
-import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
 import { PanelEmpty } from '../overlays/panel'
 
 import { CONTROL_TEXT, EMPTY_SELECT_VALUE, FIELD_DESCRIPTIONS, FIELD_LABELS, SECTIONS } from './constants'
@@ -225,10 +226,13 @@ export function ConfigSettings({
 }) {
   const { t } = useI18n()
   const c = t.settings.config
+  const gatewaySwitching = useStore($gatewaySwitching)
+  const tenantEpoch = useStore($tenantRuntimeEpoch)
   // The editable draft is local (debounced autosave watches it), but it's seeded
   // from — and saved back through — the shared config cache, so edits are visible
   // in the MCP/model surfaces and reopening the page doesn't reload-flash.
   const [config, setConfig] = useState<HermesConfigRecord | null>(null)
+  const [configTenantEpoch, setConfigTenantEpoch] = useState(tenantEpoch)
   const { data: loadedConfig, isError: configLoadFailed, refetch: refetchConfig } = useHermesConfigRecord()
 
   const {
@@ -236,7 +240,8 @@ export function ConfigSettings({
     isError: schemaFailed,
     refetch: refetchSchema
   } = useQuery({
-    queryKey: ['hermes-config-schema'],
+    enabled: !gatewaySwitching,
+    queryKey: ['hermes-config-schema', tenantEpoch],
     queryFn: getHermesConfigSchema,
     staleTime: 5 * 60 * 1000
   })
@@ -251,30 +256,40 @@ export function ConfigSettings({
   // Background refetches thereafter must not clobber in-progress edits.
   const configSeeded = useRef(false)
 
-  useEffect(() => {
-    if (loadedConfig && !configSeeded.current) {
-      configSeeded.current = true
-      setConfig(loadedConfig)
-    }
-  }, [loadedConfig])
-
-  // A profile switch invalidates (but doesn't clear) the shared config query, so
-  // the local draft would otherwise keep profile A's data and autosave it into
-  // B. Drop the seed + draft (re-seeds from B's refetch) and zero saveVersion so
-  // the pending debounced autosave is cancelled by its effect cleanup.
-  useOnProfileSwitch(() => {
+  // Reset before paint on every tenant epoch. The epoch marker also hides the
+  // old draft during the render that first notices the switch.
+  useLayoutEffect(() => {
     configSeeded.current = false
+    setConfigTenantEpoch(tenantEpoch)
     setConfig(null)
+    setElevenLabsVoiceOptions(null)
+    setElevenLabsVoiceLabels({})
     saveVersionRef.current = 0
     setSaveVersion(0)
-  })
+  }, [tenantEpoch])
+
+  useEffect(() => {
+    if (!gatewaySwitching && loadedConfig && !configSeeded.current) {
+      configSeeded.current = true
+      setConfigTenantEpoch(tenantEpoch)
+      setConfig(loadedConfig)
+    }
+  }, [gatewaySwitching, loadedConfig, tenantEpoch])
 
   useEffect(() => {
     let cancelled = false
+    const loadTenantEpoch = tenantEpoch
+
+    setElevenLabsVoiceOptions(null)
+    setElevenLabsVoiceLabels({})
+
+    if (gatewaySwitching) {
+      return () => void (cancelled = true)
+    }
 
     getElevenLabsVoices()
       .then(result => {
-        if (cancelled || !result.available) {
+        if (cancelled || !tenantIsCurrent(loadTenantEpoch) || !result.available) {
           return
         }
 
@@ -282,35 +297,45 @@ export function ConfigSettings({
         setElevenLabsVoiceLabels(Object.fromEntries(result.voices.map(voice => [voice.voice_id, voice.label])))
       })
       .catch(() => {
-        if (!cancelled) {
+        if (!cancelled && tenantIsCurrent(loadTenantEpoch)) {
           setElevenLabsVoiceOptions(null)
           setElevenLabsVoiceLabels({})
         }
       })
 
     return () => void (cancelled = true)
-  }, [])
+  }, [gatewaySwitching, tenantEpoch])
 
   useEffect(() => {
-    if (!config || saveVersion === 0) {
+    if (!config || configTenantEpoch !== tenantEpoch || gatewaySwitching || saveVersion === 0) {
       return
     }
 
     const v = saveVersion
+    const saveTenantEpoch = tenantEpoch
 
     const t = window.setTimeout(() => {
       void (async () => {
+        if (!tenantIsCurrent(saveTenantEpoch)) {
+          return
+        }
+
         try {
           await saveHermesConfig(config)
+
+          if (!tenantIsCurrent(saveTenantEpoch)) {
+            return
+          }
+
           // Mirror the saved record into the shared cache so MCP/model surfaces
           // reflect the edit without their own refetch.
-          setHermesConfigCache(config)
+          setHermesConfigCache(config, saveTenantEpoch)
 
           if (saveVersionRef.current === v) {
             onConfigSaved?.()
           }
         } catch (err) {
-          if (saveVersionRef.current === v) {
+          if (tenantIsCurrent(saveTenantEpoch) && saveVersionRef.current === v) {
             notifyError(err, c.autosaveFailed)
           }
         }
@@ -319,9 +344,13 @@ export function ConfigSettings({
 
     return () => window.clearTimeout(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps -- copy is stable; avoid re-scheduling autosave on locale change
-  }, [config, onConfigSaved, saveVersion])
+  }, [config, configTenantEpoch, gatewaySwitching, onConfigSaved, saveVersion, tenantEpoch])
 
   const updateConfig = (next: HermesConfigRecord) => {
+    if (!tenantIsCurrent(tenantEpoch) || configTenantEpoch !== tenantEpoch) {
+      return
+    }
+
     saveVersionRef.current += 1
     setConfig(next)
     setSaveVersion(saveVersionRef.current)
@@ -375,6 +404,7 @@ export function ConfigSettings({
 
   function handleImport(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
+    const importTenantEpoch = tenantEpoch
 
     if (!file) {
       return
@@ -383,6 +413,10 @@ export function ConfigSettings({
     const reader = new FileReader()
 
     reader.onload = () => {
+      if (!tenantIsCurrent(importTenantEpoch)) {
+        return
+      }
+
       try {
         updateConfig(JSON.parse(String(reader.result)))
         notify({ kind: 'success', title: c.imported, message: t.common.saving })
@@ -395,9 +429,11 @@ export function ConfigSettings({
     e.target.value = ''
   }
 
-  if (!config || !schema) {
+  const safeConfig = !gatewaySwitching && configTenantEpoch === tenantEpoch ? config : null
+
+  if (!safeConfig || !schema) {
     // A failed config/schema fetch must surface a retry, not spin forever.
-    if ((configLoadFailed && !config) || (schemaFailed && !schema)) {
+    if ((configLoadFailed && !safeConfig) || (schemaFailed && !schema)) {
       return (
         <div className="flex h-full min-h-0 flex-1">
           <PanelEmpty
@@ -434,7 +470,8 @@ export function ConfigSettings({
     return <LoadingState label={c.loading} />
   }
 
-  const visibleFields = activeSectionId === 'voice' ? fields.filter(([key]) => voiceFieldVisible(key, config)) : fields
+  const visibleFields =
+    activeSectionId === 'voice' ? fields.filter(([key]) => voiceFieldVisible(key, safeConfig)) : fields
 
   return (
     <SettingsContent>
@@ -451,23 +488,25 @@ export function ConfigSettings({
             <div className="scroll-mt-6 rounded-lg" id={`setting-field-${key}`} key={key}>
               <ConfigField
                 descriptionExtra={
-                  key === 'memory.provider' && Boolean(getNested(config, key)) ? (
-                    <MemoryConnect provider={String(getNested(config, key))} />
+                  key === 'memory.provider' && Boolean(getNested(safeConfig, key)) ? (
+                    <MemoryConnect provider={String(getNested(safeConfig, key))} />
                   ) : undefined
                 }
                 enumOptions={
                   key === 'tts.elevenlabs.voice_id'
-                    ? enumOptionsFor(key, getNested(config, key), config, elevenLabsVoiceOptions ?? undefined)
-                    : enumOptionsFor(key, getNested(config, key), config)
+                    ? enumOptionsFor(key, getNested(safeConfig, key), safeConfig, elevenLabsVoiceOptions ?? undefined)
+                    : enumOptionsFor(key, getNested(safeConfig, key), safeConfig)
                 }
-                onChange={value => updateConfig(setNested(config, key, value))}
+                onChange={value => updateConfig(setNested(safeConfig, key, value))}
                 optionLabels={key === 'tts.elevenlabs.voice_id' ? elevenLabsVoiceLabels : undefined}
                 schema={field}
                 schemaKey={key}
-                value={getNested(config, key)}
+                value={getNested(safeConfig, key)}
               />
-              {key === 'memory.provider' && typeof getNested(config, key) === 'string' && getNested(config, key) ? (
-                <ProviderConfigPanel provider={String(getNested(config, key))} />
+              {key === 'memory.provider' &&
+              typeof getNested(safeConfig, key) === 'string' &&
+              getNested(safeConfig, key) ? (
+                <ProviderConfigPanel provider={String(getNested(safeConfig, key))} />
               ) : null}
             </div>
           ))}
@@ -482,4 +521,8 @@ export function ConfigSettings({
       />
     </SettingsContent>
   )
+}
+
+function tenantIsCurrent(tenantEpoch: number): boolean {
+  return $tenantRuntimeEpoch.get() === tenantEpoch && !$gatewaySwitching.get()
 }

@@ -83,7 +83,9 @@ def apply_llm_request_middleware(
     Middleware may return ``{"request": {...}}`` to replace the effective
     provider kwargs before Hermes sends them.
     """
-    if not _has_middleware(LLM_REQUEST_MIDDLEWARE):
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode() or not _has_middleware(LLM_REQUEST_MIDDLEWARE):
         return RequestMiddlewareResult(
             payload=request,
             original_payload=request,
@@ -127,7 +129,9 @@ def apply_tool_request_middleware(
     Middleware may return ``{"args": {...}}`` to replace the effective tool
     arguments before hooks, guardrails, approvals, and execution see them.
     """
-    if not _has_middleware(TOOL_REQUEST_MIDDLEWARE):
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode() or not _has_middleware(TOOL_REQUEST_MIDDLEWARE):
         return RequestMiddlewareResult(
             payload=args,
             original_payload=args,
@@ -176,6 +180,10 @@ def run_llm_execution_middleware(
     **context: Any,
 ) -> Any:
     """Run provider execution through registered LLM execution middleware."""
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode():
+        return next_call(request)
     callbacks = _get_middleware_callbacks(LLM_EXECUTION_MIDDLEWARE)
     if not callbacks:
         return next_call(request)
@@ -196,6 +204,10 @@ def run_tool_execution_middleware(
     **context: Any,
 ) -> Any:
     """Run tool execution through registered tool execution middleware."""
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode():
+        return next_call(args)
     callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
     if not callbacks:
         return next_call(args)

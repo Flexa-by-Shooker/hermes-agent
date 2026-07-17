@@ -66,6 +66,36 @@ def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageE
 
 class TestBasePlatformTopicSessions:
     @pytest.mark.asyncio
+    async def test_pre_session_trust_hook_runs_before_session_key(self, monkeypatch):
+        adapter = DummyTelegramAdapter()
+        adapter.set_message_handler(lambda event: asyncio.sleep(0, result=None))
+        order = []
+
+        def trust_hook(event):
+            order.append("trust")
+            event.source._verified_for_session_key = True
+
+        def guarded_session_key(source, **kwargs):
+            order.append("key")
+            assert source._verified_for_session_key is True
+            return build_session_key(source, **kwargs)
+
+        def fake_create_task(coro):
+            coro.close()
+            return SimpleNamespace()
+
+        adapter.set_pre_session_key_hook(trust_hook)
+        monkeypatch.setattr(
+            "gateway.platforms.base.build_session_key",
+            guarded_session_key,
+        )
+        monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+
+        await adapter.handle_message(_make_event("-1001", "10"))
+
+        assert order == ["trust", "key"]
+
+    @pytest.mark.asyncio
     async def test_handle_message_does_not_interrupt_different_topic(self, monkeypatch):
         adapter = DummyTelegramAdapter()
         adapter.set_message_handler(lambda event: asyncio.sleep(0, result=None))

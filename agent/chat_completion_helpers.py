@@ -2378,8 +2378,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # box is already closed (tool boundary flush).
                 elif agent.stream_delta_callback:
                     try:
-                        agent.stream_delta_callback(delta.content)
-                        agent._record_streamed_assistant_text(delta.content)
+                        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+                        if _flexa_governed_mode():
+                            agent._record_streamed_assistant_text(delta.content)
+                        else:
+                            agent.stream_delta_callback(delta.content)
+                            agent._record_streamed_assistant_text(delta.content)
                     except Exception:
                         pass
 

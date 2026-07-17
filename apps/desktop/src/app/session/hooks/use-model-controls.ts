@@ -3,6 +3,7 @@ import { useCallback } from 'react'
 
 import { getGlobalModelInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { $tenantRuntimeEpoch } from '@/store/gateway-switch'
 import { notifyError } from '@/store/notifications'
 import { $activeSessionId, $currentModel, $currentProvider, setCurrentModel, setCurrentProvider } from '@/store/session'
 import type { ModelOptionsResponse } from '@/types/hermes'
@@ -41,6 +42,8 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
   // $currentModel) survives the lifecycle refreshes that fire on boot / fresh
   // draft / session events. A live session owns the footer, so skip entirely.
   const refreshCurrentModel = useCallback(async (force = false) => {
+    const tenantEpoch = $tenantRuntimeEpoch.get()
+
     try {
       if ($activeSessionId.get()) {
         return
@@ -52,7 +55,7 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
 
       const result = await getGlobalModelInfo()
 
-      if ($activeSessionId.get() || (!force && $currentModel.get())) {
+      if ($tenantRuntimeEpoch.get() !== tenantEpoch || $activeSessionId.get() || (!force && $currentModel.get())) {
         return
       }
 
@@ -81,6 +84,7 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
       // rather than leave the UI showing a model the backend never selected.
       const prevModel = $currentModel.get()
       const prevProvider = $currentProvider.get()
+      const tenantEpoch = $tenantRuntimeEpoch.get()
 
       setCurrentModel(selection.model)
       setCurrentProvider(selection.provider)
@@ -99,10 +103,18 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
           value: `${selection.model} --provider ${selection.provider} --session`
         })
 
+        if ($tenantRuntimeEpoch.get() !== tenantEpoch || $activeSessionId.get() !== activeSessionId) {
+          return false
+        }
+
         void queryClient.invalidateQueries({ queryKey: ['model-options', activeSessionId] })
 
         return true
       } catch (err) {
+        if ($tenantRuntimeEpoch.get() !== tenantEpoch || $activeSessionId.get() !== activeSessionId) {
+          return false
+        }
+
         setCurrentModel(prevModel)
         setCurrentProvider(prevProvider)
         updateModelOptionsCache(prevProvider, prevModel, !activeSessionId)

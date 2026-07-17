@@ -20,4 +20,8 @@ export function getToolDiff(toolCallId: string): string {
   return toolCallId ? $toolDiffs.get()[toolCallId] || '' : ''
 }
 
+export function clearToolDiffs(): void {
+  $toolDiffs.set({})
+}
+
 export const $toolInlineDiffs = $toolDiffs

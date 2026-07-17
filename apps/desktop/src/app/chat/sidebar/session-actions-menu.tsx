@@ -17,11 +17,14 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { Input } from '@/components/ui/input'
 import { renameSession } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { GatewayConnectionSupersededError, sameConnectionIdentity } from '@/lib/desktop-gateway-connection'
 import { triggerHaptic } from '@/lib/haptics'
 import { exportSession } from '@/lib/session-export'
-import { activeGateway } from '@/store/gateway'
+import { $gateway, gatewayMatchesConnection } from '@/store/gateway'
+import { $tenantRuntimeEpoch } from '@/store/gateway-switch'
 import { notify, notifyError } from '@/store/notifications'
-import { $activeSessionId, $selectedStoredSessionId, setSessions } from '@/store/session'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { $activeSessionId, $connection, $selectedStoredSessionId, setSessions } from '@/store/session'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
 import type { SessionTitleResponse } from '../../types'
@@ -47,19 +50,35 @@ export async function renameSessionPreferringRpc(
   title: string,
   profile?: string
 ): Promise<{ title?: string }> {
+  const tenantEpoch = $tenantRuntimeEpoch.get()
   const isActiveRow = storedSessionId === $selectedStoredSessionId.get()
   const runtimeId = isActiveRow ? $activeSessionId.get() : null
-  const gateway = activeGateway()
+  const gateway = $gateway.get()
+  const connection = $connection.get()
 
-  if (title && runtimeId && gateway) {
+  const originIsCurrent = () =>
+    $tenantRuntimeEpoch.get() === tenantEpoch &&
+    $gateway.get() === gateway &&
+    sameConnectionIdentity($connection.get(), connection) &&
+    Boolean(gateway && connection && gatewayMatchesConnection(gateway, connection))
+
+  if (title && runtimeId && gateway && connection && originIsCurrent()) {
     try {
       const result = await gateway.request<SessionTitleResponse>('session.title', {
         session_id: runtimeId,
         title
       })
 
+      if (!originIsCurrent()) {
+        throw new GatewayConnectionSupersededError('Hermes changed tenants before the rename completed.')
+      }
+
       return { title: result?.title ?? title }
     } catch (err) {
+      if (!originIsCurrent()) {
+        throw new GatewayConnectionSupersededError('Hermes changed tenants before the rename completed.')
+      }
+
       // Fall through to REST — e.g. the socket is mid-reconnect. REST still
       // works for any session that already has a persisted row. Log so a
       // genuine RPC-side failure (which then surfaces a REST 404 for the
@@ -68,7 +87,28 @@ export async function renameSessionPreferringRpc(
     }
   }
 
-  return renameSession(storedSessionId, title, profile)
+  const result = await renameSession(
+    storedSessionId,
+    title,
+    profile ?? normalizeProfileKey($activeGatewayProfile.get())
+  )
+
+  if ($tenantRuntimeEpoch.get() !== tenantEpoch) {
+    throw new GatewayConnectionSupersededError('Hermes changed tenants before the rename completed.')
+  }
+
+  return result
+}
+
+/** Apply an async rename result only inside the tenant epoch that started it. */
+export function applySessionRenameIfCurrent(sessionId: string, title: string, tenantEpoch: number): boolean {
+  if ($tenantRuntimeEpoch.get() !== tenantEpoch) {
+    return false
+  }
+
+  setSessions(prev => prev.map(session => (session.id === sessionId ? { ...session, title: title || null } : session)))
+
+  return true
 }
 
 interface SessionActions {
@@ -301,17 +341,28 @@ function RenameSessionDialog({ open, onOpenChange, sessionId, currentTitle, prof
     }
 
     setSubmitting(true)
+    const tenantEpoch = $tenantRuntimeEpoch.get()
 
     try {
       const result = await renameSessionPreferringRpc(sessionId, next, profile)
       const finalTitle = result.title || next || ''
-      setSessions(prev => prev.map(s => (s.id === sessionId ? { ...s, title: finalTitle || null } : s)))
+
+      if (!applySessionRenameIfCurrent(sessionId, finalTitle, tenantEpoch)) {
+        return
+      }
+
       notify({ durationMs: 2_000, kind: 'success', message: r.renamed })
       onOpenChange(false)
     } catch (err) {
+      if ($tenantRuntimeEpoch.get() !== tenantEpoch) {
+        return
+      }
+
       notifyError(err, r.renameFailed)
     } finally {
-      setSubmitting(false)
+      if ($tenantRuntimeEpoch.get() === tenantEpoch) {
+        setSubmitting(false)
+      }
     }
   }
 

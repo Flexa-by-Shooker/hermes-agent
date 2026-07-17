@@ -465,6 +465,20 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    from agent.flexa_enforcement import turn_active as _flexa_turn_active
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode() and _flexa_turn_active(agent):
+        # A live governed turn may contain native image bytes, decrypted broker
+        # pages, and proposal-authorized tool state. Compression crosses several
+        # independent durability/auxiliary boundaries, so defer it wholesale
+        # until the turn has produced a sanitized terminal transcript.
+        agent._last_compaction_in_place = False
+        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+        if existing_prompt is None:
+            existing_prompt = system_message or ""
+        return messages, existing_prompt
+
     # Codex app-server sessions: the codex agent owns the real thread context;
     # Hermes' summarizer would only rewrite a local mirror without shrinking
     # the actual thread (#36801). Route compaction to the app server's own
@@ -633,6 +647,9 @@ def compress_context(
         try:
             agent._memory_manager.on_pre_compress(messages)
         except Exception:
+            if _flexa_governed_mode():
+                _release_lock()
+                raise
             pass
 
     try:
@@ -924,6 +941,8 @@ def compress_context(
                     reason="compression",
                 )
         except Exception as _me_err:
+            if _flexa_governed_mode():
+                raise
             logger.debug("memory manager on_session_switch (compression): %s", _me_err)
 
         # Warn on repeated compressions (quality degrades with each pass).

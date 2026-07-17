@@ -11,20 +11,48 @@ export interface ComposerAttachment {
   previewUrl?: string
   path?: string
   attachedSessionId?: string
+  /** Opaque gateway-side handle used to detach governed uploads. */
+  attachmentId?: string
+  /** Stable idempotency key for this logical file/image. Generated once when
+   * the chip is created and reused by eager upload, submit-time joins, retries,
+   * and draft restores. Never regenerate it merely because an RPC failed. */
+  uploadNonce?: string
   /** Set while the file/image bytes are being staged into the session
    * workspace (remote upload or local stage), and 'error' if that failed.
    * Drives the spinner / error state on the composer attachment card. */
   uploadState?: 'uploading' | 'error'
 }
 
+const UPLOAD_NONCE_RE = /^[0-9a-f]{32}$/
+
+export function createAttachmentUploadNonce(): string {
+  const bytes = new Uint8Array(16)
+
+  globalThis.crypto.getRandomValues(bytes)
+
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
+}
+
+export function withAttachmentUploadNonce(attachment: ComposerAttachment): ComposerAttachment {
+  if (attachment.kind !== 'image' && attachment.kind !== 'file') {
+    return attachment
+  }
+
+  if (attachment.uploadNonce && UPLOAD_NONCE_RE.test(attachment.uploadNonce)) {
+    return attachment
+  }
+
+  return { ...attachment, uploadNonce: createAttachmentUploadNonce() }
+}
+
 export const $composerDraft = atom('')
 export const $composerAttachments = atom<ComposerAttachment[]>([])
-export const $composerTerminalSelections = atom<Record<string, string>>({})
+export const $composerTerminalSelections = atom<Record<string, Record<string, string>>>({})
 
 // Per-thread draft stash for the decoupled composer. Session lifecycle never
 // touches this — only ChatBar's scope swap reads/writes it. Text mirrors to
 // localStorage; attachments are memory-only (blobs, upload state).
-export const SESSION_DRAFTS_STORAGE_KEY = 'hermes:composer-drafts:v3'
+export const SESSION_DRAFTS_STORAGE_KEY = 'hermes:composer-drafts:v4'
 
 const NEW_SESSION_DRAFT_KEY = '__new__'
 const MAX_PERSISTED_DRAFTS = 50
@@ -88,6 +116,7 @@ export function stashSessionDraft(scope: string | null | undefined, text: string
     draftsBySession.set(key, cloneDraft({ attachments, text }))
   }
 
+  reconcileComposerTerminalSelections(scope, text)
   persistDraftTexts()
 }
 
@@ -134,11 +163,20 @@ export function clearComposerDraft() {
 }
 
 export function addComposerAttachment(attachment: ComposerAttachment) {
+  const normalized = withAttachmentUploadNonce(attachment)
   const previous = $composerAttachments.get()
-  const next = upsertAttachment(previous, attachment)
+  const existing = previous.find(item => item.id === normalized.id)
+  // Async preview enrichment (image path -> data URL) must keep the nonce the
+  // original chip received. A caller may reconstruct the same logical
+  // attachment without copying it, so preserve the existing key centrally.
+  const nextAttachment =
+    existing?.uploadNonce && (normalized.kind === 'image' || normalized.kind === 'file')
+      ? { ...normalized, uploadNonce: existing.uploadNonce }
+      : normalized
+  const next = upsertAttachment(previous, nextAttachment)
   $composerAttachments.set(next)
 
-  if (next.length > previous.length && attachment.kind !== 'url') {
+  if (next.length > previous.length && nextAttachment.kind !== 'url') {
     triggerHaptic('selection')
   }
 }
@@ -217,33 +255,42 @@ function terminalLabelsFromDraft(draft: string) {
   return labels
 }
 
-export function setComposerTerminalSelection(label: string, text: string) {
+export function setComposerTerminalSelection(scope: string | null | undefined, label: string, text: string) {
+  const scopeKey = scope?.trim()
   const nextLabel = label.trim()
   const nextText = text.trim()
 
-  if (!nextLabel || !nextText) {
+  if (!scopeKey || !nextLabel || !nextText) {
     return
   }
 
   const current = $composerTerminalSelections.get()
+  const scoped = current[scopeKey] ?? {}
 
-  if (current[nextLabel] === nextText) {
+  if (scoped[nextLabel] === nextText) {
     return
   }
 
   $composerTerminalSelections.set({
     ...current,
-    [nextLabel]: nextText
+    [scopeKey]: { ...scoped, [nextLabel]: nextText }
   })
 }
 
-export function reconcileComposerTerminalSelections(draft: string) {
+export function reconcileComposerTerminalSelections(scope: string | null | undefined, draft: string) {
+  const scopeKey = scope?.trim()
+
+  if (!scopeKey) {
+    return
+  }
+
   const current = $composerTerminalSelections.get()
+  const scoped = current[scopeKey] ?? {}
   const labels = new Set(terminalLabelsFromDraft(draft))
   let changed = false
   const next: Record<string, string> = {}
 
-  for (const [label, text] of Object.entries(current)) {
+  for (const [label, text] of Object.entries(scoped)) {
     if (!labels.has(label)) {
       changed = true
 
@@ -254,18 +301,26 @@ export function reconcileComposerTerminalSelections(draft: string) {
   }
 
   if (changed) {
-    $composerTerminalSelections.set(next)
+    const all = { ...current }
+
+    if (Object.keys(next).length === 0) {
+      delete all[scopeKey]
+    } else {
+      all[scopeKey] = next
+    }
+
+    $composerTerminalSelections.set(all)
   }
 }
 
-export function terminalContextBlocksFromDraft(draft: string) {
+export function terminalContextBlocksFromDraft(scope: string | null | undefined, draft: string) {
   const labels = terminalLabelsFromDraft(draft)
 
   if (labels.length === 0) {
     return []
   }
 
-  const selections = $composerTerminalSelections.get()
+  const selections = scope ? ($composerTerminalSelections.get()[scope] ?? {}) : {}
 
   return labels.flatMap(label => {
     const text = selections[label]?.trim()
@@ -278,12 +333,17 @@ export function terminalContextBlocksFromDraft(draft: string) {
   })
 }
 
-export function clearComposerTerminalSelections() {
-  if (Object.keys($composerTerminalSelections.get()).length === 0) {
+export function clearComposerTerminalSelections(scope: string | null | undefined) {
+  const scopeKey = scope?.trim()
+  const current = $composerTerminalSelections.get()
+
+  if (!scopeKey || !current[scopeKey]) {
     return
   }
 
-  $composerTerminalSelections.set({})
+  const next = { ...current }
+  delete next[scopeKey]
+  $composerTerminalSelections.set(next)
 }
 
 function upsertAttachment(attachments: ComposerAttachment[], attachment: ComposerAttachment) {

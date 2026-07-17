@@ -1733,6 +1733,11 @@ class SessionDB:
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
+        from hermes_cli.flexa_governed import stamp_supervised_session_config
+
+        kwargs["model_config"] = stamp_supervised_session_config(
+            kwargs.get("model_config")
+        )
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
 
@@ -3771,6 +3776,80 @@ class SessionDB:
             return msg_id
 
         return self._execute_write(_do)
+
+    def append_text_turn_atomic(
+        self,
+        session_id: str,
+        user_content: str,
+        assistant_content: str,
+    ) -> None:
+        """Append one plain user/assistant pair in a single transaction.
+
+        This deliberately accepts text only and creates no tool, reasoning,
+        model, prompt, or provider metadata. It is used by deterministic
+        gateway responses that must persist without constructing an agent.
+        """
+
+        self.append_text_turns_atomic(
+            session_id,
+            [(user_content, assistant_content)],
+        )
+
+    def append_text_turns_atomic(
+        self,
+        session_id: str,
+        turns: list[tuple[str, str]],
+    ) -> None:
+        """Append plain marked turns together in one database transaction."""
+
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or not isinstance(turns, list)
+            or not turns
+            or any(
+                not isinstance(turn, tuple)
+                or len(turn) != 2
+                or not isinstance(turn[0], str)
+                or not isinstance(turn[1], str)
+                or not turn[1]
+                for turn in turns
+            )
+        ):
+            raise ValueError("plain text turns are invalid")
+
+        rows: list[dict[str, Any]] = []
+        for user_text, assistant_text in turns:
+            rows.extend(
+                [
+                    {
+                        "role": "user",
+                        "content": user_text,
+                        "effect_disposition": "flexa_disclosure_blocked",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": assistant_text,
+                        "effect_disposition": "flexa_disclosure_blocked",
+                    },
+                ]
+            )
+
+        def _do(conn):
+            inserted, tool_calls = self._insert_message_rows(
+                conn,
+                session_id,
+                rows,
+            )
+            expected = len(rows)
+            if inserted != expected or tool_calls != 0:
+                raise RuntimeError("plain text turn persistence was not exact")
+            conn.execute(
+                "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
+                (expected, session_id),
+            )
+
+        self._execute_write(_do)
 
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.

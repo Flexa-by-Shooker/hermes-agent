@@ -1,5 +1,7 @@
-import { $gateway } from '@/store/gateway'
-import { $activeSessionId } from '@/store/session'
+import { GatewayConnectionSupersededError, sameConnectionIdentity } from '@/lib/desktop-gateway-connection'
+import { $gateway, gatewayMatchesConnection } from '@/store/gateway'
+import { $tenantRuntimeEpoch } from '@/store/gateway-switch'
+import { $activeSessionId, $connection } from '@/store/session'
 
 // Shared client for one-off ("one-shot") LLM requests: a single stateless model
 // call that runs OUTSIDE the conversation. It never appends to session history,
@@ -36,9 +38,11 @@ export interface OneShotRequest {
  */
 export async function requestOneShot(req: OneShotRequest): Promise<string> {
   const gateway = $gateway.get()
+  const connection = $connection.get()
+  const tenantEpoch = $tenantRuntimeEpoch.get()
 
-  if (!gateway) {
-    throw new Error('Gateway not connected')
+  if (!gateway || !connection || !gatewayMatchesConnection(gateway, connection)) {
+    throw new GatewayConnectionSupersededError('Hermes cannot verify the gateway for this one-off request.')
   }
 
   const sessionId = req.sessionId === undefined ? $activeSessionId.get() : req.sessionId
@@ -53,6 +57,15 @@ export async function requestOneShot(req: OneShotRequest): Promise<string> {
     template: req.template,
     variables: req.variables
   })
+
+  if (
+    $tenantRuntimeEpoch.get() !== tenantEpoch ||
+    $gateway.get() !== gateway ||
+    !sameConnectionIdentity($connection.get(), connection) ||
+    !gatewayMatchesConnection(gateway, connection)
+  ) {
+    throw new GatewayConnectionSupersededError('Hermes changed profiles before the one-off request completed.')
+  }
 
   return (result?.text ?? '').trim()
 }

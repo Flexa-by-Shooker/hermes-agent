@@ -1,7 +1,9 @@
 import { atom, computed } from 'nanostores'
 
+import type { HermesConnection } from '@/global'
+import { composerGatewayScope } from '@/lib/composer-scope'
 import { readKey, writeKey } from '@/lib/storage'
-import { $currentCwd } from '@/store/session'
+import { $connection, $currentCwd } from '@/store/session'
 
 import { setTerminalTakeover } from '../store'
 
@@ -43,7 +45,13 @@ interface PersistedTerminalState {
   terminals: PersistedTerminalEntry[]
 }
 
-const TERMINALS_STORAGE_KEY = 'hermes.desktop.terminals.v1'
+const TERMINALS_STORAGE_KEY = 'hermes.desktop.terminals.v3'
+
+export function terminalStorageKeyForConnection(connection: HermesConnection | null | undefined): string | null {
+  const scope = composerGatewayScope(connection)
+
+  return scope ? `${TERMINALS_STORAGE_KEY}.${encodeURIComponent(scope)}` : null
+}
 
 // Cap a single tab's replayed history so the persisted layout can't blow the
 // localStorage quota. Roughly mirrors VS Code's persistentSessionScrollback
@@ -74,9 +82,9 @@ function sanitizePersistedTerminal(value: unknown): PersistedTerminalEntry | nul
   }
 }
 
-function loadPersistedTerminals(): PersistedTerminalState {
+function loadPersistedTerminals(storageKey: string | null): PersistedTerminalState {
   const fallback: PersistedTerminalState = { activeTerminalId: null, terminals: [] }
-  const raw = readKey(TERMINALS_STORAGE_KEY)
+  const raw = storageKey ? readKey(storageKey) : null
 
   if (!raw) {
     return fallback
@@ -109,7 +117,13 @@ function loadPersistedTerminals(): PersistedTerminalState {
 // Persist synchronously on every change (the app-wide convention — see panes.ts
 // / layout.ts). Capturing history this way means a snapshot is already on disk
 // well before the renderer tears down, so app quit needs no unload hook.
+let activeStorageKey = terminalStorageKeyForConnection($connection.get())
+
 function persistTerminals(list: readonly TerminalEntry[], activeTerminalId: null | string) {
+  if (!activeStorageKey) {
+    return
+  }
+
   const terminals = list
     .filter(term => term.kind === 'user')
     .map(term => ({
@@ -121,16 +135,16 @@ function persistTerminals(list: readonly TerminalEntry[], activeTerminalId: null
     }))
 
   if (!terminals.length) {
-    writeKey(TERMINALS_STORAGE_KEY, null)
+    writeKey(activeStorageKey, null)
 
     return
   }
 
   const active = terminals.some(term => term.id === activeTerminalId) ? activeTerminalId : (terminals[0]?.id ?? null)
-  writeKey(TERMINALS_STORAGE_KEY, JSON.stringify({ activeTerminalId: active, terminals }))
+  writeKey(activeStorageKey, JSON.stringify({ activeTerminalId: active, terminals }))
 }
 
-const restored = loadPersistedTerminals()
+const restored = loadPersistedTerminals(activeStorageKey)
 
 export const $terminals = atom<readonly TerminalEntry[]>(
   restored.terminals.map(term => ({ ...term, kind: 'user' as const }))
@@ -161,6 +175,24 @@ export function createTerminal(cwd: string = $currentCwd.get()): string {
 // Procs we've already surfaced a tab for — so closing an agent tab doesn't
 // resurrect it on the next poll while the process is still running.
 const surfacedProcs = new Set<string>()
+
+// A profile/backend switch retires the visible terminal set synchronously.
+// Loading the new scope only after the verified descriptor changes prevents an
+// old cwd or scrollback secret from ever painting against the next tenant.
+$connection.subscribe(connection => {
+  const nextStorageKey = terminalStorageKeyForConnection(connection)
+
+  if (nextStorageKey === activeStorageKey) {
+    return
+  }
+
+  activeStorageKey = nextStorageKey
+  surfacedProcs.clear()
+  const next = loadPersistedTerminals(activeStorageKey)
+  $terminals.set(next.terminals.map(term => ({ ...term, kind: 'user' as const })))
+  $activeTerminalId.set(next.activeTerminalId)
+  setTerminalTakeover(false)
+})
 
 const findByProc = (procId: string) => $terminals.get().find(term => term.procId === procId)
 

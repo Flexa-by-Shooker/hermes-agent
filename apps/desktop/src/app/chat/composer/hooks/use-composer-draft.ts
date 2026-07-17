@@ -17,7 +17,8 @@ import {
   markActiveComposer,
   onComposerFocusRequest,
   onComposerInsertRefsRequest,
-  onComposerInsertRequest
+  onComposerInsertRequest,
+  onComposerTenantReset
 } from '../focus'
 import { type InlineRefInput, insertInlineRefsIntoEditor } from '../inline-refs'
 import { composerPlainText, placeCaretEnd, renderComposerContents } from '../rich-editor'
@@ -209,6 +210,19 @@ export function useComposerDraft({
 
     return text
   }, [setComposerText])
+
+  useEffect(
+    () =>
+      onComposerTenantReset(() => {
+        window.clearTimeout(draftPersistTimerRef.current)
+        pendingDraftPersistRef.current = null
+        const latestText = syncDraftFromEditor()
+        stashAt(draftScopeRef.current, latestText)
+        clearDraft()
+        $composerAttachments.set([])
+      }),
+    [clearDraft, syncDraftFromEditor]
+  )
 
   // Imperative draft sync — the spine of the "work only when work is to be
   // performed" model. Subscribing to the composer runtime directly (not

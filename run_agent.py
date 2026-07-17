@@ -467,6 +467,8 @@ class AIAgent:
         platform: str = None,
         user_id: str = None,
         user_id_alt: str = None,
+        principal_assertion: Dict[str, Any] = None,
+        principal_binding: Any = None,
         user_name: str = None,
         chat_id: str = None,
         chat_name: str = None,
@@ -543,6 +545,8 @@ class AIAgent:
             platform=platform,
             user_id=user_id,
             user_id_alt=user_id_alt,
+            principal_assertion=principal_assertion,
+            principal_binding=principal_binding,
             user_name=user_name,
             chat_id=chat_id,
             chat_name=chat_name,
@@ -850,6 +854,10 @@ class AIAgent:
         - output is explicitly rerouted via ``_print_fn``; or
         - stdout is a real TTY.
         """
+        from hermes_cli.flexa_governed import disclosure_boundary_mode
+
+        if disclosure_boundary_mode():
+            return False
         if self._print_fn is not None:
             return True
         stream = getattr(sys, "stdout", None)
@@ -868,8 +876,11 @@ class AIAgent:
         owns rendering. Embedded/library callers, on the other hand, expect
         quiet mode to be truly silent.
         """
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
         return (
-            self.quiet_mode
+            not _flexa_governed_mode()
+            and self.quiet_mode
             and not self.tool_progress_callback
             and getattr(self, "platform", "") == "cli"
         )
@@ -884,6 +895,14 @@ class AIAgent:
         This helper never raises — exceptions are swallowed so it cannot
         interrupt the retry/fallback logic.
         """
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            return
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            return
         try:
             self._vprint(f"{self.log_prefix}{message}", force=True)
         except Exception:
@@ -901,6 +920,10 @@ class AIAgent:
         such as auxiliary compression or memory flushes where the main turn can
         continue but the user needs to know something important failed.
         """
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            return
         try:
             self._vprint(f"{self.log_prefix}{message}", force=True)
         except Exception:
@@ -918,6 +941,10 @@ class AIAgent:
         driver does (TUI status-bar override, CLI console line). Swallows all
         callback errors — a notice must NEVER break the agent loop (D-D fail-open).
         """
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            return
         if self.notice_callback:
             try:
                 self.notice_callback(notice)
@@ -953,6 +980,10 @@ class AIAgent:
         Used to defer noisy retry chatter until we know whether the
         turn ultimately recovered or failed.
         """
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            return
         try:
             buf = getattr(self, "_retry_status_buffer", None)
             if buf is None:
@@ -965,6 +996,10 @@ class AIAgent:
 
     def _buffer_vprint(self, message: str) -> None:
         """Buffer a vprint(force=True) retry/fallback line."""
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            return
         try:
             buf = getattr(self, "_retry_status_buffer", None)
             if buf is None:
@@ -1687,12 +1722,30 @@ class AIAgent:
         never mutating the live message list used by the API call (#48677 is
         thus closed for every persist caller, not just this one).
         """
+        from agent.flexa_enforcement import (
+            governed_persistence_lock as _flexa_persistence_lock,
+            restore_governed_quarantine_snapshot as _restore_quarantine_snapshot,
+            turn_active as _flexa_turn_active,
+        )
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        with _flexa_persistence_lock(self):
+            if _restore_quarantine_snapshot(self):
+                return
+            if _flexa_governed_mode() and _flexa_turn_active(self):
+                # The current turn is intentionally memory-only until the full
+                # assistant result passes hermes.output. This also covers every
+                # early/mid-loop persistence site without teaching each caller
+                # about the enforcement lifecycle.
+                self._session_messages = messages
+                return
+
         # Scaffolding removal mutates the live list (desired — ephemeral
         # retry/failure sentinels must not survive into the real transcript).
-        self._drop_trailing_empty_response_scaffolding(messages)
-        self._session_messages = messages
-        self._save_session_log(messages)
-        self._flush_messages_to_session_db(messages, conversation_history)
+            self._drop_trailing_empty_response_scaffolding(messages)
+            self._session_messages = messages
+            self._save_session_log(messages)
+            self._flush_messages_to_session_db(messages, conversation_history)
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
@@ -1753,6 +1806,22 @@ class AIAgent:
         return repair_message_sequence(self, messages)
 
     def _flush_messages_to_session_db(self, messages: List[Dict], conversation_history: List[Dict] = None):
+        """Serialize a DB flush against governed teardown quarantine."""
+
+        from agent.flexa_enforcement import (
+            governed_persistence_lock as _flexa_persistence_lock,
+            governed_persistence_quarantined as _flexa_persistence_quarantined,
+        )
+
+        with _flexa_persistence_lock(self):
+            if _flexa_persistence_quarantined(self):
+                return
+            return self._flush_messages_to_session_db_unlocked(
+                messages,
+                conversation_history,
+            )
+
+    def _flush_messages_to_session_db_unlocked(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Persist any un-flushed messages to the SQLite session store.
 
         Deduplicates via an intrinsic ``_DB_PERSISTED_MARKER`` stamped on each
@@ -1769,6 +1838,12 @@ class AIAgent:
         edits a persisted message's content/role in place expecting a re-write
         (in-place compaction resets the seed and re-diffs by identity).
         """
+        from agent.flexa_enforcement import turn_active as _flexa_turn_active
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode() and _flexa_turn_active(self):
+            return
+
         # Persistence-isolated agents (e.g. the background skill/memory review
         # fork) must NEVER write into the canonical session store. The fork
         # shares the parent's session_id for prompt-cache warmth, so any write
@@ -1896,6 +1971,7 @@ class AIAgent:
                     tool_name=msg.get("tool_name"),
                     tool_calls=tool_calls_data,
                     tool_call_id=msg.get("tool_call_id"),
+                    effect_disposition=msg.get("effect_disposition"),
                     finish_reason=msg.get("finish_reason"),
                     reasoning=msg.get("reasoning") if role == "assistant" else None,
                     reasoning_content=msg.get("reasoning_content") if role == "assistant" else None,
@@ -2464,6 +2540,10 @@ class AIAgent:
         retryable: Optional[bool] = None,
         reason: Optional[str] = None,
     ) -> None:
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            return
         # Lazy module import (not from-import) so tests that
         # ``monkeypatch.setattr("hermes_cli.plugins.has_hook", ...)`` still
         # take effect on this call site. After first call the import is a
@@ -2555,6 +2635,19 @@ class AIAgent:
         return content
 
     def _save_session_log(self, messages: List[Dict[str, Any]] = None):
+        """Serialize a JSON snapshot write against governed teardown."""
+
+        from agent.flexa_enforcement import (
+            governed_persistence_lock as _flexa_persistence_lock,
+            governed_persistence_quarantined as _flexa_persistence_quarantined,
+        )
+
+        with _flexa_persistence_lock(self):
+            if _flexa_persistence_quarantined(self):
+                return
+            return self._save_session_log_unlocked(messages)
+
+    def _save_session_log_unlocked(self, messages: List[Dict[str, Any]] = None):
         """Optional per-session JSON snapshot writer.
 
         Gated by ``sessions.write_json_snapshots`` (default False).  state.db
@@ -2777,6 +2870,10 @@ class AIAgent:
         Returns:
             True if the steer was accepted, False if the text was empty.
         """
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            return False
         if not text or not text.strip():
             return False
         cleaned = text.strip()
@@ -3085,8 +3182,12 @@ class AIAgent:
         worker as stale (#31752). Bridge is rate-limited (60s) and
         best-effort — it never raises into the agent loop.
         """
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
         self._last_activity_ts = time.time()
-        self._last_activity_desc = desc
+        self._last_activity_desc = (
+            "governed turn active" if _flexa_governed_mode() else desc
+        )
         if os.environ.get("HERMES_KANBAN_TASK"):
             try:
                 from tools.kanban_tools import heartbeat_current_worker_from_env
@@ -3380,6 +3481,11 @@ class AIAgent:
         persist the exchange) and ``queue_prefetch_all`` (to start
         warming context for the next turn) in one shot.
 
+        Governed profiles are deliberately different: they never stage or
+        persist the raw exchange here. They record only a ``no_write`` decision
+        bound to the current turn and session; the sync and prefetch behavior
+        described in this docstring applies only to non-governed profiles.
+
         Uses ``original_user_message`` rather than ``user_message``
         because the latter may carry injected skill content that bloats
         or breaks provider queries.
@@ -3399,6 +3505,21 @@ class AIAgent:
         backend must not block the user from seeing their response.
         """
         if interrupted:
+            return
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            if not self._memory_manager:
+                raise RuntimeError("managed memory provider is unavailable")
+            turn_id = str(getattr(self, "_flexa_turn_id", "") or "")
+            session_id = str(self.session_id or "")
+            if not turn_id or not session_id:
+                raise RuntimeError("managed memory no-write decision is unbound")
+            self._flexa_pending_memory_decision = {
+                "decision": "no_write",
+                "turn_id": turn_id,
+                "session_id": session_id,
+            }
             return
         if not (self._memory_manager and final_response and original_user_message):
             return
@@ -3423,6 +3544,39 @@ class AIAgent:
                 session_id=self.session_id or "",
             )
         except Exception:
+            pass
+
+    def _commit_governed_external_memory(self, *, turn_id: str) -> bool:
+        """Consume one exact, turn-bound managed ``no_write`` decision."""
+
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if not _flexa_governed_mode():
+            return False
+        pending = getattr(self, "_flexa_pending_memory_decision", None)
+        if pending is None:
+            raise RuntimeError("managed memory no-write decision is missing")
+        try:
+            delattr(self, "_flexa_pending_memory_decision")
+        except AttributeError:
+            pass
+        if (
+            not isinstance(pending, dict)
+            or set(pending) != {"decision", "turn_id", "session_id"}
+            or pending["decision"] != "no_write"
+            or pending["turn_id"] != str(turn_id or "")
+            or pending["session_id"] != str(self.session_id or "")
+            or not self._memory_manager
+        ):
+            raise RuntimeError("managed memory no-write decision is invalid")
+        return True
+
+    def _discard_governed_external_memory(self) -> None:
+        """Forget an unconsumed decision on block, failure or interruption."""
+
+        try:
+            delattr(self, "_flexa_pending_memory_decision")
+        except AttributeError:
             pass
 
     def release_clients(self) -> None:
@@ -4611,6 +4765,9 @@ class AIAgent:
 
     def _reset_stream_delivery_tracking(self) -> None:
         """Reset tracking for text delivered during the current model response."""
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        _hold_for_flexa = _flexa_governed_mode()
         # Flush any benign partial-tag tail held by the think scrubber
         # first (#17924): an innocent '<' at the end of the stream that
         # turned out not to be a tag prefix should reach the UI.  Then
@@ -4627,12 +4784,13 @@ class AIAgent:
                 if ctx_scrubber is not None:
                     think_tail = ctx_scrubber.feed(think_tail)
                 if think_tail:
-                    callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-                    for cb in callbacks:
-                        try:
-                            cb(think_tail)
-                        except Exception:
-                            pass
+                    if not _hold_for_flexa:
+                        callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
+                        for cb in callbacks:
+                            try:
+                                cb(think_tail)
+                            except Exception:
+                                pass
                     self._record_streamed_assistant_text(think_tail)
         # Flush any benign partial-tag tail held by the context scrubber so it
         # reaches the UI before we clear state for the next model call.  If
@@ -4641,12 +4799,13 @@ class AIAgent:
         if scrubber is not None:
             tail = scrubber.flush()
             if tail:
-                callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-                for cb in callbacks:
-                    try:
-                        cb(tail)
-                    except Exception:
-                        pass
+                if not _hold_for_flexa:
+                    callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
+                    for cb in callbacks:
+                        try:
+                            cb(tail)
+                        except Exception:
+                            pass
                 self._record_streamed_assistant_text(tail)
         self._current_streamed_assistant_text = ""
 
@@ -4676,6 +4835,10 @@ class AIAgent:
 
     def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any]) -> None:
         """Surface a real mid-turn assistant commentary message to the UI layer."""
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            return
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(assistant_msg, dict):
             return
@@ -4731,6 +4894,11 @@ class AIAgent:
                 text = text.lstrip("\n")
         if not text:
             return
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            self._record_streamed_assistant_text(text)
+            return
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
         delivered = False
         for cb in callbacks:
@@ -4744,6 +4912,10 @@ class AIAgent:
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            return
         cb = self.reasoning_callback
         if cb is not None:
             try:
@@ -5682,6 +5854,12 @@ class AIAgent:
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
+            from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+            if _flexa_governed_mode():
+                return self._execute_tool_calls_sequential(
+                    assistant_message, messages, effective_task_id, api_call_count
+                )
             if not _should_parallelize_tool_batch(tool_calls):
                 return self._execute_tool_calls_sequential(
                     assistant_message, messages, effective_task_id, api_call_count
@@ -5729,7 +5907,8 @@ class AIAgent:
                      tool_call_id: Optional[str] = None, messages: list = None,
                      pre_tool_block_checked: bool = False,
                      skip_tool_request_middleware: bool = False,
-                     tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None) -> str:
+                     tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None,
+                     flexa_boundary_managed: bool = False) -> str:
         """Forwarder — see ``agent.agent_runtime_helpers.invoke_tool``."""
         from agent.agent_runtime_helpers import invoke_tool
         return invoke_tool(
@@ -5742,6 +5921,7 @@ class AIAgent:
             pre_tool_block_checked,
             skip_tool_request_middleware,
             tool_request_middleware_trace,
+            flexa_boundary_managed,
         )
 
     @staticmethod
@@ -5850,6 +6030,10 @@ def main(
     verbose: bool = False,
     log_prefix_chars: int = 20
 ):
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode():
+        return
     """
     Main function for running the agent directly.
 

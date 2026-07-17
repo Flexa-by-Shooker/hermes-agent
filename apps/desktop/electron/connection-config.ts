@@ -72,20 +72,29 @@ function normalizeRemoteBaseUrl(rawUrl) {
   return parsed.toString().replace(/\/+$/, '')
 }
 
-function buildGatewayWsUrl(baseUrl, token) {
+function buildGatewayWsUrl(baseUrl, token, profile = null) {
   const parsed = new URL(baseUrl)
   const wsScheme = parsed.protocol === 'https:' ? 'wss' : 'ws'
   const prefix = parsed.pathname.replace(/\/+$/, '')
 
-  return `${wsScheme}://${parsed.host}${prefix}/api/ws?token=${encodeURIComponent(token)}`
+  const profileQuery = profile ? `&profile=${encodeURIComponent(profile)}` : ''
+  return `${wsScheme}://${parsed.host}${prefix}/api/ws?token=${encodeURIComponent(token)}${profileQuery}`
 }
 
-function buildGatewayWsUrlWithTicket(baseUrl, ticket) {
+function buildGatewayWsUrlWithTicket(baseUrl, ticket, profile = null) {
   const parsed = new URL(baseUrl)
   const wsScheme = parsed.protocol === 'https:' ? 'wss' : 'ws'
   const prefix = parsed.pathname.replace(/\/+$/, '')
 
-  return `${wsScheme}://${parsed.host}${prefix}/api/ws?ticket=${encodeURIComponent(ticket)}`
+  const profileQuery = profile ? `&profile=${encodeURIComponent(profile)}` : ''
+  return `${wsScheme}://${parsed.host}${prefix}/api/ws?ticket=${encodeURIComponent(ticket)}${profileQuery}`
+}
+
+// Profile is deliberately a required argument here. OAuth tickets are freshly
+// minted for each reconnect, and omitting the third argument silently dropped
+// global-remote profile routing while token-mode reconnects stayed scoped.
+function buildProfileGatewayWsUrlWithTicket(baseUrl, ticket, profile) {
+  return buildGatewayWsUrlWithTicket(baseUrl, ticket, profile)
 }
 
 /**
@@ -112,10 +121,12 @@ function buildGatewayWsUrlWithTicket(baseUrl, ticket) {
  * @param {string} baseUrl
  * @param {'token'|'oauth'} authMode
  * @param {string|null} token
- * @param {{ mintTicket: (baseUrl: string) => Promise<string> }} deps
+ * @param {{ mintTicket?: (baseUrl: string) => Promise<string>, profile?: null|string }} deps
  * @returns {Promise<string|null>}
  */
 async function resolveTestWsUrl(baseUrl, authMode, token, deps: any = {}) {
+  const profile = connectionScopeKey(deps.profile)
+
   if (authMode === 'oauth') {
     const mintTicket = deps.mintTicket
 
@@ -138,14 +149,14 @@ async function resolveTestWsUrl(baseUrl, authMode, token, deps: any = {}) {
       throw err
     }
 
-    return buildGatewayWsUrlWithTicket(baseUrl, ticket)
+    return buildGatewayWsUrlWithTicket(baseUrl, ticket, profile)
   }
 
   if (!token) {
     return null
   }
 
-  return buildGatewayWsUrl(baseUrl, token)
+  return buildGatewayWsUrl(baseUrl, token, profile)
 }
 
 // Normalize a profile name to a connection scope key, or null for the global
@@ -333,6 +344,7 @@ export {
   authModeFromStatus,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
+  buildProfileGatewayWsUrlWithTicket,
   connectionScopeKey,
   cookiesHaveLiveSession,
   cookiesHavePrivySession,

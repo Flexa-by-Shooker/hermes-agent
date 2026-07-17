@@ -35,9 +35,56 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class MemoryProviderCapabilities:
+    """Explicit effects a memory provider may perform through Hermes.
+
+    Existing third-party providers retain the historical full lifecycle by
+    default.  Security-sensitive adapters can narrow the surface without
+    relying on method names or a provider implementation's good intentions.
+    The governed Flexa adapter uses :meth:`read_only_recall` and the manager
+    enforces those declarations before invoking any hook.
+    """
+
+    system_prompt: bool = True
+    recall: bool = True
+    principal_rebind: bool = False
+    turn_rebind: bool = False
+    background_prefetch: bool = True
+    turn_sync: bool = True
+    model_tools: bool = True
+    lifecycle_hooks: bool = True
+    memory_write_bridge: bool = True
+    delegation_hook: bool = True
+
+    @classmethod
+    def read_only_recall(cls) -> "MemoryProviderCapabilities":
+        """Return the exact capability set accepted in governed mode."""
+
+        return cls(
+            system_prompt=False,
+            recall=True,
+            principal_rebind=True,
+            turn_rebind=True,
+            background_prefetch=False,
+            turn_sync=False,
+            model_tools=False,
+            lifecycle_hooks=False,
+            memory_write_bridge=False,
+            delegation_hook=False,
+        )
+
+    @property
+    def is_read_only_recall(self) -> bool:
+        """Whether this is exactly the governed read-only capability set."""
+
+        return self == MemoryProviderCapabilities.read_only_recall()
 
 
 class MemoryProvider(ABC):
@@ -47,6 +94,29 @@ class MemoryProvider(ABC):
     @abstractmethod
     def name(self) -> str:
         """Short identifier for this provider (e.g. 'builtin', 'honcho', 'hindsight')."""
+
+    @property
+    def governed_scope_version(self) -> str:
+        """Governed Flexa scope contract supported by this provider.
+
+        Empty by default so existing providers cannot be selected for a
+        managed Flexa profile accidentally. A reviewed adapter must override
+        this with ``"1"`` and consume the ``flexa_scope`` initialize kwarg
+        before it is eligible for governed use.
+        """
+
+        return ""
+
+    @property
+    def capabilities(self) -> MemoryProviderCapabilities:
+        """Effects this provider permits Hermes to invoke.
+
+        The full historical surface is the compatibility default.  Governed
+        providers must override this property with the exact read-only recall
+        set; merely declaring a governed scope version is not sufficient.
+        """
+
+        return MemoryProviderCapabilities()
 
     # -- Core lifecycle (implement these) ------------------------------------
 
@@ -80,6 +150,9 @@ class MemoryProvider(ABC):
           - parent_session_id (str): For subagents, the parent's session_id.
           - user_id (str): Platform user identifier (gateway sessions).
           - user_id_alt (str): Optional alternate stable platform user identifier.
+          - flexa_scope (dict): Signed tenant/employee plus authenticated
+            principal scope. Present only for governed Flexa profiles and only
+            for providers declaring ``governed_scope_version == "1"``.
         """
 
     def system_prompt_block(self) -> str:
@@ -102,8 +175,28 @@ class MemoryProvider(ABC):
         session_id is provided for providers serving concurrent sessions
         (gateway group chats, cached agents). Providers that don't need
         per-session scoping can ignore it.
+
         """
         return ""
+
+    def bind_governed_principal(self, binding: Any) -> None:
+        """Refresh short-lived proof for the already-bound principal.
+
+        Only governed read-only adapters use this seam.  It must not perform a
+        business write or change the canonical principal selected at
+        initialization.
+        """
+
+        raise NotImplementedError(
+            f"Provider {self.name} does not support governed principal rebinding"
+        )
+
+    def bind_governed_recall(self, binding: Any) -> None:
+        """Bind the next recall to an opaque active-turn proof."""
+
+        raise NotImplementedError(
+            f"Provider {self.name} does not support governed recall rebinding"
+        )
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Queue a background recall for the NEXT turn.

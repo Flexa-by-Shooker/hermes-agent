@@ -1,6 +1,7 @@
 import { type MutableRefObject, useCallback } from 'react'
 
 import { useI18n } from '@/i18n'
+import { $tenantRuntimeEpoch } from '@/store/gateway-switch'
 import { notify, notifyError } from '@/store/notifications'
 import { $currentCwd, setCurrentBranch, setCurrentCwd } from '@/store/session'
 import type { SessionRuntimeInfo } from '@/types/hermes'
@@ -29,16 +30,26 @@ export function useCwdActions({
         return
       }
 
+      const tenantEpoch = $tenantRuntimeEpoch.get()
+
       try {
         const info = await requestGateway<{ branch?: string; cwd?: string }>('config.get', {
           key: 'project',
           cwd: target
         })
 
+        if ($tenantRuntimeEpoch.get() !== tenantEpoch || activeSessionIdRef.current) {
+          return
+        }
+
         if (!activeSessionIdRef.current && ($currentCwd.get() || target) === (info.cwd || target)) {
           setCurrentBranch(info.branch || '')
         }
       } catch {
+        if ($tenantRuntimeEpoch.get() !== tenantEpoch) {
+          return
+        }
+
         setCurrentBranch('')
       }
     },
@@ -53,6 +64,9 @@ export function useCwdActions({
         return
       }
 
+      const tenantEpoch = $tenantRuntimeEpoch.get()
+      const startingSessionId = activeSessionId
+
       if (!activeSessionId) {
         setCurrentCwd(trimmed)
 
@@ -62,6 +76,10 @@ export function useCwdActions({
             cwd: trimmed
           })
 
+          if ($tenantRuntimeEpoch.get() !== tenantEpoch || activeSessionIdRef.current !== startingSessionId) {
+            return
+          }
+
           // Adopt the backend's normalized cwd so the persisted workspace and
           // branch stay consistent with what the agent will use.
           if (info.cwd) {
@@ -70,6 +88,10 @@ export function useCwdActions({
 
           setCurrentBranch(info.branch || '')
         } catch {
+          if ($tenantRuntimeEpoch.get() !== tenantEpoch || activeSessionIdRef.current !== startingSessionId) {
+            return
+          }
+
           setCurrentBranch('')
         }
 
@@ -82,10 +104,18 @@ export function useCwdActions({
           cwd: trimmed
         })
 
+        if ($tenantRuntimeEpoch.get() !== tenantEpoch || activeSessionIdRef.current !== startingSessionId) {
+          return
+        }
+
         setCurrentCwd(info.cwd || trimmed)
         setCurrentBranch(info.branch || '')
         onSessionRuntimeInfo?.({ branch: info.branch || '', cwd: info.cwd || trimmed })
       } catch (err) {
+        if ($tenantRuntimeEpoch.get() !== tenantEpoch || activeSessionIdRef.current !== startingSessionId) {
+          return
+        }
+
         const message = err instanceof Error ? err.message : String(err)
 
         if (!message.includes('unknown method')) {

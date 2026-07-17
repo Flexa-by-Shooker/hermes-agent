@@ -23,11 +23,13 @@ Defense against context-window overflow operates at three levels:
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
 import shlex
 import uuid
+from collections.abc import Collection
 
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
@@ -43,6 +45,7 @@ HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
+_OPAQUE_ATTACHMENT_ID = re.compile(r"^[a-f0-9]{32}\.[a-z0-9]{1,8}$")
 
 
 def _resolve_storage_dir(env) -> str:
@@ -200,10 +203,133 @@ def maybe_persist_tool_result(
     )
 
 
+def _read_attachment_retry_envelope(content: str) -> str:
+    """Return a small, plaintext-free retry result for the attachment broker."""
+
+    attachment_id: str | None = None
+    offset = 1
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        candidate_id = parsed.get("attachment_id")
+        candidate_offset = parsed.get("offset")
+        if (
+            isinstance(candidate_id, str)
+            and _OPAQUE_ATTACHMENT_ID.fullmatch(candidate_id)
+        ):
+            attachment_id = candidate_id
+        if (
+            isinstance(candidate_offset, int)
+            and not isinstance(candidate_offset, bool)
+            and candidate_offset >= 1
+        ):
+            offset = candidate_offset
+
+    result = {
+        "content": "",
+        "deferred": True,
+        "hint": "Retry this attachment page in a new tool turn.",
+        "next_offset": offset,
+        "offset": offset,
+        "returned_lines": 0,
+        "truncated": True,
+    }
+    if attachment_id is not None:
+        result["attachment_id"] = attachment_id
+    return json.dumps(result, ensure_ascii=False, sort_keys=True)
+
+
+def fit_inline_only_tool_result(
+    content: str,
+    tool_name: str,
+    max_chars: int | float,
+) -> str:
+    """Fit a never-persisted result inline without writing plaintext to disk.
+
+    ``read_attachment`` returns a structured pagination document. When a
+    small-context model has a lower per-result budget, preserve as many whole
+    broker lines as fit and advance ``next_offset`` by exactly that count. A
+    malformed result, or a page for which no line fits, becomes a content-free
+    retry envelope.
+    """
+
+    if max_chars == float("inf") or len(content) <= max_chars:
+        return content
+    if tool_name != "read_attachment":
+        return content
+
+    retry = _read_attachment_retry_envelope(content)
+    if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars <= 0:
+        return retry
+
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError):
+        return retry
+    if not isinstance(parsed, dict):
+        return retry
+    page_content = parsed.get("content")
+    offset = parsed.get("offset")
+    returned_lines = parsed.get("returned_lines")
+    if (
+        not isinstance(page_content, str)
+        or not isinstance(offset, int)
+        or isinstance(offset, bool)
+        or offset < 1
+        or not isinstance(returned_lines, int)
+        or isinstance(returned_lines, bool)
+        or returned_lines < 0
+    ):
+        return retry
+
+    if returned_lines == 0:
+        lines: list[str] = []
+    elif returned_lines == 1:
+        lines = [page_content]
+    else:
+        lines = page_content.split("\n")
+        if len(lines) != returned_lines:
+            return retry
+
+    def render(line_count: int) -> str:
+        candidate = dict(parsed)
+        candidate["content"] = "\n".join(lines[:line_count])
+        candidate["offset"] = offset
+        candidate["returned_lines"] = line_count
+        candidate["truncated"] = True
+        candidate["next_offset"] = offset + line_count
+        candidate["hint"] = (
+            f"Use offset={offset + line_count} to continue reading."
+            if line_count
+            else "Retry this attachment page in a new tool turn."
+        )
+        if line_count == 0:
+            candidate["deferred"] = True
+        else:
+            candidate.pop("deferred", None)
+        return json.dumps(candidate, ensure_ascii=False, sort_keys=True)
+
+    low = 0
+    high = len(lines)
+    best = retry
+    while low <= high:
+        middle = (low + high) // 2
+        rendered = render(middle)
+        if len(rendered) <= max_chars:
+            best = rendered
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
 def enforce_turn_budget(
     tool_messages: list[dict],
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
+    never_persist_tool_names: Collection[str] | None = None,
 ) -> list[dict]:
     """Layer 3: enforce aggregate budget across all tool results in a turn.
 
@@ -213,13 +339,18 @@ def enforce_turn_budget(
 
     Mutates the list in-place and returns it.
     """
+    never_persist = frozenset(never_persist_tool_names or ())
     candidates = []
+    inline_only_candidates = []
     total_size = 0
     for i, msg in enumerate(tool_messages):
         content = msg.get("content", "")
         size = len(content)
         total_size += size
-        if PERSISTED_OUTPUT_TAG not in content:
+        tool_name = msg.get("tool_name") or msg.get("name")
+        if tool_name in never_persist:
+            inline_only_candidates.append((i, size, str(tool_name)))
+        elif PERSISTED_OUTPUT_TAG not in content:
             candidates.append((i, size))
 
     if total_size <= config.turn_budget:
@@ -250,5 +381,29 @@ def enforce_turn_budget(
                 "Budget enforcement: persisted tool result %s (%d chars)",
                 tool_use_id, size,
             )
+
+    # Governed broker plaintext is never eligible for sandbox persistence.
+    # If several inline-only pages together exceed a small model's turn
+    # budget, defer the largest pages to later tool turns with an opaque,
+    # content-free pagination envelope.
+    inline_only_candidates.sort(key=lambda item: item[1], reverse=True)
+    for idx, size, tool_name in inline_only_candidates:
+        if total_size <= config.turn_budget:
+            break
+        content = tool_messages[idx].get("content", "")
+        if not isinstance(content, str):
+            continue
+        if tool_name == "read_attachment":
+            replacement = _read_attachment_retry_envelope(content)
+        else:
+            continue
+        tool_messages[idx]["content"] = replacement
+        total_size -= size
+        total_size += len(replacement)
+        logger.info(
+            "Budget enforcement: deferred inline-only tool result %s (%d chars)",
+            tool_messages[idx].get("tool_call_id", f"budget_{idx}"),
+            size,
+        )
 
     return tool_messages

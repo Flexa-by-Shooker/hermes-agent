@@ -801,6 +801,11 @@ def load_on_disk_store() -> "MemoryStore":
     Falls back to the built-in defaults if config can't be loaded, so this can
     never raise on a missing/unreadable config.
     """
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode():
+        raise RuntimeError("native memory is unavailable in governed mode")
+
     memory_char_limit = 2200
     user_char_limit = 1375
     try:
@@ -974,6 +979,13 @@ def memory_tool(
 
     Returns JSON string with results.
     """
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode():
+        return tool_error(
+            "Native memory is unavailable in governed mode.",
+            success=False,
+        )
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
@@ -1035,8 +1047,10 @@ def memory_tool(
 
 
 def check_memory_requirements() -> bool:
-    """Memory tool has no external requirements -- always available."""
-    return True
+    """Hide native memory from governed profiles; providers own that surface."""
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    return not _flexa_governed_mode()
 
 
 def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[str, Any]:
@@ -1045,6 +1059,13 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
 
     Returns the store's result dict.
     """
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode():
+        return {
+            "success": False,
+            "error": "native memory is unavailable in governed mode",
+        }
     action = payload.get("action")
     target = payload.get("target", "memory")
     content = payload.get("content") or ""

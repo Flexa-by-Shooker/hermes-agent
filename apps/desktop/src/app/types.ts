@@ -10,6 +10,7 @@ export interface ContextSuggestion {
 
 export interface ImageAttachResponse {
   attached?: boolean
+  attachment_id?: string
   path?: string
   text?: string
   message?: string
@@ -29,6 +30,9 @@ export interface ImageDetachResponse {
 
 export interface FileAttachResponse {
   attached?: boolean
+  attachment_id?: string
+  bytes?: number
+  count?: number
   message?: string
   // Gateway-side absolute path the file was staged to.
   path?: string

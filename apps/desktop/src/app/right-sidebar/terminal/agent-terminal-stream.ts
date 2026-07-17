@@ -14,6 +14,15 @@ const seededCommands = new Set<string>()
 
 const MAX_BACKLOG = 256_000
 
+/** Drop all process output and mounted writers before changing tenant authority. */
+export function clearAgentTerminalRuntime(): void {
+  writers.clear()
+  backlog.clear()
+  commandHeaders.clear()
+  lastSnapshots.clear()
+  seededCommands.clear()
+}
+
 /** A live agent terminal registers its xterm write and replays the backlog.
  *  Returns an idempotent unregister. */
 export function registerAgentTerminalWriter(procId: string, write: Writer): () => void {

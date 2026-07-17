@@ -19,14 +19,16 @@ import {
   SidebarMenuButton,
   SidebarMenuItem
 } from '@/components/ui/sidebar'
-import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
+import { type SessionInfo, type SessionSearchResult } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { comboTokens } from '@/lib/keybinds/combo'
 import { profileColor } from '@/lib/profile-color'
 import { sessionMatchesSearch } from '@/lib/session-search'
 import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
+import { searchSessionsForTenant } from '@/lib/tenant-session-search'
 import { cn } from '@/lib/utils'
 import { $cronJobs } from '@/store/cron'
+import { $gatewaySwitching, $tenantRuntimeEpoch } from '@/store/gateway-switch'
 import {
   $dismissedAutoProjectIds,
   $panesFlipped,
@@ -277,6 +279,8 @@ export function ChatSidebar({
   const [searchQuery, setSearchQuery] = useState('')
   const [serverMatches, setServerMatches] = useState<SessionSearchResult[]>([])
   const [searchPending, setSearchPending] = useState(false)
+  const tenantEpoch = useStore($tenantRuntimeEpoch)
+  const gatewaySwitching = useStore($gatewaySwitching)
   const [newSessionKbdFlash, setNewSessionKbdFlash] = useState(false)
   const [profileLoadMorePending, setProfileLoadMorePending] = useState<Record<string, boolean>>({})
   const [messagingLoadMorePending, setMessagingLoadMorePending] = useState<Record<string, boolean>>({})
@@ -382,27 +386,28 @@ export function ChatSidebar({
   // sessions stay findable. Debounced; loaded sessions are matched instantly
   // client-side and merged ahead of the server hits.
   useEffect(() => {
-    if (!trimmedQuery) {
-      setServerMatches([])
-      setSearchPending(false)
+    setServerMatches([])
+    setSearchPending(false)
 
+    if (!trimmedQuery || gatewaySwitching) {
       return
     }
 
     let cancelled = false
+    const originEpoch = tenantEpoch
 
     setSearchPending(true)
 
     const id = window.setTimeout(() => {
-      void searchSessions(trimmedQuery)
+      void searchSessionsForTenant(trimmedQuery, originEpoch)
         .then(res => {
-          if (!cancelled) {
+          if (res && !cancelled && $tenantRuntimeEpoch.get() === originEpoch && !$gatewaySwitching.get()) {
             setServerMatches(res.results)
           }
         })
         .catch(() => undefined)
         .finally(() => {
-          if (!cancelled) {
+          if (!cancelled && $tenantRuntimeEpoch.get() === originEpoch && !$gatewaySwitching.get()) {
             setSearchPending(false)
           }
         })
@@ -412,7 +417,7 @@ export function ChatSidebar({
       cancelled = true
       window.clearTimeout(id)
     }
-  }, [trimmedQuery])
+  }, [gatewaySwitching, tenantEpoch, trimmedQuery])
 
   const searchResults = useMemo(() => {
     if (!trimmedQuery) {

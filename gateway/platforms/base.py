@@ -1060,6 +1060,19 @@ def _profile_cache_roots() -> List[Path]:
     is consulted (which otherwise wins when HERMES_HOME is symlinked under a
     denied prefix and $HOME is not that prefix). See issue #31733.
     """
+    from hermes_cli.flexa_governed import binding_for_current_home, governed_mode
+    if governed_mode():
+        # Media delivery is connection/turn scoped to exactly one verified
+        # employee. Never enumerate another profile or a stray cache directory.
+        binding_for_current_home()
+        from hermes_constants import get_hermes_home
+
+        current = Path(get_hermes_home())
+        return [
+            current / "cache" / subdir
+            for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS
+        ]
+
     roots: List[Path] = []
     profiles_dir = _HERMES_ROOT / "profiles"
     try:
@@ -2330,6 +2343,9 @@ class BasePlatformAdapter(ABC):
         # ``event.source.thread_id`` before session keying. Returns the
         # corrected thread_id or None to leave the source untouched.
         self._topic_recovery_fn: Optional[Callable[[Any], Optional[str]]] = None
+        # Optional fail-closed trust hook that runs after source normalization
+        # but before any session key or active-session guard is evaluated.
+        self._pre_session_key_hook: Optional[Callable[[MessageEvent], None]] = None
         self._running = False
         self._fatal_error_code: Optional[str] = None
         self._fatal_error_message: Optional[str] = None
@@ -2787,6 +2803,21 @@ class BasePlatformAdapter(ABC):
         # Guard against subclasses that initialize via ``object.__new__`` in
         # tests and never run ``BasePlatformAdapter.__init__``.
         self._topic_recovery_fn = fn  # type: ignore[attr-defined]
+
+    def set_pre_session_key_hook(
+        self,
+        fn: Optional[Callable[[MessageEvent], None]],
+    ) -> None:
+        """Install a synchronous trust hook that runs before session keying."""
+
+        self._pre_session_key_hook = fn
+
+    def _apply_pre_session_key_hook(self, event: MessageEvent) -> None:
+        hook = getattr(self, "_pre_session_key_hook", None)
+        if hook is not None:
+            # Deliberately do not catch: a trust failure must prevent session
+            # lookup, active-session reuse, plugin dispatch, and model work.
+            hook(event)
 
     def _apply_topic_recovery(self, event: MessageEvent) -> None:
         """Rewrite ``event.source.thread_id`` in place if the hook returns one."""
@@ -4600,6 +4631,11 @@ class BasePlatformAdapter(ABC):
         # downstream delivery all agree on the same lane.
         # Offloaded: the sync hook must not block the loop.
         await asyncio.to_thread(self._apply_topic_recovery, event)
+
+        # Governed runtimes bind the signed canonical principal here. This is
+        # necessarily before build_session_key(): shared group/thread guards
+        # must never collapse two principals before GatewayRunner is reached.
+        await asyncio.to_thread(self._apply_pre_session_key_hook, event)
 
         session_key = build_session_key(
             event.source,

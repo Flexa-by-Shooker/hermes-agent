@@ -13,6 +13,7 @@ The routes:
   GET  /api/auth/providers → list registered providers (login bootstrap)
   GET  /api/auth/me        → current Session as JSON (auth-required)
 """
+
 from __future__ import annotations
 
 import logging
@@ -121,6 +122,7 @@ def _prefix(request: Request) -> str:
     ``hermes_cli.dashboard_auth.prefix`` for the normalisation rules.
     """
     from hermes_cli.dashboard_auth.prefix import prefix_from_request
+
     return prefix_from_request(request)
 
 
@@ -135,9 +137,7 @@ async def login_page(request: Request) -> HTMLResponse:
     # the redirect URL. Validate against the same same-origin rules the
     # callback applies (defence in depth — the gate already filters,
     # but /login is reachable directly too).
-    next_path = _validate_post_login_target(
-        request.query_params.get("next", "")
-    )
+    next_path = _validate_post_login_target(request.query_params.get("next", ""))
     return HTMLResponse(
         render_login_html(next_path=next_path),
         headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
@@ -165,9 +165,7 @@ async def api_auth_providers() -> Any:
             {
                 "name": p.name,
                 "display_name": p.display_name,
-                "supports_password": bool(
-                    getattr(p, "supports_password", False)
-                ),
+                "supports_password": bool(getattr(p, "supports_password", False)),
             }
             for p in providers
         ],
@@ -237,9 +235,12 @@ async def auth_login(request: Request, provider: str, next: str = ""):
     safe_next = _validate_post_login_target(next)
     if safe_next:
         from urllib.parse import quote
+
         pkce = f"{pkce};next={quote(safe_next, safe='')}"
     set_pkce_cookie(
-        resp, payload=pkce, use_https=detect_https(request),
+        resp,
+        payload=pkce,
+        use_https=detect_https(request),
         prefix=_prefix(request),
     )
     return resp
@@ -269,9 +270,7 @@ async def auth_callback(
     # ``next`` segment is optional (only present when /auth/login was
     # given a next= query). All keys live in the same flat namespace;
     # ``next`` carries a URL-encoded path so it never contains ``;``.
-    parts = dict(
-        seg.split("=", 1) for seg in pkce_raw.split(";") if "=" in seg
-    )
+    parts = dict(seg.split("=", 1) for seg in pkce_raw.split(";") if "=" in seg)
     provider_name = parts.get("provider", "")
     expected_state = parts.get("state", "")
     verifier = parts.get("verifier", "")
@@ -386,6 +385,7 @@ def _validate_post_login_target(raw: str) -> str:
     if not raw:
         return ""
     from urllib.parse import unquote
+
     decoded = unquote(raw)
     if not decoded.startswith("/") or decoded.startswith("//"):
         return ""
@@ -566,7 +566,8 @@ async def auth_logout(request: Request):
             except Exception as e:  # noqa: BLE001 — best-effort
                 _log.warning(
                     "dashboard-auth: revoke on %r failed: %s",
-                    provider.name, e,
+                    provider.name,
+                    e,
                 )
 
     sess = getattr(request.state, "session", None)
@@ -630,7 +631,11 @@ async def api_auth_ws_ticket(request: Request):
 
     # Import here so the routes module stays usable in test contexts that
     # don't load the ticket store.
-    from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
+    from hermes_cli.dashboard_auth.ws_tickets import (
+        TTL_SECONDS,
+        mint_ticket,
+        session_authority_id,
+    )
 
     ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
     audit_log(
@@ -639,4 +644,12 @@ async def api_auth_ws_ticket(request: Request):
         user_id=sess.user_id,
         ip=_client_ip(request),
     )
-    return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
+    return {
+        "ticket": ticket,
+        "ttl_seconds": TTL_SECONDS,
+        "authority_id": session_authority_id(
+            user_id=sess.user_id,
+            provider=sess.provider,
+            org_id=sess.org_id,
+        ),
+    }

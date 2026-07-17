@@ -56,14 +56,15 @@ import {
 import { Codicon } from '@/components/ui/codicon'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { pinActiveGatewayBinding } from '@/lib/active-gateway-binding'
 import { attachmentDisplayText, attachmentId, pathLabel } from '@/lib/chat-runtime'
+import { isGatewayConnectionSuperseded } from '@/lib/desktop-gateway-connection'
 import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
 import { triggerHaptic } from '@/lib/haptics'
 import { Loader2Icon } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import type { ComposerAttachment } from '@/store/composer'
 import { notifyError } from '@/store/notifications'
-import { $connection } from '@/store/session'
 import { notifyThreadEditClose } from '@/store/thread-scroll'
 
 interface UserEditComposerProps {
@@ -355,10 +356,15 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
         return droppedFileInlineRefs(osDrops, cwd)
       }
 
-      const remote = $connection.get()?.mode === 'remote'
+      let binding: ReturnType<typeof pinActiveGatewayBinding>
 
-      const requestGateway = <T,>(method: string, params?: Record<string, unknown>) =>
-        gateway.request<T>(method, params)
+      try {
+        binding = pinActiveGatewayBinding(gateway)
+      } catch {
+        return []
+      }
+
+      const remote = binding.connection.mode === 'remote'
 
       const refs: InlineRefInput[] = []
 
@@ -375,20 +381,24 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
         try {
           const uploaded = await uploadComposerAttachment(
             { detail: path, id: attachmentId(kind, path), kind, label: pathLabel(path), path },
-            { remote, requestGateway, sessionId }
+            { remote, requestGateway: binding.request, sessionId }
           )
 
           const ref = attachmentDisplayText(uploaded)
 
-          if (ref) {
+          if (ref && binding.isActive()) {
             refs.push(ref)
           }
         } catch (err) {
+          if (isGatewayConnectionSuperseded(err)) {
+            return []
+          }
+
           notifyError(err, t.desktop.dropFiles)
         }
       }
 
-      return refs
+      return binding.isActive() ? refs : []
     },
     [cwd, gateway, sessionId, t.desktop.dropFiles]
   )

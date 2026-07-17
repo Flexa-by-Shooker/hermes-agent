@@ -24,7 +24,7 @@ declare global {
       // Keepalive: mark a pool profile backend as recently used so the idle
       // reaper spares it while its chat is active.
       touchBackend: (profile?: string | null) => Promise<{ ok: boolean }>
-      getGatewayWsUrl: (profile?: null | string) => Promise<string>
+      getGatewayWsUrl: (profile: null | string, generation: number) => Promise<string>
       // Open (or focus) a standalone OS window for a single chat session so
       // the user can work with multiple chats side by side. Returns ok:false
       // with an error code when the sessionId is empty/invalid. `watch` opens
@@ -177,8 +177,10 @@ declare global {
       ) => () => void
       signalDeepLinkReady?: () => Promise<{ ok: boolean }>
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
-      onFocusSession?: (callback: (sessionId: string) => void) => () => void
-      onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void
+      onFocusSession?: (callback: (payload: { gatewayScope?: string; sessionId?: string }) => void) => () => void
+      onNotificationAction?: (
+        callback: (payload: { actionId: string; actionNonce?: string; sessionId?: string }) => void
+      ) => () => void
       onPreviewFileChanged: (callback: (payload: HermesPreviewFileChanged) => void) => () => void
       onBackendExit: (callback: (payload: BackendExit) => void) => () => void
       // Soft gateway-mode apply: primary backend was torn down without a window
@@ -369,7 +371,13 @@ export interface DesktopUpdateProgress {
 }
 
 export interface HermesConnection {
+  /** Opaque, stable hash of the authenticated remote principal/tenant. Never
+   * contains a raw token or identity claim. Required for remote persistence. */
+  authorityId?: string
   baseUrl: string
+  /** Monotonic immutable identity for this exact backend resolution. Any async
+   * reconnect that completes against an older generation must be discarded. */
+  generation: number
   isFullscreen: boolean
   // The live, RESOLVED connection mode. Only ever 'local' or 'remote' — a
   // 'cloud' saved-config entry resolves to a 'remote' connection under the hood
@@ -377,13 +385,13 @@ export interface HermesConnection {
   mode?: 'local' | 'remote'
   authMode?: 'oauth' | 'token'
   nativeOverlayWidth: number
-  source?: 'env' | 'local' | 'settings'
+  source?: 'env' | 'local' | 'profile' | 'settings'
   token: string
   wsUrl: string
   logs: string[]
-  // Set for pool (non-primary) backends so the renderer knows which profile a
-  // connection belongs to.
-  profile?: string
+  // Exact profile selected for this resolved backend. Governed primary and
+  // secondary descriptors always set it so ticket refreshes cannot de-scope.
+  profile?: null | string
   windowButtonPosition: { x: number; y: number } | null
 }
 
@@ -606,6 +614,8 @@ export interface HermesApiRequest {
 }
 
 export interface HermesNotification {
+  actionNonce?: string
+  gatewayScope?: string
   title?: string
   body?: string
   silent?: boolean

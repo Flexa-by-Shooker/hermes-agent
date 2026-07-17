@@ -58,6 +58,11 @@ class ContextReferenceResult:
     injected_tokens: int = 0
     expanded: bool = False
     blocked: bool = False
+    # Exact resolved files whose bytes were either embedded into ``message``
+    # or deliberately left on disk for a tool. These proof fields let callers
+    # choose a safe upload lifetime without parsing human-facing text.
+    materialized_files: list[str] = field(default_factory=list)
+    tool_files: list[str] = field(default_factory=list)
 
 
 def parse_context_references(message: str) -> list[ContextReference]:
@@ -150,6 +155,8 @@ async def preprocess_context_references_async(
     )
     warnings: list[str] = []
     blocks: list[str] = []
+    materialized_files: list[str] = []
+    tool_files: list[str] = []
     injected_tokens = 0
 
     # Expand all references concurrently. Each _expand_reference is independent
@@ -169,12 +176,16 @@ async def preprocess_context_references_async(
             for ref in refs
         )
     )
-    for warning, block in expanded:
+    for warning, block, materialized_file, tool_file in expanded:
         if warning:
             warnings.append(warning)
         if block:
             blocks.append(block)
             injected_tokens += estimate_tokens_rough(block)
+        if materialized_file:
+            materialized_files.append(materialized_file)
+        if tool_file:
+            tool_files.append(tool_file)
 
     hard_limit = max(1, int(context_length * 0.50))
     soft_limit = max(1, int(context_length * 0.25))
@@ -190,6 +201,8 @@ async def preprocess_context_references_async(
             injected_tokens=injected_tokens,
             expanded=False,
             blocked=True,
+            materialized_files=materialized_files,
+            tool_files=tool_files,
         )
 
     if injected_tokens > soft_limit:
@@ -212,6 +225,8 @@ async def preprocess_context_references_async(
         injected_tokens=injected_tokens,
         expanded=bool(blocks or warnings),
         blocked=False,
+        materialized_files=materialized_files,
+        tool_files=tool_files,
     )
 
 
@@ -221,28 +236,46 @@ async def _expand_reference(
     *,
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
     allowed_root: Path | None = None,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str | None, str | None]:
     try:
         if ref.kind == "file":
             return _expand_file_reference(ref, cwd, allowed_root=allowed_root)
         if ref.kind == "folder":
-            return _expand_folder_reference(ref, cwd, allowed_root=allowed_root)
+            warning, block = _expand_folder_reference(
+                ref, cwd, allowed_root=allowed_root
+            )
+            return warning, block, None, None
         if ref.kind == "diff":
-            return _expand_git_reference(ref, cwd, ["diff"], "git diff")
+            warning, block = _expand_git_reference(ref, cwd, ["diff"], "git diff")
+            return warning, block, None, None
         if ref.kind == "staged":
-            return _expand_git_reference(ref, cwd, ["diff", "--staged"], "git diff --staged")
+            warning, block = _expand_git_reference(
+                ref, cwd, ["diff", "--staged"], "git diff --staged"
+            )
+            return warning, block, None, None
         if ref.kind == "git":
             count = max(1, min(int(ref.target or "1"), 10))
-            return _expand_git_reference(ref, cwd, ["log", f"-{count}", "-p"], f"git log -{count} -p")
+            warning, block = _expand_git_reference(
+                ref,
+                cwd,
+                ["log", f"-{count}", "-p"],
+                f"git log -{count} -p",
+            )
+            return warning, block, None, None
         if ref.kind == "url":
             content = await _fetch_url_content(ref.target, url_fetcher=url_fetcher)
             if not content:
-                return f"{ref.raw}: no content extracted", None
-            return None, f"🌐 {ref.raw} ({estimate_tokens_rough(content)} tokens)\n{content}"
+                return f"{ref.raw}: no content extracted", None, None, None
+            return (
+                None,
+                f"🌐 {ref.raw} ({estimate_tokens_rough(content)} tokens)\n{content}",
+                None,
+                None,
+            )
     except Exception as exc:
-        return f"{ref.raw}: {exc}", None
+        return f"{ref.raw}: {exc}", None, None, None
 
-    return f"{ref.raw}: unsupported reference type", None
+    return f"{ref.raw}: unsupported reference type", None, None, None
 
 
 def _expand_file_reference(
@@ -250,13 +283,28 @@ def _expand_file_reference(
     cwd: Path,
     *,
     allowed_root: Path | None = None,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str | None, str | None]:
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
     _ensure_reference_path_allowed(path)
     if not path.exists():
-        return f"{ref.raw}: file not found", None
+        return f"{ref.raw}: file not found", None, None, None
     if not path.is_file():
-        return f"{ref.raw}: path is not a file", None
+        return f"{ref.raw}: path is not a file", None, None, None
+    managed_attachment_id = _managed_attachment_id(path)
+    if managed_attachment_id is not None:
+        # Managed uploads are ciphertext on disk. The path is intentionally
+        # not a content capability; the model receives only the opaque ID for
+        # the turn-bound read_attachment broker.
+        return (
+            None,
+            (
+                "📎 Managed user attachment "
+                f"attachment_id={managed_attachment_id}. "
+                "Use read_attachment with this exact attachment_id to inspect it."
+            ),
+            None,
+            str(path),
+        )
     if _is_binary_file(path):
         # A binary file can't be inlined as text, but it IS on disk (the agent's
         # tools run where this resolves — the local cwd, or the staged copy in a
@@ -265,7 +313,7 @@ def _expand_file_reference(
         # (told the user the file type wasn't supported). Instead, hand it an
         # actionable block — the path, type, size, and a nudge to use its tools —
         # so it can read/convert/view the file itself.
-        return None, _binary_reference_block(ref, path)
+        return None, _binary_reference_block(ref, path), None, str(path)
 
     text = path.read_text(encoding="utf-8")
     if ref.line_start is not None:
@@ -276,7 +324,27 @@ def _expand_file_reference(
 
     lang = _code_fence_language(path)
     label = ref.raw
-    return None, f"📄 {label} ({estimate_tokens_rough(text)} tokens)\n```{lang}\n{text}\n```"
+    return (
+        None,
+        f"📄 {label} ({estimate_tokens_rough(text)} tokens)\n```{lang}\n{text}\n```",
+        str(path),
+        None,
+    )
+
+
+def _managed_attachment_id(path: Path) -> str | None:
+    try:
+        from hermes_cli.flexa_governed import governed_mode
+
+        if not governed_mode():
+            return None
+    except Exception:
+        return None
+    if path.parent.name != "inbox" or path.parent.parent.name != ".flexa":
+        return None
+    if not re.fullmatch(r"[a-f0-9]{32}\.[a-z0-9]{1,8}", path.name):
+        return None
+    return path.name
 
 
 def _expand_folder_reference(

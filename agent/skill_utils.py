@@ -319,14 +319,13 @@ def _raw_config_cache_clear() -> None:
     _RAW_CONFIG_CACHE.clear()
 
 
-def _load_raw_config() -> Dict[str, Any]:
-    """Read config.yaml with a shared mtime+size keyed cache.
+def _load_raw_config_path(config_path: Path) -> Dict[str, Any]:
+    """Read one config file with a shared mtime+size keyed cache.
 
     This module intentionally avoids importing ``hermes_cli.config`` on the
     skill prompt/build path. A tiny local cache gives the same repeated-read
     win without pulling the heavier CLI config stack into startup.
     """
-    config_path = get_config_path()
     if not config_path.exists():
         return {}
     try:
@@ -352,6 +351,11 @@ def _load_raw_config() -> Dict[str, Any]:
         _RAW_CONFIG_CACHE.clear()
         _RAW_CONFIG_CACHE[cache_key] = parsed
     return parsed
+
+
+def _load_raw_config() -> Dict[str, Any]:
+    """Read the active profile config with the shared raw-config cache."""
+    return _load_raw_config_path(get_config_path())
 
 
 def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
@@ -409,15 +413,19 @@ def _normalize_string_set(values) -> Set[str]:
 # each trigger a category lookup during banner construction (10+ seconds
 # of pure waste).
 _EXTERNAL_DIRS_CACHE: Dict[Tuple[str, int], List[Path]] = {}
+_EFFECTIVE_EXTERNAL_DIRS_CACHE: Dict[
+    Tuple[str, str, int, int, str, int, int], List[Path]
+] = {}
 
 
 def _external_dirs_cache_clear() -> None:
     """Test hook — drop the in-process cache."""
     _EXTERNAL_DIRS_CACHE.clear()
+    _EFFECTIVE_EXTERNAL_DIRS_CACHE.clear()
     _raw_config_cache_clear()
 
 
-def get_external_skills_dirs() -> List[Path]:
+def _get_user_external_skills_dirs() -> List[Path]:
     """Read ``skills.external_dirs`` from config.yaml and return validated paths.
 
     Each entry is expanded (``~`` and ``${VAR}``) and resolved to an absolute
@@ -498,6 +506,145 @@ def get_external_skills_dirs() -> List[Path]:
     if cache_key is not None:
         _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
     return result
+
+
+_MANAGED_EXTERNAL_DIRS_ABSENT = object()
+
+
+def _config_signature(path: Path | None) -> Tuple[str, int, int]:
+    """Return a cache-key fragment for an optional config file."""
+    if path is None:
+        return ("", 0, 0)
+    try:
+        stat = path.stat()
+    except OSError:
+        return (str(path), 0, 0)
+    return (str(path), stat.st_mtime_ns, stat.st_size)
+
+
+def _managed_external_dirs_value() -> Any:
+    """Return the managed external-dir leaf, or a sentinel when unpinned."""
+    try:
+        from hermes_cli.managed_scope import load_managed_config
+
+        managed = load_managed_config()
+    except Exception:
+        logger.debug("Could not read managed external skills config", exc_info=True)
+        return _MANAGED_EXTERNAL_DIRS_ABSENT
+    skills_cfg = managed.get("skills") if isinstance(managed, dict) else None
+    if not isinstance(skills_cfg, dict) or "external_dirs" not in skills_cfg:
+        return _MANAGED_EXTERNAL_DIRS_ABSENT
+    return skills_cfg.get("external_dirs")
+
+
+def _managed_config_signature() -> Tuple[str, int, int]:
+    try:
+        from hermes_cli.managed_scope import get_managed_dir
+
+        managed_dir = get_managed_dir()
+    except Exception:
+        managed_dir = None
+    return _config_signature(managed_dir / "config.yaml" if managed_dir else None)
+
+
+def _raw_external_dirs_value(config_path: Path) -> Any:
+    parsed = _load_raw_config_path(config_path)
+    skills_cfg = parsed.get("skills") if isinstance(parsed, dict) else None
+    return skills_cfg.get("external_dirs") if isinstance(skills_cfg, dict) else None
+
+
+def _resolve_external_dirs(
+    raw_dirs: Any,
+    *,
+    hermes_home: Path,
+    local_skills: Path,
+) -> List[Path]:
+    if not raw_dirs:
+        return []
+    if isinstance(raw_dirs, str):
+        raw_dirs = [raw_dirs]
+    if not isinstance(raw_dirs, list):
+        return []
+
+    local_skills = local_skills.resolve()
+    seen: Set[Path] = set()
+    result: List[Path] = []
+    for entry in raw_dirs:
+        entry = str(entry).strip()
+        if not entry:
+            continue
+        expanded = os.path.expanduser(os.path.expandvars(entry))
+        path = Path(expanded)
+        if not path.is_absolute():
+            path = (hermes_home / path).resolve()
+        else:
+            path = path.resolve()
+        if path == local_skills or path in seen:
+            continue
+        if path.is_dir():
+            seen.add(path)
+            result.append(path)
+        else:
+            logger.debug("External skills dir does not exist, skipping: %s", path)
+    return result
+
+
+def _get_effective_external_skills_dirs(
+    *,
+    config_path: Path,
+    hermes_home: Path,
+    local_skills: Path,
+) -> List[Path]:
+    cache_key = (
+        str(hermes_home.resolve()),
+        *_config_signature(config_path),
+        *_managed_config_signature(),
+    )
+    cached = _EFFECTIVE_EXTERNAL_DIRS_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+    managed_value = _managed_external_dirs_value()
+    raw_dirs = (
+        _raw_external_dirs_value(config_path)
+        if managed_value is _MANAGED_EXTERNAL_DIRS_ABSENT
+        else managed_value
+    )
+    result = _resolve_external_dirs(
+        raw_dirs,
+        hermes_home=hermes_home,
+        local_skills=local_skills,
+    )
+    _EFFECTIVE_EXTERNAL_DIRS_CACHE[cache_key] = list(result)
+    return result
+
+
+def get_external_skills_dirs_for_home(hermes_home: Path) -> List[Path]:
+    """Return effective external skill roots for an arbitrary profile home."""
+    home = Path(hermes_home)
+    return _get_effective_external_skills_dirs(
+        config_path=home / "config.yaml",
+        hermes_home=home,
+        local_skills=home / "skills",
+    )
+
+
+def get_external_skills_dirs() -> List[Path]:
+    """Return external roots from user config plus the managed overlay.
+
+    A managed ``skills.external_dirs`` leaf wins over the user value, matching
+    the full Hermes config loader. Both config signatures participate in the
+    cache so runtime policy changes are observed without a restart.
+    """
+    from hermes_constants import get_hermes_home
+
+    if _managed_external_dirs_value() is _MANAGED_EXTERNAL_DIRS_ABSENT:
+        return _get_user_external_skills_dirs()
+    hermes_home = get_hermes_home()
+    return _get_effective_external_skills_dirs(
+        config_path=get_config_path(),
+        hermes_home=hermes_home,
+        local_skills=get_skills_dir(),
+    )
 
 
 def get_all_skills_dirs() -> List[Path]:

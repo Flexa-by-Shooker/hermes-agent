@@ -2,6 +2,7 @@ import { atom, computed } from 'nanostores'
 
 import type { HermesGitWorktree, HermesRepoStatus } from '@/global'
 import { desktopGit } from '@/lib/desktop-git'
+import { registerTenantRuntimeReset } from '@/lib/tenant-runtime-reset'
 
 import { $worktreeRefreshToken } from './projects'
 import { $busy, $currentCwd } from './session'
@@ -73,6 +74,22 @@ let repoStatusRefreshSeq = 0
 let repoStatusRefreshTimer: ReturnType<typeof setTimeout> | null = null
 
 const normalizeCwd = (cwd?: null | string): null | string => cwd?.trim() || null
+
+export function clearCodingStatusForTenantSwitch(): void {
+  repoStatusRefreshSeq += 1
+  inflightCwd = null
+
+  if (repoStatusRefreshTimer) {
+    clearTimeout(repoStatusRefreshTimer)
+    repoStatusRefreshTimer = null
+  }
+
+  $repoStatus.set(null)
+  $repoWorktrees.set([])
+  $repoStatusLoading.set(false)
+}
+
+registerTenantRuntimeReset(clearCodingStatusForTenantSwitch)
 
 /**
  * Re-probe the working tree for `cwd` (defaults to the active session's cwd).
