@@ -795,3 +795,33 @@ def test_read_only_capabilities_prevent_every_hidden_hook(
     with pytest.raises(GovernedProfileError, match="write approval is unavailable"):
         manager.on_memory_write("add", "memory", "candidate")
     assert provider.recall_calls == 1
+
+
+def test_governed_provider_set_is_frozen_and_rechecked(
+    principal_harness: _PrincipalHarness,
+) -> None:
+    del principal_harness
+
+    class _BuiltinTripwire(_ReadOnlyTripwireProvider):
+        @property
+        def name(self) -> str:
+            return "builtin"
+
+        def prefetch(self, query: str, *, session_id: str = "") -> str:
+            del query, session_id
+            raise AssertionError("unscoped builtin provider must never run")
+
+    manager = MemoryManager()
+    governed = _ReadOnlyTripwireProvider()
+    manager.add_provider(governed)
+    builtin = _BuiltinTripwire()
+
+    with pytest.raises(GovernedProfileError, match="provider set is immutable"):
+        manager.add_provider(builtin)
+
+    # Recheck the invariant at use time too: late plugin/private-state
+    # mutation must fail before either provider contributes model context.
+    manager._providers.append(builtin)
+    with pytest.raises(GovernedProfileError, match="provider set is invalid"):
+        manager.prefetch_all("recall", session_id="session-one")
+    assert governed.recall_calls == 0

@@ -397,6 +397,30 @@ class MemoryManager:
         self._sync_executor: Optional[ThreadPoolExecutor] = None
         self._sync_executor_lock = threading.Lock()
 
+    def _assert_governed_provider_set(self) -> None:
+        """Fail closed unless governed mode owns exactly one reviewed provider.
+
+        Registration is not the only trust boundary: plugins and long-lived
+        agent objects can mutate after initialization.  Every model-context or
+        lifecycle operation therefore rechecks the complete provider set.
+        """
+
+        from hermes_cli.flexa_governed import (
+            GOVERNED_MEMORY_PROVIDER,
+            GovernedProfileError,
+            governed_mode as _flexa_governed_mode,
+            require_governed_memory_provider,
+        )
+
+        if not _flexa_governed_mode():
+            return
+        if len(self._providers) != 1:
+            raise GovernedProfileError("managed memory provider set is invalid")
+        provider = self._providers[0]
+        if provider.name != GOVERNED_MEMORY_PROVIDER:
+            raise GovernedProfileError("managed memory provider set is invalid")
+        require_governed_memory_provider(provider)
+
     # -- Registration --------------------------------------------------------
 
     def add_provider(self, provider: MemoryProvider) -> None:
@@ -406,6 +430,18 @@ class MemoryManager:
         Only **one** external (non-builtin) provider is allowed — a second
         attempt is rejected with a warning.
         """
+        from hermes_cli.flexa_governed import (
+            GOVERNED_MEMORY_PROVIDER,
+            GovernedProfileError,
+            governed_mode as _flexa_governed_mode,
+            require_governed_memory_provider,
+        )
+
+        if _flexa_governed_mode():
+            if self._providers or provider.name != GOVERNED_MEMORY_PROVIDER:
+                raise GovernedProfileError("managed memory provider set is immutable")
+            require_governed_memory_provider(provider)
+
         is_builtin = provider.name == "builtin"
 
         if not is_builtin:
@@ -474,10 +510,12 @@ class MemoryManager:
     @property
     def providers(self) -> List[MemoryProvider]:
         """All registered providers in order."""
+        self._assert_governed_provider_set()
         return list(self._providers)
 
     def get_provider(self, name: str) -> Optional[MemoryProvider]:
         """Get a provider by name, or None if not registered."""
+        self._assert_governed_provider_set()
         for p in self._providers:
             if p.name == name:
                 return p
@@ -493,6 +531,7 @@ class MemoryManager:
 
         if not _flexa_governed_mode():
             return
+        self._assert_governed_provider_set()
         providers = [
             provider
             for provider in self._providers
@@ -512,6 +551,7 @@ class MemoryManager:
 
         if not _flexa_governed_mode():
             return
+        self._assert_governed_provider_set()
         providers = [
             provider
             for provider in self._providers
@@ -529,6 +569,7 @@ class MemoryManager:
         Returns combined text, or empty string if no providers contribute.
         Each non-empty block is labeled with the provider name.
         """
+        self._assert_governed_provider_set()
         blocks = []
         for provider in self._providers:
             if not _provider_capabilities(provider).system_prompt:
@@ -574,6 +615,7 @@ class MemoryManager:
         Returns merged context text labeled by provider. Empty providers
         are skipped. Failures in one provider don't block others.
         """
+        self._assert_governed_provider_set()
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
@@ -677,6 +719,7 @@ class MemoryManager:
             require_governed_memory_write_approval,
         )
 
+        self._assert_governed_provider_set()
         providers = [
             provider
             for provider in self._providers
@@ -807,6 +850,8 @@ class MemoryManager:
         will never route. Built-ins always win (#40466).
         """
         from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        self._assert_governed_provider_set()
         from toolsets import _HERMES_CORE_TOOLS
 
         if _flexa_governed_mode():
@@ -847,10 +892,12 @@ class MemoryManager:
 
     def get_all_tool_names(self) -> set:
         """Return set of all tool names across all providers."""
+        self._assert_governed_provider_set()
         return set(self._tool_to_provider.keys())
 
     def has_tool(self, tool_name: str) -> bool:
         """Check if any provider handles this tool."""
+        self._assert_governed_provider_set()
         return tool_name in self._tool_to_provider
 
     def handle_tool_call(
@@ -866,6 +913,7 @@ class MemoryManager:
             require_governed_memory_write_approval,
         )
 
+        self._assert_governed_provider_set()
         if _flexa_governed_mode():
             # Provider schemas have no trustworthy effect classification, so a
             # model-facing provider call could be a write even when its name
@@ -894,6 +942,7 @@ class MemoryManager:
 
         kwargs may include: remaining_tokens, model, platform, tool_count.
         """
+        self._assert_governed_provider_set()
         for provider in self._providers:
             if not _provider_capabilities(provider).lifecycle_hooks:
                 continue
@@ -913,6 +962,7 @@ class MemoryManager:
         """Notify all providers of session end."""
         from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
 
+        self._assert_governed_provider_set()
         if _flexa_governed_mode():
             return
         for provider in self._providers:
@@ -957,6 +1007,7 @@ class MemoryManager:
         """
         from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
 
+        self._assert_governed_provider_set()
         if _flexa_governed_mode() or not self._providers:
             return
         snapshot = list(messages or [])
@@ -1002,6 +1053,7 @@ class MemoryManager:
         transcript was truncated; providers caching per-turn document
         state should invalidate.
         """
+        self._assert_governed_provider_set()
         if not new_session_id:
             return
         # Only forward ``rewound`` when it's actually set. Passing it
@@ -1038,6 +1090,7 @@ class MemoryManager:
         Returns combined text from providers to include in the compression
         summary prompt. Empty string if no provider contributes.
         """
+        self._assert_governed_provider_set()
         parts = []
         for provider in self._providers:
             if not _provider_capabilities(provider).lifecycle_hooks:
@@ -1099,6 +1152,7 @@ class MemoryManager:
             require_governed_memory_write_approval,
         )
 
+        self._assert_governed_provider_set()
         if _flexa_governed_mode():
             require_governed_memory_write_approval(operation="memory-bridge")
         for provider in self._providers:
@@ -1170,6 +1224,7 @@ class MemoryManager:
         session/task/tool-call provenance the manager does not) invoked once per
         mirrored op.
         """
+        self._assert_governed_provider_set()
         if not self._memory_tool_result_succeeded(tool_result):
             return
 
@@ -1217,6 +1272,7 @@ class MemoryManager:
         """Notify all providers that a subagent completed."""
         from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
 
+        self._assert_governed_provider_set()
         if _flexa_governed_mode():
             return
         for provider in self._providers:
@@ -1304,6 +1360,7 @@ class MemoryManager:
         provider can resolve profile-scoped storage paths without importing
         ``get_hermes_home()`` themselves.
         """
+        self._assert_governed_provider_set()
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
