@@ -36,6 +36,7 @@ const INSERT_EVENT = 'hermes:composer-insert'
 const INSERT_REFS_EVENT = 'hermes:composer-insert-refs'
 const SUBMIT_EVENT = 'hermes:composer-submit'
 const VOICE_TOGGLE_EVENT = 'hermes:composer-voice-toggle'
+const TENANT_RESET_EVENT = 'hermes:composer-tenant-reset'
 
 interface SubmitDetail {
   target: ComposerTarget
@@ -135,6 +136,17 @@ export const requestVoiceToggle = () => dispatch<{ at: number }>(VOICE_TOGGLE_EV
 
 export const onComposerVoiceToggleRequest = (handler: () => void) =>
   subscribe<{ at: number }>(VOICE_TOGGLE_EVENT, () => handler())
+
+/** Synchronous security boundary: stash and blank the mounted composer before
+ * an active gateway/profile pointer can move to another tenant. */
+export const requestComposerTenantReset = () => {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event(TENANT_RESET_EVENT))
+  }
+}
+
+export const onComposerTenantReset = (handler: () => void) =>
+  subscribe<Record<string, never>>(TENANT_RESET_EVENT, () => handler())
 
 /**
  * Focus a composer input across React commit + browser focus restore.

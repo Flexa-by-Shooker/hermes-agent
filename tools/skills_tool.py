@@ -69,6 +69,7 @@ Usage:
 import json
 import logging
 import time
+import contextvars
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
@@ -173,7 +174,10 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _REMOTE_ENV_BACKENDS = frozenset(
     {"docker", "singularity", "modal", "ssh", "daytona"}
 )
-_secret_capture_callback = None
+_secret_capture_callback: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "hermes_secret_capture_callback",
+    default=None,
+)
 
 
 def _skill_lookup_path_error(name: str) -> Optional[str]:
@@ -242,8 +246,28 @@ _INJECTION_PATTERNS: list = [
 
 
 def set_secret_capture_callback(callback) -> None:
-    global _secret_capture_callback
-    _secret_capture_callback = callback
+    """Bind secret capture to the current async/thread context.
+
+    Gateway turns for different managed profiles share one process.  A module
+    global callback allowed the latest turn to steal another turn's secret
+    request routing; ContextVar propagation keeps the callback with its owner.
+    """
+
+    holder = _secret_capture_callback
+    if isinstance(holder, contextvars.ContextVar):
+        holder.set(callback)
+
+
+def get_secret_capture_callback():
+    """Return the callback bound to this context (also patch-friendly in tests)."""
+
+    holder = _secret_capture_callback
+    if isinstance(holder, contextvars.ContextVar):
+        return holder.get()
+    # Several downstream tests/integrations patch this private seam directly.
+    # Treat a patched callable/None as the current value without reintroducing
+    # a production process-global routing path.
+    return holder
 
 
 def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
@@ -427,7 +451,8 @@ def _capture_required_environment_variables(
             "gateway_setup_hint": _gateway_setup_hint(),
         }
 
-    if _secret_capture_callback is None:
+    secret_capture_callback = get_secret_capture_callback()
+    if secret_capture_callback is None:
         return {
             "missing_names": missing_names,
             "setup_skipped": False,
@@ -445,7 +470,7 @@ def _capture_required_environment_variables(
             metadata["required_for"] = entry["required_for"]
 
         try:
-            callback_result = _secret_capture_callback(
+            callback_result = secret_capture_callback(
                 entry["name"],
                 entry["prompt"],
                 metadata,

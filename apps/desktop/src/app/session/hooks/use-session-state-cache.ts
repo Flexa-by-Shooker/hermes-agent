@@ -5,6 +5,7 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import { preserveLocalAssistantErrors } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { $tenantRuntimeEpoch } from '@/store/gateway-switch'
 import {
   $busy,
   $messages,
@@ -239,6 +240,22 @@ export function useSessionStateCache({
         viewSyncRafRef.current = null
       }
     },
+    []
+  )
+
+  useEffect(
+    () =>
+      $tenantRuntimeEpoch.subscribe(() => {
+        if (viewSyncRafRef.current !== null && typeof window !== 'undefined') {
+          window.cancelAnimationFrame(viewSyncRafRef.current)
+          viewSyncRafRef.current = null
+        }
+
+        pendingViewStateRef.current = null
+        viewSessionIdRef.current = null
+        sessionStateByRuntimeIdRef.current.clear()
+        runtimeIdByStoredSessionIdRef.current.clear()
+      }),
     []
   )
 

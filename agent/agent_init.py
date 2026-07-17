@@ -311,6 +311,8 @@ def init_agent(
     platform: str = None,
     user_id: str = None,
     user_id_alt: str = None,
+    principal_assertion: Dict[str, Any] = None,
+    principal_binding: Any = None,
     user_name: str = None,
     chat_id: str = None,
     chat_name: str = None,
@@ -396,6 +398,11 @@ def init_agent(
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
     agent._user_id_alt = user_id_alt  # Optional stable alternate platform identifier
+    # Short-lived assertion content is consumed during initialization and kept
+    # only inside an opaque, non-repr process-local binding so the governed
+    # adapter can forward it to Engine.  It is never placed in model context or
+    # ordinary log fields.
+    agent._governed_principal_binding = principal_binding
     agent._user_name = user_name
     agent._chat_id = chat_id
     agent._chat_name = chat_name
@@ -1306,12 +1313,53 @@ def init_agent(
     from tools.todo_tool import TodoStore
     agent._todo_store = TodoStore()
     
-    # Load config once for memory, skills, and compression sections
+    # Load config once for memory, skills, and compression sections. Managed
+    # Flexa profiles treat this as a security boundary, so a missing/unreadable
+    # effective config cannot degrade to Hermes defaults.
+    from hermes_cli.flexa_governed import (
+        GovernedProfileError as _GovernedProfileError,
+        governed_memory_scope as _governed_memory_scope,
+        governed_mode as _flexa_governed_mode,
+        require_governed_principal_binding as _require_governed_principal_binding,
+        require_governed_memory_provider as _require_governed_memory_provider,
+        validate_governed_memory_config as _validate_governed_memory_config,
+        verify_governed_principal_assertion as _verify_governed_principal_assertion,
+    )
+    _governed_memory = _flexa_governed_mode()
     try:
         from hermes_cli.config import load_config as _load_agent_config
         _agent_cfg = _load_agent_config()
-    except Exception:
+    except Exception as _cfg_err:
+        if _governed_memory:
+            raise _GovernedProfileError("managed memory config is unavailable") from _cfg_err
         _agent_cfg = {}
+    mem_config = _agent_cfg.get("memory", {}) if isinstance(_agent_cfg, dict) else {}
+    if not isinstance(mem_config, dict):
+        mem_config = {}
+    _governed_scope = None
+    if _governed_memory:
+        if skip_memory:
+            raise _GovernedProfileError("managed memory cannot be skipped")
+        _mem_provider_name = _validate_governed_memory_config(mem_config)
+        if principal_binding is None:
+            agent._governed_principal_binding = _verify_governed_principal_assertion(
+                principal_assertion,
+                platform=platform or "cli",
+                user_id=agent._user_id,
+                user_id_alt=agent._user_id_alt,
+            )
+        else:
+            agent._governed_principal_binding = _require_governed_principal_binding(
+                principal_binding
+            )
+        _governed_scope = _governed_memory_scope(
+            platform=platform or "cli",
+            user_id=agent._user_id,
+            user_id_alt=agent._user_id_alt,
+            principal_binding=agent._governed_principal_binding,
+        )
+    else:
+        _mem_provider_name = str(mem_config.get("provider", "") or "").strip()
     try:
         agent._tool_guardrails = ToolCallGuardrailController(
             ToolCallGuardrailConfig.from_mapping(
@@ -1332,9 +1380,8 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    if not skip_memory:
+    if not skip_memory and not _governed_memory:
         try:
-            mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
@@ -1355,14 +1402,17 @@ def init_agent(
     agent._memory_manager = None
     if not skip_memory:
         try:
-            _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
-
-            if _mem_provider_name and _mem_provider_name.strip():
+            if _mem_provider_name:
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()
                 _mp = _load_mem(_mem_provider_name)
-                if _mp and _mp.is_available():
+                if _mp is None or not _mp.is_available():
+                    if _governed_memory:
+                        raise _GovernedProfileError("managed memory provider is unavailable")
+                else:
+                    if _governed_memory:
+                        _require_governed_memory_provider(_mp)
                     agent._memory_manager.add_provider(_mp)
                 if agent._memory_manager.providers:
                     _init_kwargs = {
@@ -1371,6 +1421,11 @@ def init_agent(
                         "hermes_home": str(get_hermes_home()),
                         "agent_context": "primary",
                     }
+                    if _governed_scope is not None:
+                        _init_kwargs["flexa_scope"] = dict(_governed_scope)
+                        _init_kwargs["flexa_principal_binding"] = (
+                            agent._governed_principal_binding
+                        )
                     if _init_kwargs["platform"] == "cli":
                         _init_kwargs["warning_callback"] = agent._emit_warning
                         _init_kwargs["status_callback"] = agent._emit_status
@@ -1412,9 +1467,23 @@ def init_agent(
                     agent._memory_manager.initialize_all(**_init_kwargs)
                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
                 else:
+                    if _governed_memory:
+                        raise _GovernedProfileError("managed memory provider is unavailable")
                     _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
                     agent._memory_manager = None
+            elif _governed_memory:
+                raise _GovernedProfileError("managed memory provider is required")
         except Exception as _mpe:
+            if _governed_memory:
+                if agent._memory_manager is not None:
+                    try:
+                        agent._memory_manager.shutdown_all()
+                    except Exception:
+                        pass
+                agent._memory_manager = None
+                if isinstance(_mpe, _GovernedProfileError):
+                    raise
+                raise _GovernedProfileError("managed memory provider initialization failed") from _mpe
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
             agent._memory_manager = None
 

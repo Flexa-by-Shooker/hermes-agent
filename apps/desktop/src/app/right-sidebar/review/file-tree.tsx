@@ -19,6 +19,7 @@ import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { cn } from '@/lib/utils'
 import { $renamingPath, copyFilePath, revealFile, toRelativePath } from '@/store/file-actions'
+import { $tenantRuntimeEpoch } from '@/store/gateway-switch'
 import { $sidebarWorkspaceCollapsedIds, revealFileInTree, toggleWorkspaceNodeCollapsed } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { setCurrentSessionPreviewTarget } from '@/store/preview'
@@ -269,15 +270,19 @@ function ReviewFileRow({ node, depth }: { node: ReviewTreeNode; depth: number })
   }
 
   const openInPreview = () => {
+    const tenantEpoch = $tenantRuntimeEpoch.get()
+
     void (async () => {
       try {
         const preview = await normalizeOrLocalPreviewTarget(dragPath)
 
-        if (preview) {
+        if (preview && $tenantRuntimeEpoch.get() === tenantEpoch) {
           setCurrentSessionPreviewTarget(preview, 'file-browser', dragPath)
         }
       } catch (error) {
-        notifyError(error, t.rightSidebar.previewUnavailable)
+        if ($tenantRuntimeEpoch.get() === tenantEpoch) {
+          notifyError(error, t.rightSidebar.previewUnavailable)
+        }
       }
     })()
   }

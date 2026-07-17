@@ -1,6 +1,6 @@
 import { atom, computed } from 'nanostores'
 
-import { persistentAtom } from '@/lib/persisted'
+import { composerGatewayScope } from '@/lib/composer-scope'
 import { normalize } from '@/lib/text'
 
 import {
@@ -11,7 +11,7 @@ import {
   selectRightRailTab
 } from './layout'
 import { setPaneOpen } from './panes'
-import { $activeSessionId, $selectedStoredSessionId } from './session'
+import { $activeSessionId, $connection, $selectedStoredSessionId } from './session'
 
 export interface PreviewTarget {
   binary?: boolean
@@ -60,22 +60,52 @@ export interface FilePreviewTab {
   target: PreviewTarget
 }
 
-const REGISTRY_STORAGE_KEY = 'hermes.desktop.sessionPreviews.v1'
-const TABS_STORAGE_KEY = 'hermes.desktop.filePreviewTabs.v1'
+const REGISTRY_STORAGE_KEY = 'hermes.desktop.sessionPreviews.v3'
+const TABS_STORAGE_KEY = 'hermes.desktop.filePreviewTabs.v3'
 const MAX_RECORDS_PER_SESSION = 1
 const MAX_SESSIONS = 120
 
 export const $previewTarget = atom<PreviewTarget | null>(null)
+let previewGatewayScope = composerGatewayScope($connection.get())
+const scopedStorageKey = (prefix: string): string | null =>
+  previewGatewayScope ? `${prefix}.${encodeURIComponent(previewGatewayScope)}` : null
+
+function loadFilePreviewTabs(): FilePreviewTab[] {
+  const key = scopedStorageKey(TABS_STORAGE_KEY)
+
+  if (!key) {
+    return []
+  }
+
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(key) ?? '[]') as unknown
+
+    return Array.isArray(parsed) ? parsed.filter(isFilePreviewTab) : []
+  } catch {
+    return []
+  }
+}
+
 // Persisted so open file-preview tabs survive a relaunch; content is re-read
 // from each target's path/url on demand. Invalid rows are dropped on load and
 // inline image bytes (megabytes) are stripped on save, mirroring the registry.
-export const $filePreviewTabs = persistentAtom<FilePreviewTab[]>(TABS_STORAGE_KEY, [], {
-  decode: raw => {
-    const parsed = JSON.parse(raw) as unknown
+export const $filePreviewTabs = atom<FilePreviewTab[]>(loadFilePreviewTabs())
 
-    return Array.isArray(parsed) ? parsed.filter(isFilePreviewTab) : []
-  },
-  encode: tabs => JSON.stringify(tabs, (key, value) => (key === 'dataUrl' ? undefined : value))
+$filePreviewTabs.subscribe(tabs => {
+  const key = scopedStorageKey(TABS_STORAGE_KEY)
+
+  if (!key) {
+    return
+  }
+
+  if (tabs.length === 0) {
+    window.localStorage.removeItem(key)
+  } else {
+    window.localStorage.setItem(
+      key,
+      JSON.stringify(tabs, (field, value) => (field === 'dataUrl' ? undefined : value))
+    )
+  }
 })
 
 // Drop a restored active file-tab that didn't survive validation so the rail
@@ -228,7 +258,8 @@ function loadSessionPreviewRegistry(): SessionPreviewRegistry {
   }
 
   try {
-    const raw = window.localStorage.getItem(REGISTRY_STORAGE_KEY)
+    const key = scopedStorageKey(REGISTRY_STORAGE_KEY)
+    const raw = key ? window.localStorage.getItem(key) : null
 
     if (!raw) {
       return {}
@@ -270,11 +301,37 @@ function persistSessionPreviewRegistry(registry: SessionPreviewRegistry) {
     // megabytes and would blow the localStorage quota. On reload the record
     // falls back to reading its `path`/`url`.
     const lean = JSON.stringify(pruneRegistry(registry), (key, value) => (key === 'dataUrl' ? undefined : value))
-    window.localStorage.setItem(REGISTRY_STORAGE_KEY, lean)
+    const key = scopedStorageKey(REGISTRY_STORAGE_KEY)
+
+    if (key) {
+      window.localStorage.setItem(key, lean)
+    }
   } catch {
     // Session previews are a desktop convenience; storage failures are nonfatal.
   }
 }
+
+$connection.subscribe(connection => {
+  const nextScope = composerGatewayScope(connection)
+
+  if (nextScope === previewGatewayScope) {
+    return
+  }
+
+  previewGatewayScope = nextScope
+  $previewTarget.set(null)
+  $previewServerRestart.set(null)
+  $filePreviewTabs.set(loadFilePreviewTabs())
+  $sessionPreviewRegistry.set(loadSessionPreviewRegistry())
+
+  if ($rightRailActiveTabId.get().startsWith('file:')) {
+    selectRightRailTab(RIGHT_RAIL_PREVIEW_TAB_ID)
+  }
+
+  if ($filePreviewTabs.get().length === 0) {
+    setPaneOpen(PREVIEW_PANE_ID, false)
+  }
+})
 
 function pruneRegistry(registry: SessionPreviewRegistry): SessionPreviewRegistry {
   const entries = Object.entries(registry)
@@ -520,6 +577,19 @@ export function clearSessionPreviewRegistry() {
   $filePreviewTabs.set([])
   setPaneOpen(PREVIEW_PANE_ID, false)
   selectRightRailTab(RIGHT_RAIL_PREVIEW_TAB_ID)
+}
+
+export function clearPreviewRuntimeState() {
+  // Detach persistence from the old tenant before blanking live atoms. The
+  // connection subscriber will attach/load the next verified scope later.
+  previewGatewayScope = null
+  $previewTarget.set(null)
+  $filePreviewTabs.set([])
+  $sessionPreviewRegistry.set({})
+  setPaneOpen(PREVIEW_PANE_ID, false)
+  selectRightRailTab(RIGHT_RAIL_PREVIEW_TAB_ID)
+  $previewServerRestart.set(null)
+  $previewReloadRequest.set(0)
 }
 
 export function requestPreviewReload() {

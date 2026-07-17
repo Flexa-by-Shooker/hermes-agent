@@ -563,6 +563,63 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
 
 
 @app.middleware("http")
+async def _flexa_governed_profile_gate(request: Request, call_next):
+    """Deny unmanaged profile selection and protected profile mutations.
+
+    This middleware is registered inside the auth middleware below, so an
+    unauthenticated caller receives auth's 401 before this gate runs.
+    """
+    from hermes_cli.flexa_governed import (
+        GovernedProfileError,
+        governed_mode,
+        require_managed_profile,
+    )
+
+    if not governed_mode():
+        return await call_next(request)
+    path = request.url.path
+    if path == "/api/status":
+        # Public liveness reveals no model, version, profile, session, plugin,
+        # or gateway internals in a managed tenant.
+        return JSONResponse(status_code=200, content={"status": "ok"})
+    try:
+        selected = request.query_params.get("profile")
+        if selected is not None:
+            require_managed_profile(selected)
+    except GovernedProfileError:
+        return JSONResponse(status_code=404, content={"detail": "Profile not found"})
+
+    # Public upstream metadata and authenticated admin GETs can disclose the
+    # employee's system prompt, provider/model, tools, filesystem or host
+    # configuration. Managed dashboards expose only the conversation/profile
+    # and session surfaces needed by Desktop.
+    sensitive_read_prefixes = (
+        "/api/config", "/api/model", "/api/dashboard/plugins",
+        "/api/dashboard/themes", "/api/env", "/api/files", "/api/fs",
+        "/api/git", "/api/logs", "/api/ops", "/api/skills", "/api/memory",
+        "/api/mcp", "/api/plugins", "/api/messaging", "/api/learning",
+        "/api/curator", "/api/credentials", "/api/pairing", "/api/webhooks",
+        "/api/gateway", "/api/providers", "/api/hermes/update",
+    )
+    if request.method in {"GET", "HEAD"}:
+        if path.startswith(sensitive_read_prefixes) or (
+            path.startswith("/api/profiles/")
+            and (path.endswith("/soul") or path.endswith("/setup-command"))
+        ):
+            return JSONResponse(status_code=404, content={"detail": "Not found"})
+    elif path.startswith("/api/"):
+        # Exact mutation allowlist. Login/logout live outside /api; the only
+        # mutating API needed before chat is the authenticated one-use WS ticket.
+        allowed_mutations = {("POST", "/api/auth/ws-ticket")}
+        if (request.method, path) not in allowed_mutations:
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Managed profile assets are read-only"},
+            )
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def _dashboard_auth_gate(request: Request, call_next):
     from hermes_cli.dashboard_auth.middleware import gated_auth_middleware
     return await gated_auth_middleware(request, call_next)
@@ -3969,6 +4026,13 @@ def get_sessions(
     Rows omit ``system_prompt``/``model_config`` (the payload-dominating
     fields no list UI reads) unless ``full=1`` is passed.
     """
+    from hermes_cli.flexa_governed import (
+        governed_mode,
+        project_governed_session_metadata,
+    )
+    is_governed = governed_mode()
+    if is_governed:
+        full = False
     if archived not in ("exclude", "only", "include"):
         raise HTTPException(
             status_code=400,
@@ -4030,6 +4094,8 @@ def get_sessions(
                 s["archived"] = bool(s.get("archived"))
             if not full:
                 _strip_session_list_rows(sessions)
+            if is_governed:
+                sessions = [project_governed_session_metadata(row) for row in sessions]
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
         finally:
             db.close()
@@ -4064,6 +4130,13 @@ def get_profiles_sessions(
     Rows omit ``system_prompt``/``model_config`` unless ``full=1`` — same
     list projection as ``/api/sessions``.
     """
+    from hermes_cli.flexa_governed import (
+        governed_mode,
+        project_governed_session_metadata,
+    )
+    is_governed = governed_mode()
+    if is_governed:
+        full = False
     if archived not in ("exclude", "only", "include"):
         raise HTTPException(status_code=400, detail="archived must be one of: exclude, only, include")
     if order not in ("created", "recent"):
@@ -4076,14 +4149,29 @@ def get_profiles_sessions(
     if profile and profile != "all":
         name, home = _cron_profile_home(profile)
         targets.append((name, home))
+    elif is_governed:
+        from hermes_cli.flexa_governed import managed_profiles, verified_profile_home
+
+        targets = [
+            (item.slug, verified_profile_home(item.slug))
+            for item in managed_profiles()
+        ]
     else:
         try:
             infos = profiles_mod.list_profiles()
             targets = [(info.name, info.path) for info in infos]
         except Exception:
             _log.exception("GET /api/profiles/sessions: list_profiles failed")
+            if is_governed:
+                raise HTTPException(
+                    status_code=503, detail="Managed profile roster unavailable"
+                )
             targets = []
         if not targets:
+            if is_governed:
+                raise HTTPException(
+                    status_code=503, detail="Managed profile roster unavailable"
+                )
             targets.append(("default", profiles_mod.get_profile_dir("default")))
 
     min_message_count = max(0, min_messages)
@@ -4113,7 +4201,8 @@ def get_profiles_sessions(
             # read_only docstring).
             db = SessionDB(db_path=db_path, read_only=True)
         except Exception as exc:
-            errors.append({"profile": name, "error": str(exc)})
+            if not is_governed:
+                errors.append({"profile": name, "error": str(exc)})
             continue
         try:
             rows = db.list_sessions_rich(
@@ -4148,7 +4237,8 @@ def get_profiles_sessions(
                 s["archived"] = bool(s.get("archived"))
                 merged.append(s)
         except Exception as exc:
-            errors.append({"profile": name, "error": str(exc)})
+            if not is_governed:
+                errors.append({"profile": name, "error": str(exc)})
         finally:
             db.close()
 
@@ -4157,6 +4247,9 @@ def get_profiles_sessions(
     window = merged[offset:offset + limit]
     if not full:
         _strip_session_list_rows(window)
+    if is_governed:
+        window = [project_governed_session_metadata(row) for row in window]
+        errors = []
     return {
         "sessions": window,
         "total": total,
@@ -4181,6 +4274,9 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
     """
     if not q or not q.strip():
         return {"results": []}
+    from hermes_cli.flexa_governed import governed_mode
+
+    is_governed = governed_mode()
     try:
         db = _open_session_db_for_profile(profile)
         try:
@@ -4270,7 +4366,8 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
                     return
                 payload = dict(payload)
                 payload["session_id"] = lineage_tip(root)
-                payload["lineage_root"] = root
+                if not is_governed:
+                    payload["lineage_root"] = root
                 seen[root] = payload
 
             # Direct ID matches first: users often paste a session id from CLI,
@@ -4280,16 +4377,23 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
             for row in db.search_sessions_by_id(q, limit=safe_limit, include_archived=True):
                 sid = row.get("id")
                 preview = (row.get("preview") or "").strip()
-                snippet = preview or f"Session ID: {sid}"
+                snippet = (
+                    f"Session ID: {sid}"
+                    if is_governed
+                    else (preview or f"Session ID: {sid}")
+                )
+                direct_payload = {
+                    "snippet": snippet,
+                    "role": None,
+                    "session_started": row.get("started_at"),
+                }
+                if not is_governed:
+                    direct_payload.update(
+                        {"source": row.get("source"), "model": row.get("model")}
+                    )
                 add_lineage_result(
                     sid,
-                    {
-                        "snippet": snippet,
-                        "role": None,
-                        "source": row.get("source"),
-                        "model": row.get("model"),
-                        "session_started": row.get("started_at"),
-                    },
+                    direct_payload,
                 )
 
             # Auto-add prefix wildcards so partial words match
@@ -4306,21 +4410,27 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
             # Over-fetch so lineage dedup can still surface `limit` distinct
             # conversations even when several hits collapse onto one root.
             fetch_limit = max(safe_limit * 5, 50)
-            matches = db.search_messages(query=prefix_query, limit=fetch_limit)
+            search_kwargs: dict[str, Any] = {
+                "query": prefix_query,
+                "limit": fetch_limit,
+            }
+            if is_governed:
+                search_kwargs["role_filter"] = ["user", "assistant"]
+            matches = db.search_messages(**search_kwargs)
 
             for m in matches:
                 if len(seen) >= safe_limit:
                     break
-                add_lineage_result(
-                    m["session_id"],
-                    {
-                        "snippet": m.get("snippet", ""),
-                        "role": m.get("role"),
-                        "source": m.get("source"),
-                        "model": m.get("model"),
-                        "session_started": m.get("session_started"),
-                    },
-                )
+                message_payload = {
+                    "snippet": m.get("snippet", ""),
+                    "role": m.get("role"),
+                    "session_started": m.get("session_started"),
+                }
+                if not is_governed:
+                    message_payload.update(
+                        {"source": m.get("source"), "model": m.get("model")}
+                    )
+                add_lineage_result(m["session_id"], message_payload)
             return {"results": list(seen.values())}
         finally:
             db.close()
@@ -9652,6 +9762,15 @@ async def get_session_stats(profile: Optional[str] = None):
         active_store = db.session_count(include_archived=False)
         archived = db.session_count(archived_only=True)
         messages = db.message_count()
+        from hermes_cli.flexa_governed import governed_mode
+
+        if governed_mode():
+            return {
+                "total": total,
+                "active_store": active_store,
+                "archived": archived,
+                "messages": messages,
+            }
         by_source: Dict[str, int] = {}
         try:
             for s in db.list_sessions_rich(limit=10000, include_archived=True, compact_rows=True):
@@ -9679,6 +9798,10 @@ def _open_session_db_for_profile(profile: Optional[str]):
     (transcripts, detail) without spawning that profile's backend.
     """
     from hermes_state import SessionDB
+    from hermes_cli.flexa_governed import governed_mode
+    if governed_mode():
+        _name, home = _cron_profile_home(profile)
+        return SessionDB(db_path=Path(home) / "state.db")
     if not profile:
         return SessionDB()
     _name, home = _cron_profile_home(profile)
@@ -9695,6 +9818,12 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
             raise HTTPException(status_code=404, detail="Session not found")
         if profile:
             session["profile"] = _cron_profile_home(profile)[0]
+        from hermes_cli.flexa_governed import (
+            governed_mode,
+            project_governed_session_metadata,
+        )
+        if governed_mode():
+            return project_governed_session_metadata(session)
         return session
     finally:
         db.close()
@@ -9711,12 +9840,17 @@ async def get_session_latest_descendant(
         latest, path = _session_latest_descendant(session_id, db)
         if not latest:
             raise HTTPException(status_code=404, detail="Session not found")
-        return {
+        result = {
             "requested_session_id": path[0] if path else session_id,
             "session_id": latest,
             "path": path,
             "changed": bool(path and latest != path[0]),
         }
+        from hermes_cli.flexa_governed import governed_mode
+
+        if governed_mode():
+            result.pop("path", None)
+        return result
     finally:
         db.close()
 
@@ -9736,6 +9870,12 @@ async def get_session_messages(
         # Clamp limit to prevent abuse (max 500 per page)
         _limit = min(limit, 500) if limit is not None else None
         messages = db.get_messages(sid, limit=_limit, offset=offset)
+        from hermes_cli.flexa_governed import (
+            governed_mode,
+            project_governed_messages,
+        )
+        if governed_mode():
+            messages = project_governed_messages(messages)
         return {
             "session_id": sid,
             "messages": messages,
@@ -9827,6 +9967,18 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
         data = db.export_session(sid)
         if data is None:
             raise HTTPException(status_code=404, detail="Session not found")
+        from hermes_cli.flexa_governed import (
+            governed_mode,
+            project_governed_messages,
+            project_governed_session_metadata,
+        )
+        if governed_mode():
+            raw_session = data if isinstance(data, dict) else {}
+            raw_messages = data.get("messages", []) if isinstance(data, dict) else []
+            return {
+                **project_governed_session_metadata(raw_session),
+                "messages": project_governed_messages(raw_messages),
+            }
         return data
     finally:
         db.close()
@@ -10149,12 +10301,30 @@ def _cron_profile_dicts() -> List[Dict[str, Any]]:
         return [_profile_to_dict(p) for p in profiles_mod.list_profiles()]
     except Exception:
         _log.exception("Failed to list profiles for cron dashboard; falling back to directory scan")
+        from hermes_cli.flexa_governed import governed_mode
+        if governed_mode():
+            raise HTTPException(status_code=503, detail="Managed profile roster unavailable")
         return _fallback_profile_dicts(profiles_mod)
 
 
 def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
     """Resolve a profile query value to (profile_name, HERMES_HOME)."""
     from hermes_cli import profiles as profiles_mod
+    from hermes_cli.flexa_governed import (
+        governed_mode,
+        managed_profiles,
+        primary_profile,
+        verified_profile_home,
+    )
+
+    if governed_mode():
+        selected = (profile or "").strip()
+        profiles = managed_profiles()
+        if not selected:
+            if len(profiles) != 1:
+                raise HTTPException(status_code=400, detail="Explicit profile required")
+            selected = primary_profile().slug
+        return selected, verified_profile_home(selected)
 
     raw = (profile or "default").strip() or "default"
     try:
@@ -12575,6 +12745,10 @@ def _profile_to_dict(info) -> Dict[str, Any]:
 
 
 def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
+    from hermes_cli.flexa_governed import governed_mode
+    if governed_mode():
+        raise RuntimeError("directory fallback is forbidden for managed profiles")
+
     def _safe(callable_, default):
         try:
             return callable_()
@@ -12630,6 +12804,16 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
 
 def _resolve_profile_dir(name: str) -> Path:
     """Validate ``name`` and resolve to its directory or raise an HTTPException."""
+    from hermes_cli.flexa_governed import (
+        GovernedProfileError,
+        governed_mode,
+        verified_profile_home,
+    )
+    if governed_mode():
+        try:
+            return verified_profile_home(name)
+        except GovernedProfileError:
+            raise HTTPException(status_code=404, detail="Profile not found") from None
     from hermes_cli import profiles as profiles_mod
     try:
         profiles_mod.validate_profile_name(name)
@@ -12766,9 +12950,28 @@ async def list_profiles_endpoint():
     try:
         loop = asyncio.get_running_loop()
         profiles = await loop.run_in_executor(None, profiles_mod.list_profiles)
+        from hermes_cli.flexa_governed import governed_mode
+        if governed_mode():
+            # Customer-facing employee roster only. Never expose model/provider,
+            # host paths, skills, distribution or credential-state internals.
+            return {
+                "profiles": [
+                    {
+                        "name": p.name,
+                        "is_default": bool(p.is_default),
+                        "description": p.description or "",
+                        "description_auto": False,
+                        "status": "ready",
+                    }
+                    for p in profiles
+                ]
+            }
         return {"profiles": [_profile_to_dict(p) for p in profiles]}
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
+        from hermes_cli.flexa_governed import governed_mode
+        if governed_mode():
+            raise HTTPException(status_code=503, detail="Managed profile roster unavailable")
         return {"profiles": _fallback_profile_dicts(profiles_mod)}
 
 
@@ -12895,6 +13098,10 @@ async def get_active_profile_endpoint():
     the running dashboard/gateway is scoped to (derived from HERMES_HOME).
     """
     from hermes_cli import profiles as profiles_mod
+    from hermes_cli.flexa_governed import governed_mode, primary_profile
+    if governed_mode():
+        selected = primary_profile().slug
+        return {"active": selected, "current": selected}
     try:
         active = profiles_mod.get_active_profile() or "default"
     except Exception:
@@ -12914,6 +13121,12 @@ async def set_active_profile_endpoint(body: ProfileActiveUpdate):
     it changes which profile subsequent CLI commands and gateways use.
     """
     from hermes_cli import profiles as profiles_mod
+    from hermes_cli.flexa_governed import governed_mode
+    if governed_mode():
+        raise HTTPException(
+            status_code=409,
+            detail="Managed profile selection is bound to each authenticated connection",
+        )
     try:
         profiles_mod.set_active_profile(body.name)
     except FileNotFoundError as e:
@@ -13150,6 +13363,9 @@ def _profile_scope(profile: Optional[str]):
     isolation).
     """
     requested = (profile or "").strip()
+    from hermes_cli.flexa_governed import governed_mode, primary_profile
+    if governed_mode() and (not requested or requested.lower() == "current"):
+        requested = primary_profile().slug
 
     from hermes_constants import (
         get_hermes_home,
@@ -15052,6 +15268,11 @@ def _console_json_payload(msg: Any) -> tuple[Optional[dict[str, Any]], Optional[
 async def console_ws(ws: WebSocket) -> None:
     peer = ws.client.host if ws.client else "?"
 
+    from hermes_cli.flexa_governed import governed_mode
+    if governed_mode():
+        await ws.close(code=4404, reason="console unavailable")
+        return
+
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
         _log.info("console refused: embedded chat disabled peer=%s", peer)
         await ws.close(code=4404, reason="embedded chat disabled")
@@ -15408,6 +15629,11 @@ async def console_ws(ws: WebSocket) -> None:
 async def pty_ws(ws: WebSocket) -> None:
     peer = ws.client.host if ws.client else "?"
 
+    from hermes_cli.flexa_governed import governed_mode
+    if governed_mode():
+        await ws.close(code=4404, reason="terminal unavailable")
+        return
+
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
         _log.info("pty refused: embedded chat disabled peer=%s", peer)
         await ws.close(code=4404, reason="embedded chat disabled")
@@ -15598,9 +15824,40 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    from tui_gateway.ws import handle_ws
+    from hermes_cli.flexa_governed import (
+        GovernedProfileError,
+        governed_mode,
+        managed_profiles,
+        primary_profile,
+        verified_profile_home,
+    )
+    token = None
+    if governed_mode():
+        requested = (ws.query_params.get("profile") or "").strip()
+        try:
+            profiles = managed_profiles()
+            if not requested:
+                if len(profiles) != 1:
+                    await ws.close(code=4400, reason="explicit profile required")
+                    return
+                requested = primary_profile().slug
+            profile_home = verified_profile_home(requested)
+            from hermes_constants import set_hermes_home_override
 
-    await handle_ws(ws)
+            token = set_hermes_home_override(str(profile_home))
+        except GovernedProfileError:
+            await ws.close(code=4404, reason="profile unavailable")
+            return
+
+    try:
+        from tui_gateway.ws import handle_ws
+
+        await handle_ws(ws)
+    finally:
+        if token is not None:
+            from hermes_constants import reset_hermes_home_override
+
+            reset_hermes_home_override(token)
 
 
 # ---------------------------------------------------------------------------
@@ -15617,6 +15874,10 @@ async def gateway_ws(ws: WebSocket) -> None:
 
 @app.websocket("/api/pub")
 async def pub_ws(ws: WebSocket) -> None:
+    from hermes_cli.flexa_governed import governed_mode
+    if governed_mode():
+        await ws.close(code=4404, reason="publisher unavailable")
+        return
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
         await ws.close(code=4403)
         return
@@ -15645,6 +15906,10 @@ async def pub_ws(ws: WebSocket) -> None:
 
 @app.websocket("/api/events")
 async def events_ws(ws: WebSocket) -> None:
+    from hermes_cli.flexa_governed import governed_mode
+    if governed_mode():
+        await ws.close(code=4404, reason="subscriber unavailable")
+        return
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
         await ws.close(code=4403)
         return
@@ -16957,6 +17222,31 @@ def _maybe_open_browser(
     threading.Thread(target=_open, daemon=True).start()
 
 
+def _valid_governed_scrypt_hash(value: str) -> bool:
+    try:
+        scheme, n, r, p, salt_b64, digest_b64 = value.split("$")
+        salt = base64.b64decode(salt_b64, validate=True)
+        digest = base64.b64decode(digest_b64, validate=True)
+        return (
+            scheme == "scrypt"
+            and (int(n), int(r), int(p)) == (2**14, 8, 1)
+            and len(salt) == 16
+            and len(digest) == 32
+        )
+    except (ValueError, TypeError, binascii.Error):
+        return False
+
+
+def _valid_governed_session_secret(value: str) -> bool:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{43,}", value):
+        return False
+    try:
+        decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except (ValueError, binascii.Error):
+        return False
+    return len(decoded) >= 32
+
+
 def start_server(
     host: str = "127.0.0.1",
     port: int = 9119,
@@ -16977,6 +17267,27 @@ def start_server(
     the banner announces the bind rather than a browser URL.
     """
     import uvicorn
+
+    from hermes_cli.flexa_governed import governed_mode, managed_profiles
+    if governed_mode():
+        # Force signed-roster validation before opening any tenant surface.
+        managed_profiles()
+        if host not in _LOOPBACK_HOST_VALUES:
+            username = os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_USERNAME", "").strip()
+            password_hash = os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH", "").strip()
+            session_secret = os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_SECRET", "").strip()
+            plaintext = os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "").strip()
+            if (
+                not username
+                or not _valid_governed_scrypt_hash(password_hash)
+                or not _valid_governed_session_secret(session_secret)
+                or plaintext
+            ):
+                raise SystemExit(
+                    "Refusing governed remote dashboard: inject a username, "
+                    "scrypt password hash, and stable HMAC session secret; "
+                    "plaintext passwords are forbidden."
+                )
 
     try:
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
@@ -17008,7 +17319,26 @@ def start_server(
         # The gate engages on every non-loopback bind. Require at least one
         # provider to be registered, else fail closed — there is no longer an
         # escape hatch that serves the dashboard without authentication.
-        from hermes_cli.dashboard_auth import list_providers
+        from hermes_cli.dashboard_auth import (
+            list_providers,
+            list_session_providers,
+            list_token_providers,
+        )
+        if governed_mode():
+            provider_names = {provider.name for provider in list_providers()}
+            session_provider_names = {
+                provider.name for provider in list_session_providers()
+            }
+            if (
+                provider_names != {"basic"}
+                or session_provider_names != {"basic"}
+                or list_token_providers()
+            ):
+                raise SystemExit(
+                    "Refusing governed remote dashboard: exactly the bundled "
+                    "Basic session provider must be registered. Rotate the "
+                    "HMAC session secret to revoke every existing login."
+                )
         if not list_providers():
             # Surface the *specific* reason any bundled provider declined
             # to register (e.g. missing HERMES_DASHBOARD_OAUTH_CLIENT_ID).

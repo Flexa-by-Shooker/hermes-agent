@@ -1,10 +1,18 @@
-import { isGatewayReauthRequired, resolveGatewayWsUrl } from '@hermes/shared'
+import { isGatewayReauthRequired } from '@hermes/shared'
 import { useEffect, useRef } from 'react'
 
 import type { HermesConnection } from '@/global'
 import { HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
 import { desktopDefaultCwd } from '@/lib/desktop-fs'
+import {
+  exactConnectionProfile,
+  GatewayConnectionSupersededError,
+  isGatewayConnectionSuperseded,
+  resolveDesktopGatewayWsUrl,
+  sameConnectionIdentity
+} from '@/lib/desktop-gateway-connection'
+import { tagGatewayEventOrigin } from '@/lib/gateway-event-origin'
 import {
   $desktopBoot,
   applyDesktopBootProgress,
@@ -117,6 +125,51 @@ export function useGatewayBoot({
     // recovery overlay replaces the dead-end CONNECTING screen. Reset on a clean
     // open or a manual/wake-driven reconnect.
     let escalated = false
+    // Identity of the window-owned backend. It is deliberately independent of
+    // $activeGatewayProfile: the user may be looking at a secondary while this
+    // primary reconnects in the background.
+    let primaryConnection: HermesConnection | null = null
+    let primaryProfile = 'default'
+    let primaryDialEpoch = 0
+    let softSwitchEpoch = 0
+    // A reconnect may be suspended in Desktop IPC while a connection-config
+    // apply re-homes the window. Soft switches invalidate that work so the old
+    // primary can never publish, dial, or overwrite the newly selected one.
+    let reconnectLifecycleEpoch = 0
+
+    const primaryDialIsCurrent = (epoch: number, connection: HermesConnection): boolean =>
+      !cancelled && epoch === primaryDialEpoch && sameConnectionIdentity(primaryConnection, connection)
+
+    const primaryConnectionIsCurrent = (connection: HermesConnection): boolean =>
+      !cancelled && sameConnectionIdentity(primaryConnection, connection)
+
+    const connectPrimary = async (connection: HermesConnection): Promise<void> => {
+      const epoch = ++primaryDialEpoch
+      const profile = exactConnectionProfile(connection)
+
+      if (profile !== primaryProfile && primaryConnection !== null) {
+        throw new GatewayConnectionSupersededError('Hermes returned a different profile for the primary backend.')
+      }
+
+      primaryProfile = profile
+      primaryConnection = connection
+      setPrimaryGateway(gateway, profile, connection)
+      const wsUrl = await resolveDesktopGatewayWsUrl(desktop, connection)
+
+      if (!primaryDialIsCurrent(epoch, connection)) {
+        throw new GatewayConnectionSupersededError()
+      }
+
+      await gateway.connect(wsUrl)
+
+      if (!primaryDialIsCurrent(epoch, connection)) {
+        // No newer connect can have completed on the same HermesGateway while
+        // this call owned its socket (connect serializes on `connecting`).
+        // Closing here discards the late socket rather than publishing it.
+        gateway.close()
+        throw new GatewayConnectionSupersededError()
+      }
+    }
 
     // Wrap the live getter in a call so TS control-flow analysis doesn't narrow
     // `connectionState` to a constant across the early-return guards (the state
@@ -136,6 +189,12 @@ export function useGatewayBoot({
       }
 
       reconnecting = true
+      const reconnectEpoch = reconnectLifecycleEpoch
+      const reconnectIsCurrent = (connection?: HermesConnection): boolean =>
+        !cancelled &&
+        reconnectEpoch === reconnectLifecycleEpoch &&
+        !$gatewaySwitching.get() &&
+        (!connection || primaryConnectionIsCurrent(connection))
 
       try {
         // Drop a stale REMOTE backend cache before re-dialing. After sleep/wake a
@@ -145,13 +204,20 @@ export function useGatewayBoot({
         // "Starting Hermes…". The probe is a no-op for a healthy or local backend.
         await desktop.revalidateConnection?.().catch(() => undefined)
 
-        const conn = await desktop.getConnection($activeGatewayProfile.get())
-
-        if (cancelled) {
+        if (!reconnectIsCurrent()) {
           return
         }
 
-        publish(conn)
+        // The primary reconnect is pinned to the window-owned descriptor. The
+        // foreground may currently be a secondary profile; following that atom
+        // here would silently replace the primary socket with the secondary.
+        const expectedProfile = primaryProfile
+        const conn = await desktop.getConnection(expectedProfile)
+
+        if (!reconnectIsCurrent() || exactConnectionProfile(conn) !== expectedProfile) {
+          return
+        }
+
         // Re-mint the WS URL before reconnecting. OAuth tickets are single-use
         // with a short TTL, so the ticket baked into the cached conn.wsUrl is
         // dead on every reconnect after the initial boot — reusing it surfaces
@@ -159,30 +225,42 @@ export function useGatewayBoot({
         // mints a fresh ticket (or throws a reauth error in OAuth mode rather
         // than connecting with a stale one). For local/token gateways the URL
         // carries a long-lived token and the re-mint is a cheap no-op.
-        const wsUrl = await resolveGatewayWsUrl(desktop, conn)
-        await gateway.connect(wsUrl)
+        await connectPrimary(conn)
 
-        if (cancelled) {
+        if (!reconnectIsCurrent(conn)) {
           return
+        }
+
+        if (normalizeProfileKey($activeGatewayProfile.get()) === expectedProfile) {
+          publish(conn)
         }
 
         reconnectAttempt = 0
         // Resync state that may have moved on the backend while we were asleep.
         await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
+
+        if (!reconnectIsCurrent(conn)) {
+          return
+        }
+
         await callbacksRef.current.refreshSessions().catch(() => undefined)
+
+        if (!reconnectIsCurrent(conn)) {
+          return
+        }
       } catch (err) {
         // OAuth session expired mid-reconnect: surface the actionable "sign in
         // again" message once instead of silently looping the backoff against a
         // ticket that can never succeed. Transport failures fall through to the
         // backoff in the finally block below.
-        if (!cancelled && isGatewayReauthRequired(err) && !reauthNotified) {
+        if (reconnectIsCurrent() && isGatewayReauthRequired(err) && !reauthNotified) {
           reauthNotified = true
           notifyError(err, translateNow('boot.errors.gatewaySignInRequired'))
         }
       } finally {
         reconnecting = false
 
-        if (!cancelled && !gatewayOpen() && !$gatewaySwitching.get()) {
+        if (reconnectIsCurrent() && !gatewayOpen()) {
           if (reconnectAttempt >= RECONNECT_ESCALATE_AFTER && !escalated) {
             escalated = true
             failDesktopBoot(translateNow('boot.errors.gatewayConnectionLost'))
@@ -222,32 +300,39 @@ export function useGatewayBoot({
       }
     }
 
-    // Adopt the profile the primary (window) backend booted as, so same-profile
-    // resumes are no-op swaps and reconnects target the right backend.
-    // Best-effort: a missing preference means "default". Shared by boot + soft
-    // switch.
-    async function adoptPrimaryProfile() {
-      try {
-        const pref = await desktop.profile?.get?.()
-        const profileKey = (pref?.profile ?? '').trim() || 'default'
-        $activeGatewayProfile.set(profileKey)
-        setPrimaryGateway(gateway, profileKey)
-        void ensureGatewayForProfile(profileKey)
-      } catch {
-        $activeGatewayProfile.set('default')
-      }
+    // Adopt the profile from the immutable resolved descriptor itself. Reading
+    // the mutable preference after the connection await can pair a newly-saved
+    // profile with the old backend generation.
+    function adoptPrimaryProfile(connection: HermesConnection) {
+      const profileKey = exactConnectionProfile(connection)
+      primaryProfile = profileKey
+      primaryConnection = connection
+      $activeGatewayProfile.set(profileKey)
+      setPrimaryGateway(gateway, profileKey, connection)
+      void ensureGatewayForProfile(profileKey)
     }
 
     // Seed the working dir from the backend default on a fresh view (nothing
     // open yet). Shared by boot + soft switch.
-    async function seedDefaultCwd() {
+    async function seedDefaultCwd(stillCurrent: () => boolean = () => true): Promise<boolean> {
       await ensureDefaultWorkspaceCwd()
+
+      if (!stillCurrent()) {
+        return false
+      }
+
       const remoteDefault = await desktopDefaultCwd().catch(() => null)
+
+      if (!stillCurrent()) {
+        return false
+      }
 
       if (remoteDefault?.cwd && !$activeSessionId.get() && !$currentCwd.get()) {
         setCurrentCwd(remoteDefault.cwd)
         setCurrentBranch(remoteDefault.branch || '')
       }
+
+      return true
     }
 
     // Soft gateway-mode apply: main tore down the primary without reloading.
@@ -257,7 +342,13 @@ export function useGatewayBoot({
         return
       }
 
+      const switchEpoch = ++softSwitchEpoch
+      let switched = false
+      const switchIsCurrent = (connection?: HermesConnection): boolean =>
+        !cancelled && switchEpoch === softSwitchEpoch && (!connection || primaryConnectionIsCurrent(connection))
+
       $gatewaySwitching.set(true)
+      reconnectLifecycleEpoch += 1
       clearReconnectTimer()
       reconnectAttempt = 0
       escalated = false
@@ -265,38 +356,65 @@ export function useGatewayBoot({
       wipeSessionListsForGatewaySwitch()
 
       try {
+        primaryDialEpoch += 1
+        primaryConnection = null
+        publish(null)
+        setPrimaryGateway(null)
+        $gateway.set(null)
         gateway.close()
         closeSecondaryGateways()
 
+        // No explicit profile: connection-config apply may have re-homed the
+        // window from Oren to Maya. Main resolves the new primary; asking for
+        // the old captured profile would incorrectly spawn it as a secondary.
         const conn = await desktop.getConnection()
 
-        if (cancelled) {
+        if (!switchIsCurrent()) {
+          return
+        }
+
+        await connectPrimary(conn)
+
+        if (!switchIsCurrent(conn)) {
           return
         }
 
         publish(conn)
-        const wsUrl = await resolveGatewayWsUrl(desktop, conn)
-        await gateway.connect(wsUrl)
+        adoptPrimaryProfile(conn)
+        if (!(await seedDefaultCwd(() => switchIsCurrent(conn)))) {
+          return
+        }
+        await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
 
-        if (cancelled) {
+        if (!switchIsCurrent(conn)) {
           return
         }
 
-        await adoptPrimaryProfile()
-        await seedDefaultCwd()
-        await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
         await callbacksRef.current.refreshSessions().catch(() => undefined)
+
+        if (!switchIsCurrent(conn)) {
+          return
+        }
+
         completeDesktopBoot()
         bootCompleted = true
+        switched = true
       } catch (err) {
-        if (!cancelled) {
+        if (switchEpoch === softSwitchEpoch && !cancelled && !isGatewayConnectionSuperseded(err)) {
+          primaryDialEpoch += 1
+          primaryConnection = null
+          setPrimaryGateway(null)
+          $gateway.set(null)
+          gateway.close()
           const message = err instanceof Error ? err.message : String(err)
           failDesktopBoot(message)
           notifyError(err, translateNow('boot.errors.desktopBootFailed'))
           setSessionsLoading(false)
         }
       } finally {
-        $gatewaySwitching.set(false)
+        if (switchEpoch === softSwitchEpoch && switched) {
+          $gatewaySwitching.set(false)
+        }
       }
     }
 
@@ -356,7 +474,11 @@ export function useGatewayBoot({
       }
     })
 
-    const offEvent = gateway.onEvent(event => callbacksRef.current.handleGatewayEvent(event))
+    const offEvent = gateway.onEvent(event =>
+      callbacksRef.current.handleGatewayEvent(
+        tagGatewayEventOrigin(event, primaryConnection ? { connection: primaryConnection, gateway } : null)
+      )
+    )
 
     // Wake signals: power resume (macOS/Windows), network coming back, and the
     // window regaining focus/visibility. Each nudges an immediate reconnect.
@@ -428,10 +550,14 @@ export function useGatewayBoot({
     })
 
     async function boot() {
+      const bootSwitchEpoch = softSwitchEpoch
+      const bootIsCurrent = (connection?: HermesConnection): boolean =>
+        !cancelled && bootSwitchEpoch === softSwitchEpoch && (!connection || primaryConnectionIsCurrent(connection))
+
       try {
         const conn = await desktop.getConnection()
 
-        if (cancelled) {
+        if (!bootIsCurrent()) {
           return
         }
 
@@ -440,31 +566,32 @@ export function useGatewayBoot({
           message: translateNow('boot.steps.connectingGateway'),
           progress: 95
         })
-        publish(conn)
         // Mint a fresh WS URL right before connecting. For OAuth gateways the
         // ticket is single-use with a short TTL, so the ticket baked into
         // conn.wsUrl is stale; resolveGatewayWsUrl() re-mints it and, on
         // failure, throws a reauth error rather than connecting with a dead
         // ticket (which would surface as an opaque "connection closed").
-        const wsUrl = await resolveGatewayWsUrl(desktop, conn)
-        await gateway.connect(wsUrl)
+        await connectPrimary(conn)
 
-        if (cancelled) {
+        if (!bootIsCurrent(conn)) {
           return
         }
 
-        await adoptPrimaryProfile()
+        publish(conn)
+        adoptPrimaryProfile(conn)
 
         setDesktopBootStep({
           phase: 'renderer.config',
           message: translateNow('boot.steps.loadingSettings'),
           progress: 97
         })
-        await seedDefaultCwd()
+        if (!(await seedDefaultCwd(() => bootIsCurrent(conn)))) {
+          return
+        }
 
         await callbacksRef.current.refreshHermesConfig()
 
-        if (cancelled) {
+        if (!bootIsCurrent(conn)) {
           return
         }
 
@@ -474,10 +601,15 @@ export function useGatewayBoot({
           progress: 99
         })
         await callbacksRef.current.refreshSessions()
+
+        if (!bootIsCurrent(conn)) {
+          return
+        }
+
         completeDesktopBoot()
         bootCompleted = true
       } catch (err) {
-        if (!cancelled) {
+        if (bootSwitchEpoch === softSwitchEpoch && !cancelled && !isGatewayConnectionSuperseded(err)) {
           const message = err instanceof Error ? err.message : String(err)
           failDesktopBoot(message)
           notifyError(err, translateNow('boot.errors.desktopBootFailed'))
@@ -490,6 +622,10 @@ export function useGatewayBoot({
 
     return () => {
       cancelled = true
+      softSwitchEpoch += 1
+      reconnectLifecycleEpoch += 1
+      primaryDialEpoch += 1
+      primaryConnection = null
       $gatewaySwitching.set(false)
       clearReconnectTimer()
       clearInterval(keepaliveTimer)

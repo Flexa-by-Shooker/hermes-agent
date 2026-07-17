@@ -7,15 +7,19 @@ import { useI18n } from '@/i18n'
 import { stripAnsi } from '@/lib/ansi'
 import { branchGroupForUser, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
 import { pathLabel, SLASH_COMMAND_RE } from '@/lib/chat-runtime'
+import { composerGatewayScope } from '@/lib/composer-scope'
+import { pinGatewayRequest } from '@/lib/gateway-request'
 import { triggerHaptic } from '@/lib/haptics'
 import { setMutableRef } from '@/lib/mutable-ref'
 import { normalize } from '@/lib/text'
 import { clearClarifyRequest } from '@/store/clarify'
 import {
   $composerAttachments,
+  addComposerAttachment,
   type ComposerAttachment,
   setComposerAttachmentUploadState,
-  updateComposerAttachment
+  updateComposerAttachment,
+  withAttachmentUploadNonce
 } from '@/store/composer'
 import { resetSessionBackground } from '@/store/composer-status'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
@@ -32,6 +36,7 @@ import type {
   HandoffRequestResponse,
   HandoffStateResponse,
   ImageAttachResponse,
+  ImageDetachResponse,
   SessionSteerResponse
 } from '../../../types'
 
@@ -63,8 +68,9 @@ interface HandoffResult {
  * Stage one file/image attachment into the session workspace and return the
  * attachment rewritten with the gateway-side ref. Images upload their bytes in
  * remote mode (so vision works) and pass the path locally; non-image files
- * upload bytes remotely and pass the path locally. Throws on failure so callers
- * can surface an error. Shared by submit-time sync, the eager drop-time upload,
+ * always use the bounded Electron byte bridge and never send a client host path.
+ * Throws on failure so callers can surface an error. Shared by submit-time sync,
+ * the eager drop-time upload,
  * and the message-edit composer drop — keep them in lockstep.
  */
 export async function uploadComposerAttachment(
@@ -72,6 +78,7 @@ export async function uploadComposerAttachment(
   opts: { remote: boolean; requestGateway: GatewayRequest; sessionId: string }
 ): Promise<ComposerAttachment> {
   const { remote, requestGateway, sessionId } = opts
+  attachment = withAttachmentUploadNonce(attachment)
   const path = attachment.path ?? ''
   const label = attachment.label || pathLabel(path)
 
@@ -94,16 +101,18 @@ export async function uploadComposerAttachment(
       result = await requestGateway<ImageAttachResponse>('image.attach_bytes', {
         session_id: sessionId,
         content_base64: payload.contentBase64,
-        filename: payload.filename
+        filename: payload.filename,
+        upload_nonce: attachment.uploadNonce
       })
     } else {
       result = await requestGateway<ImageAttachResponse>('image.attach', {
         path,
-        session_id: sessionId
+        session_id: sessionId,
+        upload_nonce: attachment.uploadNonce
       })
     }
 
-    if (!result.attached) {
+    if (!result.attached || !result.attachment_id) {
       throw new Error(result.message || `Could not attach ${label}`)
     }
 
@@ -112,43 +121,63 @@ export async function uploadComposerAttachment(
     return {
       ...attachment,
       attachedSessionId: sessionId,
+      attachmentId: result.attachment_id,
       label: attachedPath ? pathLabel(attachedPath) : attachment.label,
       path: attachedPath,
       uploadState: undefined
     }
   }
 
-  // Non-image file.
+  // Non-image files always take the bounded local-byte route. Besides making
+  // local and remote behavior deterministic, this keeps C:\Users/... and other
+  // client-only host paths out of managed gateway requests entirely.
   let dataUrl: string | null = null
 
-  if (remote) {
-    try {
-      dataUrl = await readFileDataUrlForAttach(path)
-    } catch (err) {
-      throw friendlyRemoteAttachError(err, label)
-    }
+  try {
+    dataUrl = await readFileDataUrlForAttach(path)
+  } catch (err) {
+    throw friendlyRemoteAttachError(err, label)
+  }
 
-    if (!dataUrl) {
-      throw new Error(`Could not read ${label}`)
-    }
+  if (!dataUrl) {
+    throw new Error(`Could not read ${label}`)
   }
 
   const result = await requestGateway<FileAttachResponse>('file.attach', {
     name: label,
-    path,
     session_id: sessionId,
-    ...(dataUrl ? { data_url: dataUrl } : {})
+    data_url: dataUrl,
+    upload_nonce: attachment.uploadNonce
   })
 
-  if (!result.attached || !result.ref_text) {
+  if (!result.attached || !result.attachment_id || !result.ref_text) {
     throw new Error(result.message || `Could not attach ${label}`)
   }
 
   return {
     ...attachment,
     attachedSessionId: sessionId,
+    attachmentId: result.attachment_id,
     refText: result.ref_text,
     uploadState: undefined
+  }
+}
+
+export async function detachUploadedComposerAttachment(
+  attachment: ComposerAttachment,
+  requestGateway: GatewayRequest
+): Promise<void> {
+  if (!attachment.attachedSessionId || !attachment.attachmentId) {
+    throw new Error('Hermes could not verify the staged attachment for cleanup.')
+  }
+
+  const result = await requestGateway<ImageDetachResponse>('image.detach', {
+    session_id: attachment.attachedSessionId,
+    attachment_id: attachment.attachmentId
+  })
+
+  if (!result.detached) {
+    throw new Error(`Hermes could not remove the staged copy of ${attachment.label}.`)
   }
 }
 
@@ -162,7 +191,7 @@ interface PromptActionsOptions {
   handleSkinCommand: (arg: string) => string
   openMemoryGraph: () => void
   refreshSessions: () => Promise<void>
-  requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
+  requestGateway: GatewayRequest
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   startFreshSessionDraft: () => void
@@ -245,6 +274,8 @@ export function usePromptActions({
     ): Promise<ComposerAttachment[]> => {
       const updateComposerAttachments = options.updateComposerAttachments ?? true
       const remote = $connection.get()?.mode === 'remote'
+      const originGatewayScope = composerGatewayScope($connection.get())
+      const originRequest = pinGatewayRequest(requestGateway)
       const synced: ComposerAttachment[] = []
 
       for (const original of attachments) {
@@ -259,7 +290,17 @@ export function usePromptActions({
 
         if (inFlight) {
           await inFlight
-          attachment = $composerAttachments.get().find(item => item.id === attachment.id) ?? attachment
+          const current = $composerAttachments.get().find(item => item.id === attachment.id)
+
+          if (
+            activeSessionIdRef.current !== sessionId ||
+            composerGatewayScope($connection.get()) !== originGatewayScope ||
+            (updateComposerAttachments && !current)
+          ) {
+            throw new Error(`The upload of ${attachment.label} finished after its chat changed.`)
+          }
+
+          attachment = current ?? attachment
         }
 
         // Already-synced or pathless refs (terminal, url, etc.) pass through.
@@ -272,11 +313,34 @@ export function usePromptActions({
         }
 
         if (attachment.kind === 'image' || attachment.kind === 'file') {
-          const nextAttachment = await uploadComposerAttachment(attachment, { remote, requestGateway, sessionId })
+          const nextAttachment = await uploadComposerAttachment(attachment, {
+            remote,
+            requestGateway: originRequest,
+            sessionId
+          })
+          const sessionStillCurrent =
+            originGatewayScope !== null &&
+            composerGatewayScope($connection.get()) === originGatewayScope &&
+            activeSessionIdRef.current === sessionId
 
           // Update-only: never resurrect a chip the user removed mid-upload.
-          if (updateComposerAttachments) {
-            updateComposerAttachment(nextAttachment)
+          const chipStillCurrent = !updateComposerAttachments || updateComposerAttachment(nextAttachment)
+
+          if (!sessionStillCurrent || !chipStillCurrent) {
+            try {
+              await detachUploadedComposerAttachment(nextAttachment, originRequest)
+            } catch (error) {
+              if (
+                activeSessionIdRef.current === sessionId &&
+                composerGatewayScope($connection.get()) === originGatewayScope &&
+                !$composerAttachments.get().some(item => item.id === nextAttachment.id)
+              ) {
+                addComposerAttachment(nextAttachment)
+              }
+              notifyError(error, copy.dropFiles)
+            }
+
+            throw new Error(`The upload of ${nextAttachment.label} finished after its chat changed.`)
           }
 
           synced.push(nextAttachment)
@@ -289,7 +353,7 @@ export function usePromptActions({
 
       return synced
     },
-    [requestGateway]
+    [activeSessionIdRef, copy.dropFiles, requestGateway]
   )
 
   // Stage a freshly dropped file as soon as it lands (when a session already
@@ -305,22 +369,54 @@ export function usePromptActions({
   const eagerlyUploadAttachment = useCallback(
     async (sessionId: string, attachment: ComposerAttachment) => {
       const remote = $connection.get()?.mode === 'remote'
+      const originGatewayScope = composerGatewayScope($connection.get())
+      const originRequest = pinGatewayRequest(requestGateway)
 
       setComposerAttachmentUploadState(attachment.id, 'uploading')
 
       try {
         // Update-only: if the user removed the chip while this was uploading,
         // don't resurrect it — just drop the staged result on the floor.
-        updateComposerAttachment(await uploadComposerAttachment(attachment, { remote, requestGateway, sessionId }))
+        const uploaded = await uploadComposerAttachment(attachment, {
+          remote,
+          requestGateway: originRequest,
+          sessionId
+        })
+        const sessionStillCurrent =
+          originGatewayScope !== null &&
+          composerGatewayScope($connection.get()) === originGatewayScope &&
+          activeSessionIdRef.current === sessionId
+        const chipStillCurrent = sessionStillCurrent && updateComposerAttachment(uploaded)
+
+        if (!chipStillCurrent) {
+          try {
+            await detachUploadedComposerAttachment(uploaded, originRequest)
+          } catch (error) {
+            if (
+              activeSessionIdRef.current === sessionId &&
+              composerGatewayScope($connection.get()) === originGatewayScope &&
+              !$composerAttachments.get().some(item => item.id === uploaded.id)
+            ) {
+              addComposerAttachment(uploaded)
+            }
+            notifyError(error, copy.dropFiles)
+          }
+        }
       } catch (err) {
         // Leave the chip in place so submit-time sync can retry (or the user can
         // remove it) and flag the card; also toast so a hard failure (unreadable
         // file, gateway perms) isn't swallowed while the user keeps typing.
-        setComposerAttachmentUploadState(attachment.id, 'error')
-        notifyError(err, copy.dropFiles)
+        if (
+          originGatewayScope !== null &&
+          composerGatewayScope($connection.get()) === originGatewayScope &&
+          activeSessionIdRef.current === sessionId
+        ) {
+          setComposerAttachmentUploadState(attachment.id, 'error')
+          notifyError(err, copy.dropFiles)
+        }
       }
     },
-    [copy.dropFiles, requestGateway]
+    [activeSessionIdRef, copy.dropFiles, requestGateway]
   )
 
   const composerAttachments = useStore($composerAttachments)

@@ -1,8 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useStore } from '@nanostores/react'
+import { useEffect, useLayoutEffect, useState } from 'react'
 
 import { deleteEnvVar, getEnvVars, revealEnvVar, setEnvVar } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type IconComponent } from '@/lib/icons'
+import { $gatewaySwitching, $tenantRuntimeEpoch } from '@/store/gateway-switch'
 import { notify, notifyError } from '@/store/notifications'
 import type { EnvVarInfo } from '@/types/hermes'
 
@@ -45,6 +47,9 @@ export function useEnvCredentials(): UseEnvCredentials {
   const { t } = useI18n()
   const credentials = t.settings.credentials
   const toolsets = t.settings.toolsets
+  const gatewaySwitching = useStore($gatewaySwitching)
+  const tenantEpoch = useStore($tenantRuntimeEpoch)
+  const [stateTenantEpoch, setStateTenantEpoch] = useState(tenantEpoch)
   const [vars, setVars] = useState<Record<string, EnvVarInfo> | null>(null)
   const [edits, setEdits] = useState<Record<string, string>>({})
   const [revealed, setRevealed] = useState<Record<string, string>>({})
@@ -60,24 +65,45 @@ export function useEnvCredentials(): UseEnvCredentials {
     }
   }, [])
 
+  // Credentials include plaintext revealed values. Hide the retiring tenant's
+  // state during render and clear it before the browser paints the new epoch.
+  useLayoutEffect(() => {
+    setStateTenantEpoch(tenantEpoch)
+    setVars(null)
+    setEdits({})
+    setRevealed({})
+    setSaving(null)
+  }, [tenantEpoch])
+
   useEffect(() => {
     let cancelled = false
+    const loadTenantEpoch = tenantEpoch
 
+    if (gatewaySwitching) {
+      setVars(null)
+      setEdits({})
+      setRevealed({})
+      setSaving(null)
+
+      return () => void (cancelled = true)
+    }
     void (async () => {
       try {
         const next = await getEnvVars()
 
-        if (!cancelled) {
+        if (!cancelled && tenantIsCurrent(loadTenantEpoch)) {
           setVars(next)
         }
       } catch (err) {
-        notifyError(err, t.settings.keys.failedLoad)
+        if (!cancelled && tenantIsCurrent(loadTenantEpoch)) {
+          notifyError(err, t.settings.keys.failedLoad)
+        }
       }
     })()
 
     return () => void (cancelled = true)
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- load once on mount; copy is stable
-  }, [])
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- copy is stable
+  }, [gatewaySwitching, tenantEpoch])
 
   function patchVar(key: string, patch: Partial<Pick<EnvVarInfo, 'is_set' | 'redacted_value'>>) {
     setVars(c => (c ? { ...c, [key]: { ...c[key], ...patch } } : c))
@@ -90,8 +116,9 @@ export function useEnvCredentials(): UseEnvCredentials {
 
   async function handleSave(key: string) {
     const value = edits[key]
+    const actionTenantEpoch = tenantEpoch
 
-    if (!value) {
+    if (!value || !tenantIsCurrent(actionTenantEpoch)) {
       return
     }
 
@@ -99,13 +126,22 @@ export function useEnvCredentials(): UseEnvCredentials {
 
     try {
       await setEnvVar(key, value)
+
+      if (!tenantIsCurrent(actionTenantEpoch)) {
+        return
+      }
+
       patchVar(key, { is_set: true, redacted_value: redactedValue(value) })
       clearLocalState(key)
       notify({ kind: 'success', title: toolsets.savedTitle, message: toolsets.savedMessage(key) })
     } catch (err) {
-      notifyError(err, toolsets.failedSave(key))
+      if (tenantIsCurrent(actionTenantEpoch)) {
+        notifyError(err, toolsets.failedSave(key))
+      }
     } finally {
-      setSaving(null)
+      if (tenantIsCurrent(actionTenantEpoch)) {
+        setSaving(null)
+      }
     }
   }
 
@@ -114,8 +150,9 @@ export function useEnvCredentials(): UseEnvCredentials {
   // the form can surface inline errors instead of only toasting.
   async function saveValue(key: string, value: string): Promise<{ message?: string; ok: boolean }> {
     const trimmed = value.trim()
+    const actionTenantEpoch = tenantEpoch
 
-    if (!trimmed) {
+    if (!trimmed || !tenantIsCurrent(actionTenantEpoch)) {
       return { message: credentials.enterValueFirst, ok: false }
     }
 
@@ -123,22 +160,35 @@ export function useEnvCredentials(): UseEnvCredentials {
 
     try {
       await setEnvVar(key, trimmed)
+
+      if (!tenantIsCurrent(actionTenantEpoch)) {
+        return { ok: false }
+      }
+
       patchVar(key, { is_set: true, redacted_value: redactedValue(trimmed) })
       clearLocalState(key)
       notify({ kind: 'success', message: toolsets.savedMessage(key), title: toolsets.savedTitle })
 
       return { ok: true }
     } catch (err) {
+      if (!tenantIsCurrent(actionTenantEpoch)) {
+        return { ok: false }
+      }
+
       notifyError(err, toolsets.failedSave(key))
 
       return { message: err instanceof Error ? err.message : credentials.couldNotSave, ok: false }
     } finally {
-      setSaving(null)
+      if (tenantIsCurrent(actionTenantEpoch)) {
+        setSaving(null)
+      }
     }
   }
 
   async function handleClear(key: string) {
-    if (!window.confirm(toolsets.removeConfirm(key))) {
+    const actionTenantEpoch = tenantEpoch
+
+    if (!tenantIsCurrent(actionTenantEpoch) || !window.confirm(toolsets.removeConfirm(key))) {
       return
     }
 
@@ -146,17 +196,32 @@ export function useEnvCredentials(): UseEnvCredentials {
 
     try {
       await deleteEnvVar(key)
+
+      if (!tenantIsCurrent(actionTenantEpoch)) {
+        return
+      }
+
       patchVar(key, { is_set: false, redacted_value: null })
       clearLocalState(key)
       notify({ kind: 'success', title: toolsets.removedTitle, message: toolsets.removedMessage(key) })
     } catch (err) {
-      notifyError(err, toolsets.failedRemove(key))
+      if (tenantIsCurrent(actionTenantEpoch)) {
+        notifyError(err, toolsets.failedRemove(key))
+      }
     } finally {
-      setSaving(null)
+      if (tenantIsCurrent(actionTenantEpoch)) {
+        setSaving(null)
+      }
     }
   }
 
   async function handleReveal(key: string) {
+    const actionTenantEpoch = tenantEpoch
+
+    if (!tenantIsCurrent(actionTenantEpoch)) {
+      return
+    }
+
     if (revealed[key]) {
       setRevealed(c => withoutKey(c, key))
 
@@ -165,25 +230,36 @@ export function useEnvCredentials(): UseEnvCredentials {
 
     try {
       const result = await revealEnvVar(key)
-      setRevealed(c => ({ ...c, [key]: result.value }))
+
+      if (tenantIsCurrent(actionTenantEpoch)) {
+        setRevealed(c => ({ ...c, [key]: result.value }))
+      }
     } catch (err) {
-      notifyError(err, toolsets.failedReveal(key))
+      if (tenantIsCurrent(actionTenantEpoch)) {
+        notifyError(err, toolsets.failedReveal(key))
+      }
     }
   }
 
+  const stateIsCurrent = !gatewaySwitching && stateTenantEpoch === tenantEpoch
+
   return {
     saveValue,
-    vars,
+    vars: stateIsCurrent ? vars : null,
     rowProps: {
-      edits,
-      revealed,
-      saving,
-      setEdits,
+      edits: stateIsCurrent ? edits : {},
+      revealed: stateIsCurrent ? revealed : {},
+      saving: stateIsCurrent ? saving : null,
+      setEdits: stateIsCurrent ? setEdits : () => undefined,
       onSave: handleSave,
       onClear: handleClear,
       onReveal: handleReveal
     }
   }
+}
+
+function tenantIsCurrent(tenantEpoch: number): boolean {
+  return $tenantRuntimeEpoch.get() === tenantEpoch && !$gatewaySwitching.get()
 }
 
 interface CategoryHeadingProps {

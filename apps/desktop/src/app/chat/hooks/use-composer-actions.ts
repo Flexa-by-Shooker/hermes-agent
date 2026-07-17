@@ -5,15 +5,19 @@ import { droppedFileInlineRef } from '@/app/chat/composer/inline-refs'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { useI18n } from '@/i18n'
 import { attachmentId, contextPath, pathLabel } from '@/lib/chat-runtime'
+import { composerGatewayScope, composerSessionScope } from '@/lib/composer-scope'
 import { readDesktopFileDataUrl, selectDesktopPaths } from '@/lib/desktop-fs'
+import { type GatewayRequest, pinGatewayRequest } from '@/lib/gateway-request'
 import { normalize } from '@/lib/text'
 import {
+  $composerAttachments,
   addComposerAttachment,
   type ComposerAttachment,
   removeComposerAttachment,
   setComposerTerminalSelection
 } from '@/store/composer'
 import { notify, notifyError } from '@/store/notifications'
+import { $activeSessionId, $connection } from '@/store/session'
 
 import type { ImageDetachResponse } from '../../types'
 
@@ -75,6 +79,30 @@ export interface DroppedFile {
   line?: number
   /** Last line number for line-range drags (`line..lineEnd` inclusive). */
   lineEnd?: number
+}
+
+export function attachmentDetachParams(
+  attachment: ComposerAttachment | null | undefined,
+  activeSessionId: string | null
+): Record<string, unknown> | null {
+  if (
+    !attachment ||
+    !activeSessionId ||
+    attachment.attachedSessionId !== activeSessionId ||
+    (attachment.kind !== 'image' && attachment.kind !== 'file')
+  ) {
+    return null
+  }
+
+  if (attachment.attachmentId) {
+    return { session_id: activeSessionId, attachment_id: attachment.attachmentId }
+  }
+
+  if (attachment.kind === 'image' && attachment.path) {
+    return { session_id: activeSessionId, path: attachment.path }
+  }
+
+  return null
 }
 
 /** MIME emitted by in-app drag sources (project tree, gutter line numbers).
@@ -257,8 +285,9 @@ export function partitionDroppedFiles(candidates: DroppedFile[]): {
 
 interface ComposerActionsOptions {
   activeSessionId: string | null
+  composerSessionKey: string | null
   currentCwd: string
-  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  requestGateway: GatewayRequest
 }
 
 /** Add to the main composer and focus it. All sidebar/picker/drop attach paths funnel through here. */
@@ -267,7 +296,12 @@ const attachToMain = (attachment: ComposerAttachment) => {
   requestComposerFocus('main')
 }
 
-export function useComposerActions({ activeSessionId, currentCwd, requestGateway }: ComposerActionsOptions) {
+export function useComposerActions({
+  activeSessionId,
+  composerSessionKey,
+  currentCwd,
+  requestGateway
+}: ComposerActionsOptions) {
   const { t } = useI18n()
   const copy = t.desktop
 
@@ -275,18 +309,25 @@ export function useComposerActions({ activeSessionId, currentCwd, requestGateway
     requestComposerInsert(text, { mode: 'block' })
   }, [])
 
-  const addTerminalSelectionAttachment = useCallback((text: string, label = 'selection') => {
-    const trimmed = text.trim()
-    const normalizedLabel = label.trim() || 'selection'
-    const refText = `@terminal:${formatRefValue(normalizedLabel)}`
+  const addTerminalSelectionAttachment = useCallback(
+    (text: string, label = 'selection') => {
+      const trimmed = text.trim()
+      const normalizedLabel = label.trim() || 'selection'
+      const refText = `@terminal:${formatRefValue(normalizedLabel)}`
 
-    if (!trimmed) {
-      return
-    }
+      if (!trimmed) {
+        return
+      }
 
-    setComposerTerminalSelection(normalizedLabel, trimmed)
-    requestComposerInsert(refText, { mode: 'inline' })
-  }, [])
+      setComposerTerminalSelection(
+        composerSessionScope($connection.get(), composerSessionKey),
+        normalizedLabel,
+        trimmed
+      )
+      requestComposerInsert(refText, { mode: 'inline' })
+    },
+    [composerSessionKey]
+  )
 
   const addContextRefAttachment = useCallback((refText: string, label?: string, detail?: string) => {
     const kind: ComposerAttachment['kind'] = refText.startsWith('@folder:')
@@ -599,22 +640,39 @@ export function useComposerActions({ activeSessionId, currentCwd, requestGateway
 
   const removeAttachment = useCallback(
     async (id: string) => {
+      const originGatewayScope = composerGatewayScope($connection.get())
       const removed = removeComposerAttachment(id)
+      const detachParams = attachmentDetachParams(removed, activeSessionId)
 
-      if (
-        removed?.kind === 'image' &&
-        removed.path &&
-        activeSessionId &&
-        removed.attachedSessionId &&
-        removed.attachedSessionId === activeSessionId
-      ) {
-        await requestGateway<ImageDetachResponse>('image.detach', {
-          session_id: activeSessionId,
-          path: removed.path
-        }).catch(() => undefined)
+      if (detachParams) {
+        const originRequest = pinGatewayRequest(requestGateway)
+
+        try {
+          const result = await originRequest<ImageDetachResponse>('image.detach', detachParams)
+
+          if (!result.detached) {
+            throw new Error(`Hermes could not remove the staged copy of ${removed?.label || 'the attachment'}.`)
+          }
+        } catch (error) {
+          // Removing the chip while the governed detach failed would tell the
+          // user the file is gone even though its staged copy still exists.
+          // Roll the UI back only in the same session and only if no newer
+          // logical chip with that id has appeared meanwhile.
+          if (
+            removed &&
+            originGatewayScope !== null &&
+            composerGatewayScope($connection.get()) === originGatewayScope &&
+            $activeSessionId.get() === activeSessionId &&
+            !$composerAttachments.get().some(attachment => attachment.id === removed.id)
+          ) {
+            addComposerAttachment(removed)
+          }
+
+          notifyError(error, t.composer.removeAttachment(removed?.label || 'attachment'))
+        }
       }
     },
-    [activeSessionId, requestGateway]
+    [activeSessionId, requestGateway, t.composer]
   )
 
   return {

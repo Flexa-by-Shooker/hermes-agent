@@ -1,6 +1,7 @@
 import { atom, computed } from 'nanostores'
 
 import { getProfiles, setApiRequestProfile, STARTUP_REQUEST_TIMEOUT_MS } from '@/hermes'
+import { exactConnectionProfile } from '@/lib/desktop-gateway-connection'
 import { queryClient } from '@/lib/query-client'
 import {
   arraysEqual,
@@ -11,8 +12,9 @@ import {
   storedStringArray,
   storedStringRecord
 } from '@/lib/storage'
-import { $gateway, ensureGatewayForProfile } from '@/store/gateway'
-import { setConnection } from '@/store/session'
+import { $gateway, ensureGatewayForProfile, gatewayMatchesConnection } from '@/store/gateway'
+import { $gatewaySwitching, wipeSessionListsForGatewaySwitch } from '@/store/gateway-switch'
+import { $connection, setConnection } from '@/store/session'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
 
@@ -191,6 +193,19 @@ export const $gatewaySwapTarget = atom<string | null>(null)
 
 let gatewaySwitch: Promise<void> | null = null
 
+function activeGatewayProfileIsVerified(profile: string): boolean {
+  const connection = $connection.get()
+  const gateway = $gateway.get()
+
+  return Boolean(
+    !$gatewaySwitching.get() &&
+    connection &&
+    gateway &&
+    exactConnectionProfile(connection) === profile &&
+    gatewayMatchesConnection(gateway, connection)
+  )
+}
+
 // Keep the renderer's $connection (mode / baseUrl / profile) in lockstep with
 // the profile the live gateway is now on. $connection seeds from the PRIMARY
 // (window) backend at boot and otherwise only refreshes on a sleep/wake
@@ -201,20 +216,20 @@ let gatewaySwitch: Promise<void> | null = null
 // instead of `image.attach_bytes`, handing the remote gateway a client-only
 // path it can't resolve ("image not found: C:\…"), while the /api/fs/* file
 // browser and /api/media fetches targeted the wrong machine (#46651).
-// Best-effort: a failed descriptor fetch leaves the prior connection intact for
-// boot/reconnect to resync.
-async function syncConnectionToActiveProfile(profile: string): Promise<void> {
+async function resolveConnectionForProfile(profile: string) {
   const getConnection = window.hermesDesktop?.getConnection
 
   if (!getConnection) {
-    return
+    throw new Error('Desktop cannot verify the selected Hermes profile.')
   }
 
-  try {
-    setConnection(await getConnection(profile))
-  } catch {
-    // Leave the prior connection in place; boot/reconnect resyncs it later.
+  const connection = await getConnection(profile)
+
+  if (exactConnectionProfile(connection) !== profile) {
+    throw new Error(`Hermes returned the wrong profile while switching to ${profile}.`)
   }
+
+  return connection
 }
 
 // Make `profile`'s backend the active gateway, lazily opening its socket if it
@@ -237,7 +252,7 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
 
   const target = normalizeProfileKey(profile)
 
-  if (normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
+  if (normalizeProfileKey($activeGatewayProfile.get()) === target && activeGatewayProfileIsVerified(target)) {
     return
   }
 
@@ -246,27 +261,65 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
   if (gatewaySwitch) {
     await gatewaySwitch.catch(() => undefined)
 
-    if (normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
+    if (normalizeProfileKey($activeGatewayProfile.get()) === target && activeGatewayProfileIsVerified(target)) {
       return
     }
   }
 
+  const previousProfile = normalizeProfileKey($activeGatewayProfile.get())
+  let transitionSafe = false
+
   $gatewaySwapTarget.set(target)
+  $gatewaySwitching.set(true)
+  wipeSessionListsForGatewaySwitch()
+  setConnection(null)
   gatewaySwitch = (async () => {
-    // ensureGatewayForProfile opens (or reuses) the target's socket and points
-    // the active gateway at it — without closing the profile you came from.
-    await ensureGatewayForProfile(target)
-    $activeGatewayProfile.set(target)
-    // The active backend just changed; resync $connection so remote-aware
-    // paths (image.attach_bytes vs image.attach, /api/fs/*, /api/media) follow.
-    await syncConnectionToActiveProfile(target)
+    try {
+      // ensureGatewayForProfile opens (or reuses) the target's socket and points
+      // the active gateway at it — without closing the profile you came from.
+      await ensureGatewayForProfile(target)
+      const connection = await resolveConnectionForProfile(target)
+      const gateway = $gateway.get()
+
+      if (!gateway || !gatewayMatchesConnection(gateway, connection)) {
+        throw new Error(`Hermes could not verify the active gateway for ${target}.`)
+      }
+
+      setConnection(connection)
+      $activeGatewayProfile.set(target)
+      transitionSafe = true
+      // The active backend just changed; resync $connection so remote-aware
+      // paths (image.attach_bytes vs image.attach, /api/fs/*, /api/media) follow.
+    } catch (error) {
+      try {
+        await ensureGatewayForProfile(previousProfile)
+        const rollbackConnection = await resolveConnectionForProfile(previousProfile)
+        const rollbackGateway = $gateway.get()
+
+        if (!rollbackGateway || !gatewayMatchesConnection(rollbackGateway, rollbackConnection)) {
+          throw new Error(`Hermes could not verify the rollback gateway for ${previousProfile}.`)
+        }
+
+        setConnection(rollbackConnection)
+        $activeGatewayProfile.set(previousProfile)
+        transitionSafe = true
+      } catch {
+        // Keep the descriptor null and the switch guard raised. Exposing the
+        // target gateway with the old descriptor would cross tenants.
+      }
+
+      throw error
+    }
   })()
 
   try {
     await gatewaySwitch
   } finally {
     gatewaySwitch = null
-    $gatewaySwapTarget.set(null)
+    if (transitionSafe) {
+      $gatewaySwitching.set(false)
+      $gatewaySwapTarget.set(null)
+    }
   }
 }
 

@@ -31,6 +31,7 @@ tests can patch ``time.time`` cleanly.
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 import threading
 import time
@@ -57,6 +58,17 @@ INTERNAL_PROVIDER = "server-internal"
 
 class TicketInvalid(Exception):
     """Ticket missing, expired, or already consumed."""
+
+
+def session_authority_id(*, user_id: str, provider: str, org_id: str = "") -> str:
+    """Return an opaque, stable id for one verified dashboard tenant."""
+    payload = "\0".join((
+        "hermes-dashboard-authority:v1",
+        provider,
+        org_id,
+        user_id,
+    )).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def mint_ticket(*, user_id: str, provider: str) -> str:

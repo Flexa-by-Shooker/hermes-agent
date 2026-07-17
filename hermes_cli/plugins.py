@@ -1316,6 +1316,13 @@ class PluginManager:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
         manifests: List[PluginManifest] = []
 
+        from hermes_cli.flexa_governed import (
+            governed_mode,
+            supervised_disclosure_mode,
+        )
+
+        _supervised_only = supervised_disclosure_mode() and not governed_mode()
+
         # 1. Bundled plugins (<repo>/plugins/<name>/)
         #
         # Repo-shipped plugins live next to hermes_cli/. Two layouts are
@@ -1329,20 +1336,23 @@ class PluginManager:
         # (plugins/memory/__init__.py, providers/__init__.py). ``platforms/``
         # is a category holding platform adapters (scanned one level deeper
         # below).
-        repo_plugins = get_bundled_plugins_dir()
-        logger.debug("Scanning bundled plugins: %s", repo_plugins)
-        bundled = self._scan_directory(
-            repo_plugins,
-            source="bundled",
-            skip_names={"memory", "context_engine", "platforms", "model-providers"},
-        )
-        logger.debug("  bundled (top-level): %d manifest(s)", len(bundled))
-        manifests.extend(bundled)
-        bundled_platforms = self._scan_directory(
-            repo_plugins / "platforms", source="bundled"
-        )
-        logger.debug("  bundled/platforms: %d manifest(s)", len(bundled_platforms))
-        manifests.extend(bundled_platforms)
+        if _supervised_only:
+            logger.info("Supervised disclosure mode: bundled plugins are disabled")
+        else:
+            repo_plugins = get_bundled_plugins_dir()
+            logger.debug("Scanning bundled plugins: %s", repo_plugins)
+            bundled = self._scan_directory(
+                repo_plugins,
+                source="bundled",
+                skip_names={"memory", "context_engine", "platforms", "model-providers"},
+            )
+            logger.debug("  bundled (top-level): %d manifest(s)", len(bundled))
+            manifests.extend(bundled)
+            bundled_platforms = self._scan_directory(
+                repo_plugins / "platforms", source="bundled"
+            )
+            logger.debug("  bundled/platforms: %d manifest(s)", len(bundled_platforms))
+            manifests.extend(bundled_platforms)
 
         # 2. User plugins (~/.hermes/plugins/)
         user_dir = get_hermes_home() / "plugins"
@@ -1907,8 +1917,38 @@ class PluginManager:
         are reused.  All injected context is ephemeral — never
         persisted to session DB.
         """
+        from hermes_cli.flexa_governed import (
+            disclosure_boundary_mode as _flexa_disclosure_boundary_mode,
+            governed_mode as _flexa_governed_mode,
+        )
+
+        _governed = _flexa_governed_mode()
+        _disclosure_boundary = _flexa_disclosure_boundary_mode()
+        _governed_disclosure_hooks = {
+            "pre_llm_call": "_pre_llm_call",
+            "transform_llm_output": "_transform_llm_output",
+        }
+        if (
+            _governed
+            and hook_name not in {"pre_tool_call", "post_tool_call"}
+            and hook_name not in _governed_disclosure_hooks
+        ):
+            return []
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
+        if _disclosure_boundary and hook_name in _governed_disclosure_hooks:
+            expected_name = _governed_disclosure_hooks[hook_name]
+            callbacks = [
+                callback
+                for callback in callbacks
+                if getattr(callback, "__module__", "")
+                == "hermes_plugins.flexa_disclosure_boundary"
+                and getattr(callback, "__name__", "") == expected_name
+            ]
+            if len(callbacks) != 1:
+                raise RuntimeError(
+                    "Flexa disclosure hook is missing or ambiguous: " + hook_name
+                )
         results: List[Any] = []
         for cb in callbacks:
             try:

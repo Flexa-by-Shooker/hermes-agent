@@ -475,6 +475,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if _ext_mem_block:
                 volatile_parts.append(_ext_mem_block)
         except Exception:
+            from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+            if _flexa_governed_mode():
+                raise
             pass
 
     from hermes_time import now as _hermes_now

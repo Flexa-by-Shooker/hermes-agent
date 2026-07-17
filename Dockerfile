@@ -1,4 +1,4 @@
-FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df22866bd7857e5d304b67a564f4feab6ac22044dde719b AS uv_source
+FROM ghcr.io/astral-sh/uv:0.11.29-python3.13-trixie@sha256:d880a6830733cadff8d92e4f7fda20d9a23985f7c198183ef7e5f86bea170cf8 AS uv_source
 # Node 22 LTS source stage. Debian trixie's bundled nodejs is pinned to 20.x
 # which reached EOL in April 2026 — we copy node + npm + corepack from the
 # upstream node:22 image instead so we can stay on a supported LTS without
@@ -7,7 +7,22 @@ FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df228
 # our Debian 13 (trixie, glibc 2.41) runtime.  Bumping to a new Node major
 # is a one-line ARG change; see #4977.
 FROM node:22-bookworm-slim@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac43b1c15a689c029c732 AS node_source
-FROM debian:13.4
+# Replace the npm tree bundled in the pinned Node image with an independently
+# checksum-locked release. npm 11.18.0 carries sigstore 4.1.1 and picomatch
+# 4.0.4, closing the fixable HIGH findings in the copied npm installation.
+ADD --checksum=sha256:73f6155215ebabf4ed96dca1f567c2372cc713c33af2e5b9b62fde4e92373e2e https://registry.npmjs.org/npm/-/npm-11.18.0.tgz /tmp/npm.tgz
+RUN set -eu; \
+    printf '%s  %s\n' '73f6155215ebabf4ed96dca1f567c2372cc713c33af2e5b9b62fde4e92373e2e' /tmp/npm.tgz | sha256sum -c -; \
+    rm -rf /usr/local/lib/node_modules/npm; \
+    mkdir -p /usr/local/lib/node_modules/npm; \
+    tar -xzf /tmp/npm.tgz -C /usr/local/lib/node_modules/npm --strip-components=1; \
+    test "$(node -p 'require("/usr/local/lib/node_modules/npm/package.json").version')" = '11.18.0'; \
+    test "$(node -p 'require("/usr/local/lib/node_modules/npm/node_modules/sigstore/package.json").version')" = '4.1.1'; \
+    test "$(node -p 'require("/usr/local/lib/node_modules/npm/node_modules/tinyglobby/node_modules/picomatch/package.json").version')" = '4.0.4'; \
+    rm /tmp/npm.tgz
+
+FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da
+ARG TARGETARCH
 
 # Disable Python stdout buffering to ensure logs are printed immediately.
 # Do not write .pyc files at runtime: /opt/hermes is immutable in the
@@ -51,7 +66,6 @@ RUN apt-get update && \
 # `.sha256` files from the corresponding release and update the ARGs. The
 # checksum lookup happens during build, so a compromised release artifact
 # fails the build loudly instead of silently producing a tampered image.
-ARG TARGETARCH
 ARG S6_OVERLAY_VERSION=3.2.3.0
 ARG S6_OVERLAY_NOARCH_SHA256=b720f9d9340efc8bb07528b9743813c836e4b02f8693d90241f047998b4c53cf
 ARG S6_OVERLAY_X86_64_SHA256=a93f02882c6ed46b21e7adb5c0add86154f01236c93cd82c7d682722e8840563
@@ -138,6 +152,23 @@ ENV npm_config_install_links=false
 RUN npm install --prefer-offline --no-audit && \
     npx playwright install --with-deps chromium --only-shell && \
     npm cache clean --force
+
+# Debian Snapshot hotfix applied after Playwright's own APT transaction so the
+# final filesystem is provably the fixed amd64 libcap2 package. The governed
+# runtime-image source lock supports linux/amd64 only; a future multi-arch
+# build must add a separately hashed package for each architecture.
+ADD --checksum=sha256:f8db64b636eb3e4f805b3f5f62cc32b99beec92df49920a9c24d34902bba0ce9 https://snapshot.debian.org/file/9d57cee3a8050e82ebd1ba078b5767a321bbf5ad /tmp/libcap2.deb
+RUN set -eu; \
+    test "${TARGETARCH:-amd64}" = 'amd64'; \
+    printf '%s  %s\n' 'f8db64b636eb3e4f805b3f5f62cc32b99beec92df49920a9c24d34902bba0ce9' /tmp/libcap2.deb | sha256sum -c -; \
+    test "$(dpkg-deb -f /tmp/libcap2.deb Package)" = 'libcap2'; \
+    test "$(dpkg-deb -f /tmp/libcap2.deb Architecture)" = 'amd64'; \
+    test "$(dpkg-deb -f /tmp/libcap2.deb Version)" = '1:2.75-10+deb13u1'; \
+    dpkg -i /tmp/libcap2.deb; \
+    test "$(dpkg-query -W -f='${Architecture}' libcap2)" = 'amd64'; \
+    test "$(dpkg-query -W -f='${Version}' libcap2)" = '1:2.75-10+deb13u1'; \
+    test -z "$(dpkg --audit)"; \
+    rm /tmp/libcap2.deb
 
 # ---------- Layer-cached Python dependency install ----------
 # Copy only pyproject.toml + uv.lock so the Python dep resolve + wheel

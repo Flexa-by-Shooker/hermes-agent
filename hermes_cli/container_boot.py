@@ -123,6 +123,14 @@ def reconcile_profile_gateways(
         One :class:`ReconcileAction` per profile, in this order:
         ``default`` first, then named profiles in directory order.
     """
+    from hermes_cli.flexa_governed import governed_mode, managed_profiles
+    if governed_mode():
+        # The Flexa launcher owns one tenant gateway and its signed roster.
+        # Never register an unmanaged root/default service and never scan SOUL
+        # markers for attacker-created profile directories.
+        managed_profiles()
+        return []
+
     actions: list[ReconcileAction] = []
 
     # Default profile — always register, even if nothing has ever

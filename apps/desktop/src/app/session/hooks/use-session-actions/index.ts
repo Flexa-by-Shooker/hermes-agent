@@ -5,8 +5,10 @@ import type { NavigateFunction } from 'react-router-dom'
 import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { type GatewayRequest, pinGatewayRequest } from '@/lib/gateway-request'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearQueuedPrompts } from '@/store/composer-queue'
+import { $tenantRuntimeEpoch } from '@/store/gateway-switch'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
@@ -71,7 +73,7 @@ interface SessionActionsOptions {
   ensureSessionState: (sessionId: string, storedSessionId?: string | null) => ClientSessionState
   getRouteToken: () => string
   navigate: NavigateFunction
-  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  requestGateway: GatewayRequest
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionId: string | null
   selectedStoredSessionIdRef: MutableRefObject<string | null>
@@ -163,6 +165,8 @@ export function useSessionActions({
         // a backend resolves its own launch profile to None (_profile_home).
         const newChatProfile = $newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get())
         await ensureGatewayProfile(newChatProfile)
+        const tenantEpoch = $tenantRuntimeEpoch.get()
+        const originRequest = pinGatewayRequest(requestGateway)
         const cwd = $currentCwd.get().trim() || workspaceCwdForNewSession()
         // The composer's model/effort/fast is sticky UI state ($currentModel,
         // $currentProvider, $currentReasoningEffort, $currentFastMode). Ship it
@@ -174,7 +178,7 @@ export function useSessionActions({
         const uiEffort = $currentReasoningEffort.get().trim()
         const uiFast = $currentFastMode.get()
 
-        const created = await requestGateway<SessionCreateResponse>('session.create', {
+        const created = await originRequest<SessionCreateResponse>('session.create', {
           cols: 96,
           source: 'desktop',
           ...(cwd && { cwd }),
@@ -189,9 +193,10 @@ export function useSessionActions({
         if (
           activeSessionIdRef.current !== startingActiveSessionId ||
           selectedStoredSessionIdRef.current !== startingStoredSessionId ||
+          $tenantRuntimeEpoch.get() !== tenantEpoch ||
           getRouteToken() !== startingRouteToken
         ) {
-          await requestGateway('session.close', { session_id: created.session_id }).catch(() => undefined)
+          await originRequest('session.close', { session_id: created.session_id }).catch(() => undefined)
 
           return null
         }
@@ -226,7 +231,7 @@ export function useSessionActions({
         // User may have armed YOLO on the new-chat draft before the runtime
         // session existed — apply it to the freshly created session.
         if (yoloArmed) {
-          await setSessionYolo(requestGateway, created.session_id, true).catch(() => undefined)
+          await setSessionYolo(originRequest, created.session_id, true).catch(() => undefined)
         }
 
         return created.session_id
@@ -281,9 +286,12 @@ export function useSessionActions({
     async (storedSessionId: string, replaceRoute = false) => {
       const requestId = resumeRequestRef.current + 1
       resumeRequestRef.current = requestId
+      let resumeTenantEpoch = $tenantRuntimeEpoch.get()
 
       const isCurrentResume = () =>
-        resumeRequestRef.current === requestId && selectedStoredSessionIdRef.current === storedSessionId
+        resumeRequestRef.current === requestId &&
+        selectedStoredSessionIdRef.current === storedSessionId &&
+        $tenantRuntimeEpoch.get() === resumeTenantEpoch
 
       // Paint the click before the profile-resolve / gateway-swap awaits below,
       // so there's zero dead air: highlight the row instantly (the sidebar reads
@@ -347,11 +355,14 @@ export function useSessionActions({
       const storedForProfile = await resolveStoredSession(storedSessionId)
       const sessionProfile = storedForProfile?.profile
 
-      if (resumeRequestRef.current !== requestId) {
+      if (!isCurrentResume()) {
         return
       }
 
       await ensureGatewayProfile(sessionProfile)
+      resumeTenantEpoch = $tenantRuntimeEpoch.get()
+      setSelectedStoredSessionId(storedSessionId)
+      selectedStoredSessionIdRef.current = storedSessionId
 
       // Re-check after the profile-resolve / gateway-swap awaits above: the
       // cache may have changed, and takeWarmCache re-validates belongs-to and
@@ -768,7 +779,13 @@ export function useSessionActions({
 
       try {
         await ensureGatewayProfile(profile)
+        const tenantEpoch = $tenantRuntimeEpoch.get()
         const { messages } = await getSessionMessages(storedSessionId, profile)
+
+        if ($tenantRuntimeEpoch.get() !== tenantEpoch) {
+          return false
+        }
+
         const branchMessages = toBranchMessages(toChatMessages(messages))
 
         if (!branchMessages.length) {
@@ -792,8 +809,22 @@ export function useSessionActions({
       clearNotifications()
 
       const removed = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+      const tenantEpoch = $tenantRuntimeEpoch.get()
+      const actionIsCurrent = () => $tenantRuntimeEpoch.get() === tenantEpoch
       const wasSelected = selectedStoredSessionId === storedSessionId
       const closingRuntimeId = wasSelected ? activeSessionId : null
+      let originRequest: ReturnType<typeof pinGatewayRequest> | null = null
+
+      if (closingRuntimeId) {
+        try {
+          originRequest = pinGatewayRequest(requestGateway)
+        } catch (err) {
+          notifyError(err, copy.deleteFailed)
+
+          return
+        }
+      }
+
       const previousMessages = $messages.get()
       const previousPinned = $pinnedSessionIds.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
@@ -817,17 +848,35 @@ export function useSessionActions({
       }
 
       try {
-        if (closingRuntimeId) {
-          await requestGateway('session.close', { session_id: closingRuntimeId }).catch(() => undefined)
+        // Start both origin-bound mutations before yielding. In particular,
+        // never wait for session.close and then route the REST deletion through
+        // whichever tenant happens to be active by that later time.
+        const closePromise =
+          closingRuntimeId && originRequest
+            ? originRequest('session.close', { session_id: closingRuntimeId }).catch(() => undefined)
+            : Promise.resolve()
+
+        const deletePromise = deleteSession(
+          storedSessionId,
+          removed?.profile ?? normalizeProfileKey($activeGatewayProfile.get())
+        )
+
+        await Promise.all([closePromise, deletePromise])
+
+        if (!actionIsCurrent()) {
+          return
         }
 
-        await deleteSession(storedSessionId, removed?.profile)
         clearQueuedPrompts(storedSessionId)
 
         if (closingRuntimeId) {
           clearQueuedPrompts(closingRuntimeId)
         }
       } catch (err) {
+        if (!actionIsCurrent()) {
+          return
+        }
+
         if (removed) {
           setSessions(prev => [removed, ...prev])
           setSessionsTotal(prev => prev + 1)
@@ -880,6 +929,8 @@ export function useSessionActions({
       clearNotifications()
 
       const archived = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+      const tenantEpoch = $tenantRuntimeEpoch.get()
+      const actionIsCurrent = () => $tenantRuntimeEpoch.get() === tenantEpoch
       const wasSelected = selectedStoredSessionId === storedSessionId
       const previousPinned = $pinnedSessionIds.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
@@ -900,7 +951,16 @@ export function useSessionActions({
       }
 
       try {
-        await setSessionArchived(storedSessionId, true, archived?.profile)
+        await setSessionArchived(
+          storedSessionId,
+          true,
+          archived?.profile ?? normalizeProfileKey($activeGatewayProfile.get())
+        )
+
+        if (!actionIsCurrent()) {
+          return
+        }
+
         // A sidebar refresh can race the optimistic removal while the PATCH is
         // in flight and briefly reinsert the still-unarchived backend row. Win
         // that race after the mutation succeeds so right-click → Archive does
@@ -909,6 +969,10 @@ export function useSessionActions({
         $pinnedSessionIds.set($pinnedSessionIds.get().filter(id => id !== storedSessionId && id !== archivedPinId))
         notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
       } catch (err) {
+        if (!actionIsCurrent()) {
+          return
+        }
+
         if (archived) {
           setSessions(prev => [archived, ...prev.filter(session => !sessionMatchesStoredId(session, storedSessionId))])
           setSessionsTotal(prev => prev + 1)

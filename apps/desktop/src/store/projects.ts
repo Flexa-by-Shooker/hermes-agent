@@ -3,15 +3,16 @@ import { atom } from 'nanostores'
 import { liveSessionProjectId, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
 import type { HermesGitBranch } from '@/global'
 import { translateNow } from '@/i18n'
+import { composerGatewayScope } from '@/lib/composer-scope'
 import { desktopDefaultCwd, selectDesktopPaths, writeDesktopFileText } from '@/lib/desktop-fs'
 import { desktopGit } from '@/lib/desktop-git'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
-import { persistentAtom } from '@/lib/persisted'
+import { readKey, writeKey } from '@/lib/storage'
 import { activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
 import { notify } from '@/store/notifications'
 import { requestFreshSession } from '@/store/profile'
-import { $selectedStoredSessionId, $sessions, workspaceCwdForNewSession } from '@/store/session'
+import { $connection, $selectedStoredSessionId, $sessions, workspaceCwdForNewSession } from '@/store/session'
 import type { ProjectInfo, ProjectsPayload } from '@/types/hermes'
 
 // First-class, per-profile Projects (named, multi-folder workspaces). State is
@@ -105,11 +106,45 @@ export const $reposScanning = atom(false)
 // chats land there, exactly as selecting a profile does.
 export const ALL_PROJECTS = '__all_projects__'
 
-const PROJECT_SCOPE_KEY = 'hermes.desktop.projectScope'
+const PROJECT_SCOPE_KEY = 'hermes.desktop.projectScope.v3'
+const projectScopeStorageKey = (scope: string | null): string | null =>
+  scope ? `${PROJECT_SCOPE_KEY}.${encodeURIComponent(scope)}` : null
 
-export const $projectScope = persistentAtom<string>(PROJECT_SCOPE_KEY, ALL_PROJECTS, {
-  decode: raw => raw || ALL_PROJECTS,
-  encode: value => value || ALL_PROJECTS
+let projectCacheScope = composerGatewayScope($connection.get())
+let projectHydratedScope: string | null = null
+
+const loadProjectScope = (scope: string | null): string => {
+  const key = projectScopeStorageKey(scope)
+
+  return (key ? readKey(key) : null)?.trim() || ALL_PROJECTS
+}
+
+export const $projectScope = atom<string>(loadProjectScope(projectCacheScope))
+
+$projectScope.subscribe(value => {
+  const key = projectScopeStorageKey(projectCacheScope)
+
+  if (key) {
+    writeKey(key, value || ALL_PROJECTS)
+  }
+})
+
+$connection.subscribe(connection => {
+  const nextScope = composerGatewayScope(connection)
+
+  if (nextScope === projectCacheScope) {
+    return
+  }
+
+  projectCacheScope = nextScope
+  projectHydratedScope = null
+  $projects.set([])
+  $activeProjectId.set(null)
+  $projectTree.set([])
+  $projectsRpcAvailable.set(null)
+  $removedSessionIds.set(new Set())
+  $projectScope.set(loadProjectScope(nextScope))
+  $projectTreeLoading.set(Boolean(nextScope))
 })
 
 // Enter a project: scope the sidebar to it and make it the active project
@@ -137,6 +172,15 @@ export function exitProjectScope(): void {
 // drifted into. Outside a project it falls back to the plain default (detached),
 // so a bare new chat shows no branch.
 export function resolveNewSessionCwd(): string {
+  const liveScope = composerGatewayScope($connection.get())
+
+  if (
+    liveScope &&
+    (liveScope !== projectCacheScope || projectHydratedScope !== liveScope || $projectTreeLoading.get())
+  ) {
+    return ''
+  }
+
   const scope = $projectScope.get()
 
   if (scope !== ALL_PROJECTS) {
@@ -235,11 +279,21 @@ function applyPayload(payload: ProjectsPayload): void {
 // Pull the full project list + active pointer. Best-effort: a failure (gateway
 // not up yet) leaves the cached atoms intact so the sidebar doesn't flicker.
 export async function refreshProjects(): Promise<void> {
+  const requestScope = composerGatewayScope($connection.get())
+
   try {
-    applyPayload(await gatewayRequest<ProjectsPayload>('projects.list'))
+    const payload = await gatewayRequest<ProjectsPayload>('projects.list')
+
+    if (requestScope !== composerGatewayScope($connection.get()) || requestScope !== projectCacheScope) {
+      return
+    }
+
+    applyPayload(payload)
     markProjectsRpcSuccess()
   } catch (err) {
-    markProjectsRpcFailure(err)
+    if (requestScope === composerGatewayScope($connection.get()) && requestScope === projectCacheScope) {
+      markProjectsRpcFailure(err)
+    }
     // Backend may not be ready; keep the last known list.
   }
 }
@@ -254,10 +308,15 @@ interface ProjectTreePayload {
 // sessions + the scoped-session-id set). Best-effort: a failure leaves the
 // cached tree intact so the sidebar doesn't flicker.
 export async function refreshProjectTree(): Promise<void> {
+  const requestScope = composerGatewayScope($connection.get())
   $projectTreeLoading.set(true)
 
   try {
     const res = await gatewayRequest<ProjectTreePayload>('projects.tree', { preview_limit: 3 })
+
+    if (requestScope !== composerGatewayScope($connection.get()) || requestScope !== projectCacheScope) {
+      return
+    }
     // The flat Sessions list shows everything; scoped ids are only used here to
     // reconcile the optimistic eviction layer against what the server still lists.
     const scoped = new Set(res.scoped_session_ids ?? [])
@@ -279,11 +338,16 @@ export async function refreshProjectTree(): Promise<void> {
     }
 
     markProjectsRpcSuccess()
+    projectHydratedScope = requestScope
   } catch (err) {
-    markProjectsRpcFailure(err)
+    if (requestScope === composerGatewayScope($connection.get()) && requestScope === projectCacheScope) {
+      markProjectsRpcFailure(err)
+    }
     // Backend may not be ready; keep the last known tree.
   } finally {
-    $projectTreeLoading.set(false)
+    if (requestScope === composerGatewayScope($connection.get()) && requestScope === projectCacheScope) {
+      $projectTreeLoading.set(false)
+    }
   }
 }
 

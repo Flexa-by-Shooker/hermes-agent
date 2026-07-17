@@ -1,5 +1,6 @@
 import { atom } from 'nanostores'
 
+import { registerTenantRuntimeReset } from '@/lib/tenant-runtime-reset'
 import { normalize } from '@/lib/text'
 import { $petInfo, type PetInfo, petProfile, setPetInfo } from '@/store/pet'
 
@@ -90,6 +91,8 @@ export function resetPetGallery(): void {
   $petGalleryError.set(null)
   $petBusy.set(null)
 }
+
+registerTenantRuntimeReset(resetPetGallery)
 
 export function loadPetThumb(request: GatewayRequest, slug: string, url?: string): Promise<string | null> {
   let pending = thumbCache.get(slug)

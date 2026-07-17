@@ -21,6 +21,7 @@ import { storedSessionIdForNotification } from '../lib/session-ids'
 import { isMessagingSource } from '../lib/session-source'
 import { latestSessionTodos } from '../lib/todos'
 import { setCronFocusJobId } from '../store/cron'
+import { $tenantRuntimeEpoch } from '../store/gateway-switch'
 import {
   $fileBrowserOpen,
   $panesFlipped,
@@ -36,7 +37,7 @@ import {
   SIDEBAR_MAX_WIDTH,
   unpinSession
 } from '../store/layout'
-import { respondToApprovalAction } from '../store/native-notifications'
+import { notificationFocusMatchesActiveScope, respondToApprovalAction } from '../store/native-notifications'
 import { $paneOpen } from '../store/panes'
 import { setPetActivity } from '../store/pet'
 import { setPetScale } from '../store/pet-gallery'
@@ -306,9 +307,9 @@ export function DesktopController() {
   // resumes a non-existent stored session ("session not found") and strands the
   // user. Translate runtime -> stored before navigating.
   useEffect(() => {
-    const unsubscribe = window.hermesDesktop?.onFocusSession?.(sessionId => {
-      if (sessionId) {
-        navigate(sessionRoute(storedSessionIdForNotification(sessionId, runtimeIdByStoredSessionIdRef.current)))
+    const unsubscribe = window.hermesDesktop?.onFocusSession?.(target => {
+      if (notificationFocusMatchesActiveScope(target)) {
+        navigate(sessionRoute(storedSessionIdForNotification(target.sessionId!, runtimeIdByStoredSessionIdRef.current)))
       }
     })
 
@@ -317,8 +318,8 @@ export function DesktopController() {
 
   // Notification action button (Approve/Reject) — resolve in place, no navigation.
   useEffect(() => {
-    const unsubscribe = window.hermesDesktop?.onNotificationAction?.(({ actionId, sessionId }) => {
-      void respondToApprovalAction(sessionId ?? null, actionId)
+    const unsubscribe = window.hermesDesktop?.onNotificationAction?.(({ actionId, actionNonce, sessionId }) => {
+      void respondToApprovalAction(sessionId ?? null, actionId, actionNonce)
     })
 
     return () => unsubscribe?.()
@@ -500,6 +501,8 @@ export function DesktopController() {
         return
       }
 
+      const tenantEpoch = $tenantRuntimeEpoch.get()
+
       const storedProfile = $sessions
         .get()
         .find(session => session.id === storedSessionId || session._lineage_root_id === storedSessionId)?.profile
@@ -507,6 +510,15 @@ export function DesktopController() {
       for (let index = 0; index < Math.max(1, attempts); index += 1) {
         try {
           const latest = await getSessionMessages(storedSessionId, storedProfile)
+
+          if (
+            $tenantRuntimeEpoch.get() !== tenantEpoch ||
+            selectedStoredSessionIdRef.current !== storedSessionId ||
+            activeSessionIdRef.current !== runtimeSessionId
+          ) {
+            return
+          }
+
           const messages = toChatMessages(latest.messages)
           updateSessionState(
             runtimeSessionId,
@@ -539,6 +551,10 @@ export function DesktopController() {
 
         if (index < attempts - 1) {
           await new Promise(resolve => window.setTimeout(resolve, 250))
+
+          if ($tenantRuntimeEpoch.get() !== tenantEpoch) {
+            return
+          }
         }
       }
     },
@@ -559,8 +575,18 @@ export function DesktopController() {
       return
     }
 
+    const tenantEpoch = $tenantRuntimeEpoch.get()
+
     try {
       const latest = await getSessionMessages(storedSessionId, stored.profile)
+
+      if (
+        $tenantRuntimeEpoch.get() !== tenantEpoch ||
+        selectedStoredSessionIdRef.current !== storedSessionId ||
+        activeSessionIdRef.current !== runtimeSessionId
+      ) {
+        return
+      }
       const signatureKey = `${stored.profile ?? 'default'}:${storedSessionId}`
       const sig = sessionMessagesSignature(latest.messages)
 
@@ -673,6 +699,7 @@ export function DesktopController() {
 
   const composer = useComposerActions({
     activeSessionId,
+    composerSessionKey: selectedStoredSessionId || activeSessionId,
     currentCwd,
     requestGateway
   })

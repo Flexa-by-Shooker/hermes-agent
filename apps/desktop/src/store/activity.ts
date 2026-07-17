@@ -28,6 +28,10 @@ export function upsertDesktopActionTask(status: ActionStatusResponse): void {
   $desktopActionTasks.set(prune({ ...$desktopActionTasks.get(), [status.name]: { status, updatedAt: Date.now() } }))
 }
 
+export function clearDesktopActionTasks(): void {
+  $desktopActionTasks.set({})
+}
+
 export function buildRailTasks(
   workingSessionIds: readonly string[],
   sessions: readonly SessionInfo[],

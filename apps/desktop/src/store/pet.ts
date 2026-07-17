@@ -1,6 +1,7 @@
 import { atom, computed } from 'nanostores'
 
 import { persistBoolean, storedBoolean } from '@/lib/storage'
+import { registerTenantRuntimeReset } from '@/lib/tenant-runtime-reset'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $busy } from '@/store/session'
 
@@ -121,6 +122,16 @@ export const clearPetUnread = () => $petUnread.set(false)
 export const setPetActivity = (next: Partial<PetActivity>) => $petActivity.set({ ...$petActivity.get(), ...next })
 
 let flashTimer: ReturnType<typeof setTimeout> | undefined
+
+function resetPetRuntimeForTenantSwitch(): void {
+  clearTimeout(flashTimer)
+  flashTimer = undefined
+  $petInfo.set({ enabled: false })
+  $petActivity.set({})
+  $petUnread.set(false)
+}
+
+registerTenantRuntimeReset(resetPetRuntimeForTenantSwitch)
 
 /** Fire a transient reaction beat (error / celebrate / justCompleted) that
  *  decays back to the steady state after `ms`.

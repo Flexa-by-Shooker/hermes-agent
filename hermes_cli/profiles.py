@@ -32,7 +32,11 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional, Tuple
 
-from agent.skill_utils import is_excluded_skill_path
+from agent.skill_utils import (
+    get_external_skills_dirs_for_home,
+    is_excluded_skill_path,
+    parse_frontmatter,
+)
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -729,15 +733,15 @@ def _check_gateway_running(profile_dir: Path) -> bool:
         return False
 
 
-# In-process cache for skill counts. Walking ``skills_dir.rglob("SKILL.md")``
-# recurses the entire skill tree (each skill carries references/scripts/assets
-# sub-trees); the default profile alone has ~270 skills, and ``list_profiles``
-# calls this for EVERY profile (16+), so an uncached scan costs ~6s — long
-# enough that the desktop's per-request backend calls time out and the sidebar
-# renders "全部智能体 0". We cache the count keyed by the skills dir, invalidated
-# when the dir tree's signature (skills_dir + immediate category dirs mtimes)
-# changes (catches skill add/remove) or after a short TTL (catches deep edits).
-_SKILL_COUNT_CACHE: dict[str, tuple[float, float, int]] = {}
+# In-process cache for effective skill counts. Walking every local and external
+# root recurses each skill tree (whose packages carry references/scripts/assets
+# sub-trees); ``list_profiles`` does this for every profile, so an uncached scan
+# can make desktop requests time out. The cache signature includes every root
+# and its immediate category-directory mtimes, with a short TTL for deep edits.
+_SKILL_COUNT_CACHE: dict[
+    str, tuple[tuple[tuple[str, float], ...], float, int]
+] = {}
+_SKILL_ROOT_NAMES_CACHE: dict[str, tuple[float, float, frozenset[str]]] = {}
 _SKILL_COUNT_TTL_SECONDS = 30.0
 
 
@@ -768,14 +772,59 @@ def _skills_dir_signature(skills_dir: Path) -> float:
     return sig
 
 
+def _skill_names_for_root(root: Path) -> frozenset[str]:
+    """Return logical skill names for one root, sharing scans across profiles."""
+    signature = _skills_dir_signature(root)
+    now = time.time()
+    cached = _SKILL_ROOT_NAMES_CACHE.get(str(root))
+    if (
+        cached is not None
+        and cached[0] == signature
+        and (now - cached[1]) < _SKILL_COUNT_TTL_SECONDS
+    ):
+        return cached[2]
+
+    names: set[str] = set()
+    for md in root.rglob("SKILL.md"):
+        if is_excluded_skill_path(md):
+            continue
+        try:
+            frontmatter, _body = parse_frontmatter(
+                md.read_text(encoding="utf-8")[:4000]
+            )
+        except (OSError, UnicodeError):
+            continue
+        name = str(frontmatter.get("name") or md.parent.name).strip()
+        if name:
+            names.add(name)
+    result = frozenset(names)
+    _SKILL_ROOT_NAMES_CACHE[str(root)] = (signature, now, result)
+    return result
+
+
 def _count_skills(profile_dir: Path) -> int:
-    """Count installed skills in a profile (cached by skills-dir signature)."""
-    skills_dir = profile_dir / "skills"
-    if not skills_dir.is_dir():
+    """Count the effective local-plus-external skill union for a profile."""
+    skill_roots = [profile_dir / "skills"]
+    skill_roots.extend(get_external_skills_dirs_for_home(profile_dir))
+
+    unique_roots: list[Path] = []
+    seen_roots: set[Path] = set()
+    for root in skill_roots:
+        try:
+            resolved = root.resolve()
+        except OSError:
+            resolved = root
+        if resolved in seen_roots or not resolved.is_dir():
+            continue
+        seen_roots.add(resolved)
+        unique_roots.append(resolved)
+    if not unique_roots:
         return 0
 
-    key = str(skills_dir)
-    signature = _skills_dir_signature(skills_dir)
+    key = str(profile_dir)
+    signature = tuple(
+        (str(root), _skills_dir_signature(root)) for root in unique_roots
+    )
     now = time.time()
     cached = _SKILL_COUNT_CACHE.get(key)
     if (
@@ -785,11 +834,13 @@ def _count_skills(profile_dir: Path) -> int:
     ):
         return cached[2]
 
-    count = 0
-    for md in skills_dir.rglob("SKILL.md"):
-        if is_excluded_skill_path(md):
-            continue
-        count += 1
+    # The runtime scans local first, then external roots, and the first skill
+    # with a given frontmatter name wins. Use that same logical identity here;
+    # directory names are only the fallback when a manifest omits ``name``.
+    skill_names: set[str] = set()
+    for root in unique_roots:
+        skill_names.update(_skill_names_for_root(root))
+    count = len(skill_names)
     _SKILL_COUNT_CACHE[key] = (signature, now, count)
     return count
 
@@ -849,6 +900,9 @@ def write_profile_meta(
     fields preserve existing values. Creates the file if missing.
     Profile directory itself must exist.
     """
+    from hermes_cli.flexa_governed import deny_protected_mutation
+
+    deny_protected_mutation()
     if not profile_dir.is_dir():
         raise FileNotFoundError(f"profile directory does not exist: {profile_dir}")
     import yaml
@@ -876,6 +930,29 @@ def write_profile_meta(
 
 def list_profiles() -> List[ProfileInfo]:
     """Return info for all profiles, including the default."""
+    from hermes_cli.flexa_governed import governed_mode, managed_profiles, verified_profile_home
+
+    if governed_mode():
+        governed: List[ProfileInfo] = []
+        for item in managed_profiles():
+            entry = verified_profile_home(item.slug)
+            model, provider = _read_config_model(entry)
+            governed.append(ProfileInfo(
+                name=item.slug,
+                path=entry,
+                # Presentation only: the signed primary named profile is the
+                # single home profile. The unmanaged root default never resolves.
+                is_default=item.primary,
+                gateway_running=_check_gateway_running(entry),
+                model=model,
+                provider=provider,
+                has_env=False,
+                skill_count=_count_skills(entry),
+                description=item.description,
+                description_auto=False,
+            ))
+        return governed
+
     profiles = []
     wrapper_dir = _get_wrapper_dir()
 
@@ -966,6 +1043,24 @@ def profiles_to_serve(multiplex: bool) -> List[Tuple[str, Path]]:
     The returned ``hermes_home`` is the path to pass to
     ``set_hermes_home_override`` when scoping a turn to that profile.
     """
+    from hermes_cli.flexa_governed import governed_mode, managed_profiles, verified_profile_home
+
+    if governed_mode():
+        governed = managed_profiles()
+        if multiplex:
+            return [(item.slug, verified_profile_home(item.slug)) for item in governed]
+        if len(governed) == 1:
+            selected = governed[0]
+        else:
+            active_managed = get_active_profile_name() or ""
+            matches = [item for item in governed if item.slug == active_managed]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    "governed multi-profile gateway requires multiplex mode or one active managed profile"
+                )
+            selected = matches[0]
+        return [(selected.slug, verified_profile_home(selected.slug))]
+
     active = get_active_profile_name() or "default"
     if not multiplex:
         return [(active, get_profile_dir(active))]
@@ -1023,6 +1118,9 @@ def create_profile(
     Path
         The newly created profile directory.
     """
+    from hermes_cli.flexa_governed import deny_protected_mutation
+
+    deny_protected_mutation()
     if no_skills and (clone_from is not None or clone_config or clone_all):
         raise ValueError(
             "--no-skills is mutually exclusive with --clone / --clone-from / --clone-all "
@@ -1468,6 +1566,9 @@ def delete_profile(name: str, yes: bool = False) -> Path:
 
     Returns the path that was removed.
     """
+    from hermes_cli.flexa_governed import deny_protected_mutation
+
+    deny_protected_mutation()
     canon = normalize_profile_name(name)
     validate_profile_name(canon)
 
@@ -2152,6 +2253,9 @@ def rename_profile(old_name: str, new_name: str) -> Path:
 
     Returns the new profile directory.
     """
+    from hermes_cli.flexa_governed import deny_protected_mutation
+
+    deny_protected_mutation()
     old_canon = normalize_profile_name(old_name)
     new_canon = normalize_profile_name(new_name)
     validate_profile_name(old_canon)

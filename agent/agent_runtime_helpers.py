@@ -27,6 +27,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -1435,6 +1436,10 @@ def dump_api_request_debug(
     like timeout). Intended for debugging provider-side 4xx failures where
     retries are not useful.
     """
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode():
+        return None
     try:
         body = copy.deepcopy(api_kwargs)
         body.pop("timeout", None)
@@ -1788,6 +1793,12 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # ── Determine api_mode if not provided ──
     if not api_mode:
         api_mode = determine_api_mode(new_provider, base_url)
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode() and api_mode == "codex_app_server":
+        from agent.flexa_enforcement import FlexaEnforcementError
+
+        raise FlexaEnforcementError("runtime transport is unavailable in governed mode")
 
     # Defense-in-depth: ensure OpenCode base_url doesn't carry a trailing
     # /v1 into the anthropic_messages client, which would cause the SDK to
@@ -2156,7 +2167,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False,
                  skip_tool_request_middleware: bool = False,
-                 tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None) -> str:
+                 tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
+                 flexa_boundary_managed: bool = False) -> str:
     """Invoke a single tool and return the result string. No display logic.
 
     Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
@@ -2185,23 +2197,42 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     except Exception as _mw_err:
         logger.debug("tool_request middleware error: %s", _mw_err)
 
+    _flexa_operation_id = tool_call_id or str(uuid.uuid4())
+    if not flexa_boundary_managed:
+        from model_tools import coerce_tool_args
+
+        function_args = coerce_tool_args(function_name, function_args)
+        if not isinstance(function_args, dict):
+            function_args = {}
+        from agent.flexa_enforcement import tool_proposal as _flexa_tool_proposal
+
+        function_name, function_args, _flexa_operation_id = _flexa_tool_proposal(
+            agent,
+            function_name,
+            function_args,
+            operation_id=_flexa_operation_id,
+        )
+
     # Check plugin hooks for a block or approval directive before executing.
-    block_message: Optional[str] = None
+    from agent.flexa_enforcement import governed_tool_denial
+
+    block_message: Optional[str] = governed_tool_denial(function_name)
     if not pre_tool_block_checked:
         try:
             from hermes_cli.plugins import resolve_pre_tool_block
-            block_message = resolve_pre_tool_block(
-                function_name,
-                function_args,
-                task_id=effective_task_id or "",
-                session_id=getattr(agent, "session_id", "") or "",
-                tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                middleware_trace=list(_tool_middleware_trace),
-            )
+            if block_message is None:
+                block_message = resolve_pre_tool_block(
+                    function_name,
+                    function_args,
+                    task_id=effective_task_id or "",
+                    session_id=getattr(agent, "session_id", "") or "",
+                    tool_call_id=tool_call_id or "",
+                    turn_id=getattr(agent, "_current_turn_id", "") or "",
+                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                    middleware_trace=list(_tool_middleware_trace),
+                )
         except Exception:
-            block_message = None
+            pass
     if block_message is not None:
         result = json.dumps({"error": block_message}, ensure_ascii=False)
         try:
@@ -2222,6 +2253,38 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
         except Exception:
             pass
+        if not flexa_boundary_managed:
+            from agent.flexa_enforcement import tool_result as _flexa_tool_result
+
+            result = _flexa_tool_result(
+                agent,
+                function_name,
+                result,
+                operation_id=_flexa_operation_id,
+            )
+            from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+            try:
+                from model_tools import _emit_post_tool_call_hook
+
+                if _flexa_governed_mode():
+                    _emit_post_tool_call_hook(
+                        function_name=function_name,
+                        function_args=function_args,
+                        result=result,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=_flexa_operation_id,
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        status="blocked",
+                        error_type="governed_or_plugin_block",
+                        error_message="tool execution blocked",
+                        middleware_trace=list(_tool_middleware_trace),
+                        governed_approved=True,
+                    )
+            except Exception:
+                pass
         return result
 
     tool_start_time = time.monotonic()
@@ -2280,6 +2343,14 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
     elif function_name == "memory":
         def _execute(next_args: dict) -> Any:
+            from agent.flexa_enforcement import memory_candidate_arguments
+
+            next_args = memory_candidate_arguments(
+                agent,
+                next_args,
+                action=str(next_args.get("action") or "batch"),
+                target=str(next_args.get("target") or "memory"),
+            )
             target = next_args.get("target", "memory")
             operations = next_args.get("operations")
             from tools.memory_tool import memory_tool as _memory_tool
@@ -2306,6 +2377,14 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             return _finish_agent_tool(result, next_args)
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
         def _execute(next_args: dict) -> Any:
+            from agent.flexa_enforcement import memory_candidate_arguments
+
+            next_args = memory_candidate_arguments(
+                agent,
+                next_args,
+                action=str(next_args.get("action") or function_name),
+                target=function_name,
+            )
             return _finish_agent_tool(agent._memory_manager.handle_tool_call(function_name, next_args), next_args)
     elif function_name == "clarify":
         def _execute(next_args: dict) -> Any:
@@ -2350,7 +2429,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
-    return run_tool_execution_middleware(
+    result = run_tool_execution_middleware(
         function_name,
         function_args,
         lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
@@ -2361,6 +2440,36 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         turn_id=getattr(agent, "_current_turn_id", "") or "",
         api_request_id=getattr(agent, "_current_api_request_id", "") or "",
     )
+    if not flexa_boundary_managed:
+        from agent.flexa_enforcement import tool_result as _flexa_tool_result
+
+        result = _flexa_tool_result(
+            agent,
+            function_name,
+            result,
+            operation_id=_flexa_operation_id,
+        )
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        try:
+            from model_tools import _emit_post_tool_call_hook
+
+            if _flexa_governed_mode():
+                _emit_post_tool_call_hook(
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=result,
+                    task_id=effective_task_id or "",
+                    session_id=getattr(agent, "session_id", "") or "",
+                    tool_call_id=_flexa_operation_id,
+                    turn_id=getattr(agent, "_current_turn_id", "") or "",
+                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                    middleware_trace=list(_tool_middleware_trace),
+                    governed_approved=True,
+                )
+        except Exception:
+            pass
+    return result
 
 
 
@@ -3147,6 +3256,13 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         num_tool_msgs: Number of tool results appended in this batch;
             used to locate the tail slice safely.
     """
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode():
+        # Managed follow-ups are queued as a fresh channel ingress.  Never
+        # splice stale text into an already-bound tool result.
+        agent._drain_pending_steer()
+        return
     if num_tool_msgs <= 0 or not messages:
         return
     steer_text = agent._drain_pending_steer()

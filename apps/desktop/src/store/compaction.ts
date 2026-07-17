@@ -36,3 +36,7 @@ export function setSessionCompacting(sessionId: string | null | undefined, activ
   delete next[key]
   $compactingSessions.set(next)
 }
+
+export function clearAllCompactionState(): void {
+  $compactingSessions.set({})
+}

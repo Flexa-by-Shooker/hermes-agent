@@ -1,8 +1,16 @@
-import { type ConnectionState, type GatewayEvent, resolveGatewayWsUrl } from '@hermes/shared'
+import { type ConnectionState, type GatewayEvent } from '@hermes/shared'
 import { atom } from 'nanostores'
 
+import type { HermesConnection } from '@/global'
 import { HermesGateway } from '@/hermes'
-import { setGatewayState } from '@/store/session'
+import {
+  exactConnectionProfile,
+  GatewayConnectionSupersededError,
+  resolveDesktopGatewayWsUrl,
+  sameConnectionIdentity
+} from '@/lib/desktop-gateway-connection'
+import { gatewayEventOrigin, tagGatewayEventOrigin } from '@/lib/gateway-event-origin'
+import { $connection, setGatewayState } from '@/store/session'
 
 // ── Multi-profile gateway routing ──────────────────────────────────────────
 // Concurrent sessions across profiles need concurrent sockets: the renderer's
@@ -25,6 +33,20 @@ const isOpen = (gateway: HermesGateway | null): boolean => gateway?.connectionSt
 // the instance threaded down through props.
 export const $gateway = atom<HermesGateway | null>(null)
 
+export function gatewayEventMatchesActiveOrigin(event: GatewayEvent): boolean {
+  const origin = gatewayEventOrigin(event)
+
+  if (!origin) {
+    return true
+  }
+
+  return (
+    origin.gateway === $gateway.get() &&
+    sameConnectionIdentity(origin.connection, $connection.get()) &&
+    gatewayMatchesConnection(origin.gateway, origin.connection)
+  )
+}
+
 interface RegistryConfig {
   onEvent: (event: GatewayEvent) => void
 }
@@ -38,21 +60,46 @@ export function configureGatewayRegistry(cfg: RegistryConfig): void {
 // ── Primary (window) backend ───────────────────────────────────────────────
 let primaryGateway: HermesGateway | null = null
 let primaryProfile = 'default'
+let primaryConnection: HermesConnection | null = null
 
-export function setPrimaryGateway(gateway: HermesGateway | null, profile = 'default'): void {
+export function setPrimaryGateway(
+  gateway: HermesGateway | null,
+  profile = 'default',
+  connection: HermesConnection | null = null
+): void {
   primaryGateway = gateway
   primaryProfile = normKey(profile)
+  primaryConnection = gateway ? connection : null
+}
+
+export function isExactPrimaryGateway(gateway: HermesGateway, profile: string): boolean {
+  return gateway === primaryGateway && normKey(profile) === primaryProfile
+}
+
+export function gatewayMatchesConnection(gateway: HermesGateway, connection: HermesConnection): boolean {
+  const profile = normKey(connection.profile)
+
+  if (gateway === primaryGateway && profile === primaryProfile) {
+    return sameConnectionIdentity(primaryConnection, connection)
+  }
+
+  const secondary = secondaries.get(profile)
+
+  return Boolean(secondary && secondary.gateway === gateway && sameConnectionIdentity(secondary.connection, connection))
 }
 
 // ── Secondary (pool) backends ──────────────────────────────────────────────
 interface Secondary {
   profile: string
+  connection: HermesConnection | null
+  dialEpoch: number
   gateway: HermesGateway
   offEvent: () => void
   offState: () => void
   reconnectTimer: ReturnType<typeof setTimeout> | null
   reconnectAttempt: number
   reconnecting: boolean
+  openPromise: Promise<void> | null
   // While true the entry auto-reconnects on drop; pruning flips it off so a
   // deliberate close doesn't trigger the backoff loop.
   wantOpen: boolean
@@ -109,10 +156,49 @@ async function openSecondary(entry: Secondary): Promise<void> {
     return
   }
 
-  const conn = await desktop.getConnection(entry.profile)
-  const wsUrl = await resolveGatewayWsUrl(desktop, conn)
-  await entry.gateway.connect(wsUrl)
-  void desktop.touchBackend?.(entry.profile).catch(() => undefined)
+  if (entry.openPromise) {
+    return entry.openPromise
+  }
+
+  const epoch = ++entry.dialEpoch
+  const isCurrent = (connection?: HermesConnection): boolean =>
+    entry.wantOpen &&
+    secondaries.get(entry.profile) === entry &&
+    entry.dialEpoch === epoch &&
+    (!connection || sameConnectionIdentity(entry.connection, connection))
+
+  const task = (async () => {
+    const conn = await desktop.getConnection(entry.profile)
+
+    if (!isCurrent() || exactConnectionProfile(conn) !== entry.profile) {
+      throw new GatewayConnectionSupersededError()
+    }
+
+    entry.connection = conn
+    const wsUrl = await resolveDesktopGatewayWsUrl(desktop, conn)
+
+    if (!isCurrent(conn)) {
+      throw new GatewayConnectionSupersededError()
+    }
+
+    await entry.gateway.connect(wsUrl)
+
+    if (!isCurrent(conn)) {
+      entry.gateway.close()
+      throw new GatewayConnectionSupersededError()
+    }
+
+    void desktop.touchBackend?.(entry.profile).catch(() => undefined)
+  })()
+
+  const wrapped = task.finally(() => {
+    if (entry.openPromise === wrapped) {
+      entry.openPromise = null
+    }
+  })
+  entry.openPromise = wrapped
+
+  return wrapped
 }
 
 function scheduleReconnect(entry: Secondary): void {
@@ -155,16 +241,23 @@ function createSecondary(profile: string): Secondary {
 
   const entry: Secondary = {
     profile,
+    connection: null,
+    dialEpoch: 0,
     gateway,
     offEvent: () => {},
     offState: () => {},
     reconnectTimer: null,
     reconnectAttempt: 0,
     reconnecting: false,
+    openPromise: null,
     wantOpen: true
   }
 
-  entry.offEvent = gateway.onEvent(event => config?.onEvent(event))
+  entry.offEvent = gateway.onEvent(event =>
+    config?.onEvent(
+      tagGatewayEventOrigin(event, entry.connection ? { connection: entry.connection, gateway: entry.gateway } : null)
+    )
+  )
   entry.offState = gateway.onState(state => {
     reportGatewayState(profile, state)
 
@@ -234,6 +327,27 @@ export async function ensureActiveGatewayOpen(): Promise<HermesGateway | null> {
   return isOpen(entry.gateway) ? entry.gateway : null
 }
 
+/** Reconnect one exact secondary binding without consulting the mutable active
+ * profile. A request that began on Maya must never recover through Oren merely
+ * because the user switched workspaces while the first request was in flight. */
+export async function ensureExactSecondaryGatewayOpen(
+  profile: string,
+  gateway: HermesGateway,
+  connection: HermesConnection
+): Promise<HermesGateway | null> {
+  const entry = secondaries.get(normKey(profile))
+
+  if (!entry || entry.gateway !== gateway || !sameConnectionIdentity(entry.connection, connection)) {
+    return null
+  }
+
+  if (!isOpen(entry.gateway)) {
+    await reconnectSecondary(entry)
+  }
+
+  return isOpen(entry.gateway) && sameConnectionIdentity(entry.connection, connection) ? entry.gateway : null
+}
+
 // Wake signal (sleep/network/visibility): nudge every live secondary back open.
 export function reconnectSecondaryGateways(): void {
   for (const entry of secondaries.values()) {
@@ -268,6 +382,8 @@ export function pruneSecondaryGateways(keep: Set<string>): void {
     }
 
     entry.wantOpen = false
+    entry.dialEpoch += 1
+    entry.connection = null
     clearTimer(entry)
     entry.offEvent()
     entry.offState()
@@ -279,6 +395,8 @@ export function pruneSecondaryGateways(keep: Set<string>): void {
 export function closeSecondaryGateways(): void {
   for (const entry of secondaries.values()) {
     entry.wantOpen = false
+    entry.dialEpoch += 1
+    entry.connection = null
     clearTimer(entry)
     entry.offEvent()
     entry.offState()
