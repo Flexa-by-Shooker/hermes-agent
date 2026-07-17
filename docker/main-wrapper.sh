@@ -6,7 +6,7 @@
 # stderr from the container.
 #
 # Shebang note: /init scrubs env before invoking CMD, so a plain
-# `#!/bin/sh` wrapper sees an empty environ and `ENV HERMES_HOME=/opt/data`
+# `#!/bin/sh` wrapper sees an empty environ and the image's HERMES_HOME
 # from the Dockerfile never reaches `hermes`. with-contenv repopulates
 # the env from /run/s6/container_environment before exec'ing, which is
 # what s6-supervised services use too (see main-hermes/run).
@@ -18,6 +18,9 @@
 #
 # Drop to hermes via s6-setuidgid, but skip it when already non-root.
 set -e
+
+: "${HERMES_HOME:=/var/lib/hermes}"
+export HERMES_HOME
 
 drop() { [ "$(id -u)" = 0 ] && set -- s6-setuidgid hermes "$@"; exec "$@"; }
 
@@ -53,20 +56,20 @@ fi
 # to the hermes user's home before dropping privileges so libraries that
 # resolve paths via $HOME (e.g. discord lockfile under XDG_STATE_HOME)
 # don't try to write to /root.
-export HOME=/opt/data
+export HOME="$HERMES_HOME"
 
 # Save the Docker -w (or default) working directory before init
-# scripts cd to /opt/data, so the container starts in the
+# scripts cd to the governed Hermes root, so the container starts in the
 # directory the user requested.
 _hermes_orig_cwd="${HERMES_ORIG_CWD:-$PWD}"
 
-cd /opt/data
+cd "$HERMES_HOME"
 # shellcheck disable=SC1091
 . /opt/hermes/.venv/bin/activate
 
 # Restore the original working directory before handing off to
 # the user's command so `hermes chat` starts in the Docker -w
-# directory, not /opt/data.
+# directory, not the governed state root.
 cd "$_hermes_orig_cwd"
 
 if [ $# -eq 0 ]; then

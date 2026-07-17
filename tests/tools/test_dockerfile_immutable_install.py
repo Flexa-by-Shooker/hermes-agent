@@ -24,12 +24,12 @@ def test_dockerfile_makes_opt_hermes_readonly_for_hermes_user() -> None:
     assert "chmod -R a-w /opt/hermes" not in text
 
 
-def test_dockerfile_keeps_mutable_state_under_opt_data() -> None:
+def test_dockerfile_keeps_mutable_state_under_governed_runtime_root() -> None:
     text = _dockerfile_text()
 
-    assert "ENV HERMES_HOME=/opt/data" in text
-    assert "ENV HERMES_WRITE_SAFE_ROOT=/opt/data" in text
-    assert 'VOLUME [ "/opt/data" ]' in text
+    assert "ENV HERMES_HOME=/var/lib/hermes" in text
+    assert "ENV HERMES_WRITE_SAFE_ROOT=/var/lib/hermes:/workspaces" in text
+    assert "VOLUME" not in text
 
 
 def test_dockerfile_disables_runtime_install_mutations() -> None:
@@ -78,34 +78,13 @@ def test_dockerfile_bakes_code_scoped_install_method_stamp() -> None:
     assert shim_block, "install-method stamp must be in the shim-wiring RUN block"
 
 
-def test_dockerfile_redirects_lazy_installs_to_durable_target() -> None:
-    """Immutable image seals the venv but redirects lazy installs to the
-    writable data volume, so opt-in backends still install at first use
-    without being able to break the sealed core.
-
-    Guards the contract between the Dockerfile env var, the stage2-hook
-    seeding, and tools/lazy_deps.py — these three must agree on the path.
-    """
+def test_dockerfile_keeps_lazy_installs_disabled() -> None:
+    """Mutable employee state must never become a runtime code source."""
     text = _dockerfile_text()
-    target = "/opt/data/lazy-packages"
 
-    # The redirect target must be set AND must live under the data volume,
-    # never under the immutable /opt/hermes tree.
-    assert f"ENV HERMES_LAZY_INSTALL_TARGET={target}" in text
-    assert target.startswith("/opt/data/"), "target must be on the durable volume"
-    assert "ENV HERMES_LAZY_INSTALL_TARGET=/opt/hermes" not in text
-
-    # The seal flag must still be present — the redirect rides on top of it,
-    # it does not replace it.
     assert "ENV HERMES_DISABLE_LAZY_INSTALLS=1" in text
+    assert "HERMES_LAZY_INSTALL_TARGET" not in text
 
-    # stage2-hook must seed + chown the target dir so first-use installs
-    # succeed as the unprivileged hermes runtime user.
     stage2 = (REPO_ROOT / "docker" / "stage2-hook.sh").read_text()
-    assert '"$HERMES_HOME/lazy-packages"' in stage2, (
-        "stage2-hook.sh must create the lazy-packages dir on the data volume"
-    )
-    assert "lazy-packages" in stage2.split("for sub in", 1)[1].split(";", 1)[0], (
-        "lazy-packages must be in the per-boot chown subdir list so it stays "
-        "hermes-owned"
-    )
+    assert '"$HERMES_HOME/lazy-packages"' not in stage2
+    assert "lazy-packages" not in stage2.split("for sub in", 1)[1].split(";", 1)[0]

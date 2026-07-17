@@ -10,7 +10,7 @@
 # $HERMES_HOME — auth.json, .env, config.yaml — ends up root-owned and
 # unreadable to the supervised gateway. The most common manifestation: the
 # user runs `docker exec <c> hermes login`, this writes
-# /opt/data/auth.json as root:root mode 0600, and from then on the gateway
+# $HERMES_HOME/auth.json as root:root mode 0600, and from then on the gateway
 # returns "Provider authentication failed: Hermes is not logged into Nous
 # Portal" on every incoming message — even though `docker exec <c> hermes
 # chat -q ping` (also running as root) succeeds because root happens to be
@@ -39,6 +39,9 @@
 # state via the hermes CLI. Default is to drop.
 
 set -e
+
+: "${HERMES_HOME:=/var/lib/hermes}"
+export HERMES_HOME
 
 REAL=/opt/hermes/.venv/bin/hermes
 
@@ -82,6 +85,6 @@ fi
 # this, $HOME stays /root and any library that resolves paths off $HOME
 # (XDG caches, lockfiles, .config writes) will try to write to /root and
 # fail with EACCES. Mirrors main-wrapper.sh.
-export HOME=/opt/data
+export HOME="$HERMES_HOME"
 
 exec "$S6_SUID" hermes "$REAL" "$@"

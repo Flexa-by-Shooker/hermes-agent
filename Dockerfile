@@ -26,12 +26,12 @@ ARG TARGETARCH
 
 # Disable Python stdout buffering to ensure logs are printed immediately.
 # Do not write .pyc files at runtime: /opt/hermes is immutable in the
-# published container and writable state belongs under /opt/data.
+# published container and writable state belongs under /var/lib/hermes.
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
 # Store Playwright browsers outside the volume mount so the build-time
-# install survives the /opt/data volume overlay at runtime.
+# install stays separate from the governed runtime-state bind mount.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 
 # Install system dependencies in one layer, clear APT cache.
@@ -103,7 +103,7 @@ RUN set -eu; \
     ln -sf /init /usr/bin/tini
 
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
-RUN useradd -u 10000 -m -d /opt/data hermes
+RUN useradd -u 10000 -m -d /var/lib/hermes hermes
 
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
 
@@ -197,7 +197,7 @@ RUN set -eu; \
 # The hindsight memory provider's client (hindsight-client) is baked in
 # for the same reason: it lazy-installs into /opt/hermes/.venv at first
 # use, which lives inside the (immutable) image layer rather than the
-# mounted /opt/data volume, so it is lost on every container recreate /
+# governed runtime-state bind mount, so it is lost on every container recreate /
 # image update and recall/retain then fails with
 # `ModuleNotFoundError: No module named 'hindsight_client'` (#38128).
 #
@@ -248,7 +248,7 @@ RUN mkdir -p /opt/hermes/bin && \
     chmod 0755 /opt/hermes/bin/hermes && \
     printf 'docker\n' > /opt/hermes/.install_method
 # The ``.install_method`` stamp is baked next to the running code (the install
-# tree), NOT into $HERMES_HOME. $HERMES_HOME (/opt/data) is a shared data
+# tree), NOT into $HERMES_HOME. $HERMES_HOME (/var/lib/hermes) is a private data
 # volume that is commonly bind-mounted from the host and even shared with a
 # host-side Desktop/CLI install; stamping it at boot used to clobber that
 # host install's marker and wrongly block its ``hermes update``. A code-scoped
@@ -322,22 +322,12 @@ ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 # 502 / "[session ended]". Pointing at the prebuilt bundle sidesteps the whole
 # check. (A separate launcher hardening is tracked independently.)
 ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
-ENV HERMES_HOME=/opt/data
-ENV HERMES_WRITE_SAFE_ROOT=/opt/data
+ENV HERMES_HOME=/var/lib/hermes
+ENV HERMES_WRITE_SAFE_ROOT=/var/lib/hermes:/workspaces
 ENV HERMES_DISABLE_LAZY_INSTALLS=1
-# The published image seals /opt/hermes (root-owned, read-only) so a runtime
-# lazy install can't mutate the agent's own venv and brick it. But opt-in
-# backends (Firecrawl web search, Exa, Feishu, …) keep their SDKs in
-# tools/lazy_deps.py — deliberately NOT baked into [all] (see pyproject.toml
-# policy 2026-05-12: one quarantined release must not break every install).
-# Redirect those lazy installs to a writable dir on the durable data volume.
-# lazy_deps appends this dir to the END of sys.path, so a package installed
-# here can only ADD modules — it can never shadow or downgrade a core module,
-# so the sealed-venv guarantee holds even with installs re-enabled. The dir
-# is seeded + chowned to the hermes user by docker/stage2-hook.sh and lives
-# on the /opt/data volume, so it persists across container recreates / image
-# updates (an ABI stamp invalidates it if a rebuild bumps the interpreter).
-ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
+# The governed runtime never installs code into mutable employee state. An
+# optional backend must be baked into a reviewed image or supplied through a
+# separately qualified broker/extension image.
 
 # `docker exec` privilege-drop shim. When operators run
 # `docker exec <c> hermes ...` they default to root, and any file the
@@ -362,9 +352,7 @@ ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
 # shim wins PATH resolution. The shim's last act is to exec the venv
 # binary by absolute path, so this PATH ordering is transparent to
 # every other consumer.
-ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
-RUN mkdir -p /opt/data
-VOLUME [ "/opt/data" ]
+ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:${PATH}"
 
 # s6-overlay's /init is PID 1. It sets up the supervision tree, runs
 # /etc/cont-init.d/* (our stage2 hook), starts s6-rc services
