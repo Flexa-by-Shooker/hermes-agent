@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.memory_manager import MemoryManager
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import MemoryProvider, MemoryProviderCapabilities
 
 
 class _Provider(MemoryProvider):
@@ -28,6 +28,10 @@ class _Provider(MemoryProvider):
     @property
     def governed_scope_version(self) -> str:
         return "1"
+
+    @property
+    def capabilities(self) -> MemoryProviderCapabilities:
+        return MemoryProviderCapabilities.read_only_recall()
 
     def is_available(self) -> bool:
         return True
@@ -116,7 +120,7 @@ def test_governed_scope_is_forwarded_to_provider(
     assert provider.initialized["session_id"] == "session-one"
 
 
-@pytest.mark.parametrize("failure", ["initialize", "system_prompt", "prefetch"])
+@pytest.mark.parametrize("failure", ["initialize", "prefetch"])
 def test_provider_outage_propagates_in_governed_mode(
     failure: str,
     tmp_path: Path,
@@ -131,8 +135,6 @@ def test_provider_outage_propagates_in_governed_mode(
                 session_id="session-one",
                 hermes_home=str(tmp_path),
             )
-        elif failure == "system_prompt":
-            manager.build_system_prompt()
         elif failure == "prefetch":
             manager.prefetch_all("remember this", session_id="session-one")
 
@@ -146,8 +148,10 @@ def test_governed_external_writes_are_blocked_before_provider_dispatch(
     provider = _Provider()
     manager = _manager(provider)
 
-    with pytest.raises(GovernedProfileError, match="write approval is unavailable"):
-        manager.sync_all("user", "assistant", session_id="session-one")
+    # Automatic post-turn hooks are absent from the exact read-only
+    # capabilities, so normal turn completion is a no-op rather than an error.
+    manager.sync_all("user", "assistant", session_id="session-one")
+    manager.queue_prefetch_all("user", session_id="session-one")
     with pytest.raises(GovernedProfileError, match="write approval is unavailable"):
         manager.handle_tool_call("flexa_memory_store", {"content": "candidate"})
     with pytest.raises(GovernedProfileError, match="write approval is unavailable"):
@@ -420,56 +424,19 @@ def test_compression_session_switch_failure_propagates_in_governed_mode(
     manager.on_session_switch.assert_called_once()
 
 
-def test_provider_tool_failure_escapes_sequential_executor_in_governed_mode(
+def test_provider_tool_is_never_registered_in_governed_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("FLEXA_GOVERNED_MODE", raising=False)
-    with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
-    ):
-        from run_agent import AIAgent
-
-        agent = AIAgent(
-            api_key="test-key-1234567890",
-            base_url="https://openrouter.ai/api/v1",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
-
-    provider = _Provider()
-    agent._memory_manager = _manager(provider)
-    tool_call = SimpleNamespace(
-        id="memory-tool-one",
-        function=SimpleNamespace(
-            name="flexa_memory_store",
-            arguments=json.dumps({"content": "candidate"}),
-        ),
-    )
-    assistant = SimpleNamespace(tool_calls=[tool_call])
     monkeypatch.setenv("FLEXA_GOVERNED_MODE", "true")
-
-    def _approve_proposal(_agent, name, arguments, *, operation_id=None):
-        return name, arguments, operation_id or "memory-tool-one"
+    provider = _Provider()
+    manager = _manager(provider)
 
     from hermes_cli.flexa_governed import GovernedProfileError
 
-    with (
-        patch("agent.flexa_enforcement.tool_proposal", side_effect=_approve_proposal),
-        patch("agent.flexa_enforcement.governed_tool_denial", return_value=None),
-        patch(
-            "agent.flexa_enforcement.memory_candidate_arguments",
-            side_effect=lambda _agent, arguments, **_kwargs: arguments,
-        ),
-        pytest.raises(GovernedProfileError, match="write approval is unavailable"),
-    ):
-        agent._execute_tool_calls_sequential(
-            assistant,
-            [],
-            "task-one",
-        )
+    assert manager.has_tool("flexa_memory_store") is False
+    assert manager.get_all_tool_names() == set()
+    with pytest.raises(GovernedProfileError, match="write approval is unavailable"):
+        manager.handle_tool_call("flexa_memory_store", {"content": "candidate"})
     assert provider.tool_calls == []
 
 
@@ -654,12 +621,21 @@ def test_aiagent_uses_only_scoped_external_memory_in_governed_mode(
             "user_profile_enabled": False,
             "write_approval": True,
             "provider": "flexa-memory",
+            "principal_assertion": {
+                "algorithm": "ed25519",
+                "key_id": "unconfigured",
+                "public_key_sha256": "unconfigured",
+            },
         },
         "agent": {},
     }
 
     with (
         patch("hermes_cli.config.load_config", return_value=cfg),
+        patch(
+            "hermes_cli.flexa_governed.verify_governed_principal_assertion",
+            return_value=object(),
+        ),
         patch("hermes_cli.flexa_governed.governed_memory_scope", return_value=scope),
         patch("plugins.memory.load_memory_provider", return_value=provider),
         patch("agent.model_metadata.get_model_context_length", return_value=204_800),
@@ -697,6 +673,11 @@ def test_aiagent_cannot_skip_governed_memory(
             "user_profile_enabled": False,
             "write_approval": True,
             "provider": "flexa-memory",
+            "principal_assertion": {
+                "algorithm": "ed25519",
+                "key_id": "unconfigured",
+                "public_key_sha256": "unconfigured",
+            },
         },
         "agent": {},
     }

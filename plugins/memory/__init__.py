@@ -189,6 +189,19 @@ def load_memory_provider(name: str) -> Optional["MemoryProvider"]:
 
     Returns None if the provider is not found or fails to load.
     """
+    # Flexa's governed adapter is a reviewed core boundary, not a general
+    # third-party memory plugin.  Keep it out of the user/bundled plugin
+    # directories (whose in-tree provider set is intentionally closed) while
+    # still resolving it through the one existing provider-selection seam.
+    if name == "flexa-memory":
+        try:
+            from agent.flexa_memory_provider import FlexaMemoryProvider
+
+            return FlexaMemoryProvider()
+        except Exception as e:
+            logger.warning("Failed to load governed Flexa memory adapter: %s", e)
+            return None
+
     provider_dir = find_provider_dir(name)
     if not provider_dir:
         logger.debug("Memory provider '%s' not found in bundled or user plugins", name)

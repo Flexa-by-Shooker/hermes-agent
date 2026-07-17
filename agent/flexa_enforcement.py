@@ -72,6 +72,7 @@ _AGENT_TURN_KEY = "_flexa_governed_turn_key"
 _AGENT_PERSISTENCE_LOCK = "_flexa_governed_persistence_lock"
 _AGENT_PERSISTENCE_QUARANTINE = "_flexa_persistence_quarantined"
 _AGENT_PERSISTENCE_SAFE_SNAPSHOT = "_flexa_persistence_safe_snapshot"
+_RECALL_BINDING_PROOF = object()
 _BOUND_TURN: contextvars.ContextVar[TurnKey | None] = contextvars.ContextVar(
     "flexa_governed_turn_binding", default=None
 )
@@ -81,10 +82,11 @@ class FlexaEnforcementError(RuntimeError):
     """Opaque fail-closed boundary failure; never contains request content."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class TurnKey:
     tenant_id: str
     employee_id: str
+    principal_id: str
     profile_slug: str
     session_id: str
     turn_id: str
@@ -97,6 +99,19 @@ class GovernedTurnInput:
     key: TurnKey
     model_message: Any
     persistence_message: Any
+
+
+@dataclass(frozen=True, repr=False)
+class GovernedRecallBinding:
+    """Opaque, content-free proof binding one recall to an active turn."""
+
+    tenant_id: str
+    employee_id: str
+    principal_id: str
+    session_id: str
+    turn_id: str
+    turn_context_token: str = field(repr=False, compare=False)
+    _proof: object = field(repr=False, compare=False)
 
 
 class GovernedAttachmentPrompt(str):
@@ -131,7 +146,7 @@ class GovernedNativeAttachmentContent(list):
 class _TurnState:
     key: TurnKey
     endpoint: str
-    token: str
+    token: str = field(repr=False)
     phase: str
     expires_at: float
     attachment_ids: tuple[str, ...] = ()
@@ -357,6 +372,7 @@ def _boundary_request(
             "turn": {
                 "tenant_id": key.tenant_id,
                 "employee_id": key.employee_id,
+                "principal_id": key.principal_id,
                 "session_id": key.session_id,
                 "turn_id": key.turn_id,
             },
@@ -417,12 +433,21 @@ def _state_for(agent: Any) -> _TurnState:
         _drop_local_state(agent, state)
         raise FlexaEnforcementError("governed turn expired")
     profile, endpoint = _profile_and_endpoint()
+    from hermes_cli.flexa_governed import require_governed_principal_binding
+
+    principal = require_governed_principal_binding(
+        getattr(agent, "_governed_principal_binding", None)
+    )
     if (
         profile.tenant_id != key.tenant_id
         or profile.employee_id != key.employee_id
         or profile.slug != key.profile_slug
         or endpoint != state.endpoint
         or _session_id(agent) != key.session_id
+        or principal.tenant_id != key.tenant_id
+        or principal.employee_id != key.employee_id
+        or principal.profile_id != key.profile_slug
+        or principal.principal_id != key.principal_id
     ):
         raise FlexaEnforcementError("governed turn binding mismatch")
     return state
@@ -471,9 +496,22 @@ def channel_ingress(
                 pass
         raise FlexaEnforcementError("agent already owns a governed turn")
     profile, endpoint = _profile_and_endpoint()
+    from hermes_cli.flexa_governed import require_governed_principal_binding
+
+    principal = require_governed_principal_binding(
+        getattr(agent, "_governed_principal_binding", None)
+    )
+    if (
+        principal.tenant_id != profile.tenant_id
+        or principal.employee_id != profile.employee_id
+        or principal.profile_id != profile.slug
+        or not principal.principal_id
+    ):
+        raise FlexaEnforcementError("governed principal binding mismatch")
     key = TurnKey(
         tenant_id=profile.tenant_id,
         employee_id=profile.employee_id,
+        principal_id=principal.principal_id,
         profile_slug=profile.slug,
         session_id=_session_id(agent, session_id),
         turn_id=str(uuid.uuid4()),
@@ -631,6 +669,50 @@ def turn_active(agent: Any) -> bool:
         return False
     with _REGISTRY_LOCK:
         return key in _TURN_STATES
+
+
+def governed_recall_binding(agent: Any) -> GovernedRecallBinding:
+    """Return an opaque recall proof for the current sanitized active turn."""
+
+    if not governed_mode():
+        raise FlexaEnforcementError("governed recall binding is unavailable")
+    state = _state_for(agent)
+    with state.lock:
+        if state.phase != "memory.retrieval" or state.pending_tools:
+            raise FlexaEnforcementError("governed recall boundary is unavailable")
+        from hermes_cli.flexa_governed import require_governed_principal_binding
+
+        principal = require_governed_principal_binding(
+            getattr(agent, "_governed_principal_binding", None)
+        )
+        if (
+            principal.tenant_id != state.key.tenant_id
+            or principal.employee_id != state.key.employee_id
+            or principal.profile_id != state.key.profile_slug
+            or principal.principal_id != state.key.principal_id
+        ):
+            raise FlexaEnforcementError("governed recall principal is invalid")
+        return GovernedRecallBinding(
+            tenant_id=state.key.tenant_id,
+            employee_id=state.key.employee_id,
+            principal_id=state.key.principal_id,
+            session_id=state.key.session_id,
+            turn_id=state.key.turn_id,
+            turn_context_token=state.token,
+            _proof=_RECALL_BINDING_PROOF,
+        )
+
+
+def require_governed_recall_binding(value: Any) -> GovernedRecallBinding:
+    """Validate an opaque recall proof passed between reviewed components."""
+
+    if (
+        not isinstance(value, GovernedRecallBinding)
+        or value._proof is not _RECALL_BINDING_PROOF
+        or not value.turn_context_token
+    ):
+        raise FlexaEnforcementError("governed recall binding is unavailable")
+    return value
 
 
 def governed_persistence_lock(agent: Any) -> threading.RLock:
@@ -1987,6 +2069,7 @@ def revoke_turn(agent: Any) -> None:
             "turn": {
                 "tenant_id": state.key.tenant_id,
                 "employee_id": state.key.employee_id,
+                "principal_id": state.key.principal_id,
                 "session_id": state.key.session_id,
                 "turn_id": state.key.turn_id,
             },

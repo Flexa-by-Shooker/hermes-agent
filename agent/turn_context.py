@@ -596,12 +596,34 @@ def build_turn_context(
 
     # External memory provider: prefetch once before the tool loop.
     ext_prefetch_cache = ""
+    if _flexa_governed_mode() and agent._memory_manager is None:
+        from hermes_cli.flexa_governed import GovernedProfileError
+
+        raise GovernedProfileError("managed memory provider is unavailable")
     if agent._memory_manager:
         _query = original_user_message if isinstance(original_user_message, str) else ""
         if _flexa_governed_mode():
-            from agent.flexa_enforcement import memory_candidate, memory_retrieval
+            from agent.flexa_enforcement import (
+                governed_recall_binding,
+                memory_candidate,
+                memory_retrieval,
+            )
 
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+            governed_query = memory_retrieval(
+                agent,
+                _query,
+                target="external-recall-query",
+            )
+            agent._memory_manager.bind_governed_recall(
+                governed_recall_binding(agent)
+            )
+            ext_prefetch_cache = (
+                agent._memory_manager.prefetch_all(
+                    governed_query,
+                    session_id=str(agent.session_id or ""),
+                )
+                or ""
+            )
             if ext_prefetch_cache:
                 ext_prefetch_cache = memory_retrieval(
                     agent,
@@ -620,7 +642,13 @@ def build_turn_context(
             )
         else:
             try:
-                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+                ext_prefetch_cache = (
+                    agent._memory_manager.prefetch_all(
+                        _query,
+                        session_id=str(agent.session_id or ""),
+                    )
+                    or ""
+                )
             except Exception:
                 pass
 

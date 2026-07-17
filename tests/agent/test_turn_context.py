@@ -364,3 +364,56 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
 
+
+def test_governed_recall_sanitizes_query_and_binds_active_turn_first(
+    monkeypatch,
+):
+    monkeypatch.setenv("FLEXA_GOVERNED_MODE", "true")
+    agent = _FakeAgent()
+    manager = MagicMock()
+    agent._memory_manager = manager
+    events = []
+    recall_proof = object()
+
+    def _boundary(_agent, content, *, target):
+        events.append(("boundary", target, content))
+        if target == "external-recall-query":
+            return "sanitized query"
+        return "sanitized recalled context"
+
+    manager.bind_governed_recall.side_effect = (
+        lambda proof: events.append(("bind", proof))
+    )
+    manager.prefetch_all.side_effect = lambda query, *, session_id: (
+        events.append(("prefetch", query, session_id)) or "raw recalled context"
+    )
+
+    with (
+        patch("agent.flexa_enforcement.memory_retrieval", side_effect=_boundary),
+        patch(
+            "agent.flexa_enforcement.governed_recall_binding",
+            return_value=recall_proof,
+        ),
+        patch(
+            "agent.flexa_enforcement.memory_candidate",
+            side_effect=lambda _agent, content, **_kwargs: content,
+        ),
+    ):
+        context = _build(agent)
+
+    assert context.ext_prefetch_cache == "sanitized recalled context"
+    assert events == [
+        ("boundary", "external-recall-query", "hello"),
+        ("bind", recall_proof),
+        ("prefetch", "sanitized query", "sess-1"),
+        ("boundary", "external-prefetch", "raw recalled context"),
+    ]
+    manager.on_turn_start.assert_called_once_with(1, "hello")
+
+
+def test_governed_turn_without_memory_provider_fails_closed(monkeypatch):
+    monkeypatch.setenv("FLEXA_GOVERNED_MODE", "true")
+
+    with pytest.raises(RuntimeError, match="memory provider is unavailable"):
+        _build(_FakeAgent())
+

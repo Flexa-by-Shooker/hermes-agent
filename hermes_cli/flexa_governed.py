@@ -16,7 +16,8 @@ import logging
 import os
 import re
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -25,14 +26,29 @@ _EMPLOYEE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _RELEASE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _MEMORY_PROVIDER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_PRINCIPAL_ID = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
+_ASSERTION_NONCE = re.compile(r"^[A-Za-z0-9_-]{22,128}$")
 _SIDECAR = re.compile(r"^http://enforcement-[a-z0-9][a-z0-9-]{0,62}:8081$")
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
 _LOG_FACTORY_LOCK = threading.Lock()
 _LOG_FACTORY_INSTALLED = False
 GOVERNED_MEMORY_MODE = "governed_external"
 GOVERNED_MEMORY_SCOPE_VERSION = "1"
+GOVERNED_MEMORY_PROVIDER = "flexa-memory"
+GOVERNED_PRINCIPAL_ASSERTION_VERSION = "1"
+GOVERNED_PRINCIPAL_ASSERTION_ISSUER = "flexa-engine"
+GOVERNED_PRINCIPAL_ASSERTION_AUDIENCE = "hermes-memory"
+GOVERNED_PRINCIPAL_ASSERTION_MAX_TTL_SECONDS = 300
+GOVERNED_PRINCIPAL_ASSERTION_CLOCK_SKEW_SECONDS = 30
+GOVERNED_PRINCIPAL_PUBLIC_KEY_FILENAME = "principal-assertion-public-key.pem"
 SUPERVISED_DISCLOSURE_LINEAGE_FIELD = "_flexa_disclosure_boundary_version"
 SUPERVISED_DISCLOSURE_LINEAGE_VERSION = "1"
+_PRINCIPAL_BINDING_ATTR = "_flexa_governed_principal_binding"
+_PRINCIPAL_EVENT_BOUND_ATTR = "_flexa_governed_principal_event_bound"
+_PRINCIPAL_BINDING_PROOF = object()
+_PRINCIPAL_NONCE_LOCK = threading.Lock()
+_CONSUMED_PRINCIPAL_NONCES: dict[tuple[str, str, str, str], float] = {}
+_ASSERTION_CLOCK = time.time
 
 
 class GovernedProfileError(RuntimeError):
@@ -53,6 +69,21 @@ class ManagedProfile:
     config_sha256: str
     metadata_sha256: str
     buffered_output: bool
+
+
+@dataclass(frozen=True, repr=False)
+class GovernedPrincipalBinding:
+    """Opaque, process-local proof of one verified principal assertion."""
+
+    tenant_id: str
+    employee_id: str
+    profile_id: str
+    release_id: str
+    principal_namespace: str
+    principal_id: str
+    assertion_sha256: str
+    assertion_json: bytes = field(repr=False, compare=False)
+    _proof: object
 
 
 def governed_mode() -> bool:
@@ -422,6 +453,39 @@ def _strict_yaml(path: Path) -> dict[str, Any]:
     return value
 
 
+def _validate_principal_assertion_descriptor(value: Any) -> dict[str, str]:
+    """Validate the signed trust descriptor, including rollout placeholders."""
+
+    if not isinstance(value, dict) or set(value) != {
+        "algorithm",
+        "key_id",
+        "public_key_sha256",
+    }:
+        raise GovernedProfileError("managed memory config is not canonical")
+    algorithm = value.get("algorithm")
+    key_id = value.get("key_id")
+    public_key_sha256 = value.get("public_key_sha256")
+    placeholder = key_id == "unconfigured" or public_key_sha256 == "unconfigured"
+    if (
+        algorithm != "ed25519"
+        or not isinstance(key_id, str)
+        or not isinstance(public_key_sha256, str)
+        or (placeholder and not (
+            key_id == "unconfigured" and public_key_sha256 == "unconfigured"
+        ))
+        or (not placeholder and (
+            not _KEY_ID.fullmatch(key_id)
+            or not _SHA256.fullmatch(public_key_sha256)
+        ))
+    ):
+        raise GovernedProfileError("managed memory config is not canonical")
+    return {
+        "algorithm": algorithm,
+        "key_id": key_id,
+        "public_key_sha256": public_key_sha256,
+    }
+
+
 def validate_governed_memory_config(value: Any, *, exact: bool = False) -> str:
     """Return the signed external provider name or fail closed.
 
@@ -437,6 +501,7 @@ def validate_governed_memory_config(value: Any, *, exact: bool = False) -> str:
         "user_profile_enabled",
         "write_approval",
         "provider",
+        "principal_assertion",
     }
     if (
         not isinstance(value, dict)
@@ -452,9 +517,329 @@ def validate_governed_memory_config(value: Any, *, exact: bool = False) -> str:
         or value.get("write_approval") is not True
         or not isinstance(provider, str)
         or not _MEMORY_PROVIDER.fullmatch(provider)
+        or provider != GOVERNED_MEMORY_PROVIDER
     ):
         raise GovernedProfileError("managed memory config is not canonical")
+    _validate_principal_assertion_descriptor(value.get("principal_assertion"))
     return provider
+
+
+def _managed_principal_assertion_trust(
+    profile: ManagedProfile,
+) -> tuple[str, Any]:
+    """Load the assertion verifier pinned by the signed managed config."""
+
+    from hermes_cli.managed_scope import get_managed_dir
+
+    managed_dir = get_managed_dir()
+    if managed_dir is None or managed_dir.is_symlink() or not managed_dir.is_dir():
+        raise GovernedProfileError("managed principal assertion trust is unavailable")
+    config_path = managed_dir / "config.yaml"
+    public_key_path = managed_dir / GOVERNED_PRINCIPAL_PUBLIC_KEY_FILENAME
+    if (
+        config_path.is_symlink()
+        or not config_path.is_file()
+        or _sha256(config_path) != profile.config_sha256
+        or public_key_path.is_symlink()
+        or not public_key_path.is_file()
+    ):
+        raise GovernedProfileError("managed principal assertion trust is unavailable")
+    if os.name == "posix" and (
+        public_key_path.stat().st_mode & 0o222
+        or public_key_path.parent.stat().st_mode & 0o222
+    ):
+        raise GovernedProfileError("managed principal assertion trust is writable")
+    config = _strict_yaml(config_path)
+    memory = config.get("memory")
+    validate_governed_memory_config(memory, exact=True)
+    descriptor = _validate_principal_assertion_descriptor(
+        memory.get("principal_assertion")
+    )
+    key_id = descriptor["key_id"]
+    expected_digest = descriptor["public_key_sha256"]
+    if key_id == "unconfigured" or expected_digest == "unconfigured":
+        raise GovernedProfileError("managed principal assertion trust is unconfigured")
+    if _sha256(public_key_path) != expected_digest:
+        raise GovernedProfileError("managed principal assertion key digest mismatch")
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        public_key = serialization.load_pem_public_key(public_key_path.read_bytes())
+        if not isinstance(public_key, Ed25519PublicKey):
+            raise TypeError("not Ed25519")
+    except (ImportError, OSError, TypeError, ValueError) as exc:
+        raise GovernedProfileError(
+            "managed principal assertion key is invalid"
+        ) from exc
+    return key_id, public_key
+
+
+def governed_principal_assertion_ready() -> bool:
+    """Return whether signed principal assertions can be verified now."""
+
+    if not governed_mode():
+        return False
+    try:
+        profile, _binding = binding_for_current_home()
+        _managed_principal_assertion_trust(profile)
+    except Exception:
+        return False
+    return True
+
+
+def _principal_namespace(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    namespace = str(raw or "").strip()
+    if (
+        not namespace
+        or len(namespace) > 128
+        or "\x00" in namespace
+        or not namespace.isprintable()
+    ):
+        raise GovernedProfileError("authenticated memory principal is required")
+    return namespace
+
+
+def _transport_subject(value: Any) -> str:
+    subject = str(value or "").strip()
+    if (
+        not subject
+        or len(subject) > 512
+        or "\x00" in subject
+        or not subject.isprintable()
+    ):
+        raise GovernedProfileError("authenticated memory principal is required")
+    return subject
+
+
+def _transport_subject_sha256(namespace: str, subject: str) -> str:
+    return hashlib.sha256(f"{namespace}\x00{subject}".encode("utf-8")).hexdigest()
+
+
+def _consume_principal_assertion_nonce(
+    *,
+    profile: ManagedProfile,
+    nonce: str,
+    expires_at: int,
+    now: float,
+) -> None:
+    key = (profile.tenant_id, profile.employee_id, profile.release_id, nonce)
+    with _PRINCIPAL_NONCE_LOCK:
+        expired = [
+            item
+            for item, item_expiry in _CONSUMED_PRINCIPAL_NONCES.items()
+            if item_expiry <= now
+        ]
+        for item in expired:
+            _CONSUMED_PRINCIPAL_NONCES.pop(item, None)
+        if key in _CONSUMED_PRINCIPAL_NONCES:
+            raise GovernedProfileError("principal assertion was already used")
+        _CONSUMED_PRINCIPAL_NONCES[key] = float(
+            expires_at + GOVERNED_PRINCIPAL_ASSERTION_CLOCK_SKEW_SECONDS
+        )
+
+
+def verify_governed_principal_assertion(
+    assertion: Any,
+    *,
+    platform: Any,
+    user_id: Any,
+    user_id_alt: Any = None,
+) -> GovernedPrincipalBinding:
+    """Verify and consume one short-lived canonical principal assertion."""
+
+    profile, _profile_binding = binding_for_current_home()
+    namespace = _principal_namespace(platform)
+    subject = _transport_subject(user_id_alt or user_id)
+    required_fields = {
+        "schema_version",
+        "issuer",
+        "audience",
+        "tenant_id",
+        "employee_id",
+        "profile_id",
+        "release_id",
+        "bundle_signing_payload_sha256",
+        "principal_namespace",
+        "principal_id",
+        "transport_subject_sha256",
+        "issued_at",
+        "expires_at",
+        "nonce",
+        "signature",
+    }
+    if not isinstance(assertion, dict) or set(assertion) != required_fields:
+        raise GovernedProfileError("principal assertion is missing or invalid")
+    principal_id = assertion.get("principal_id")
+    nonce = assertion.get("nonce")
+    issued_at = assertion.get("issued_at")
+    expires_at = assertion.get("expires_at")
+    signature = assertion.get("signature")
+    if (
+        assertion.get("schema_version") != GOVERNED_PRINCIPAL_ASSERTION_VERSION
+        or assertion.get("issuer") != GOVERNED_PRINCIPAL_ASSERTION_ISSUER
+        or assertion.get("audience") != GOVERNED_PRINCIPAL_ASSERTION_AUDIENCE
+        or assertion.get("tenant_id") != profile.tenant_id
+        or assertion.get("employee_id") != profile.employee_id
+        or assertion.get("profile_id") != profile.slug
+        or assertion.get("release_id") != profile.release_id
+        or assertion.get("bundle_signing_payload_sha256")
+        != profile.bundle_signing_payload_sha256
+        or assertion.get("principal_namespace") != namespace
+        or not isinstance(principal_id, str)
+        or not _PRINCIPAL_ID.fullmatch(principal_id)
+        or assertion.get("transport_subject_sha256")
+        != _transport_subject_sha256(namespace, subject)
+        or not isinstance(nonce, str)
+        or not _ASSERTION_NONCE.fullmatch(nonce)
+        or not isinstance(issued_at, int)
+        or isinstance(issued_at, bool)
+        or not isinstance(expires_at, int)
+        or isinstance(expires_at, bool)
+        or expires_at <= issued_at
+        or expires_at - issued_at > GOVERNED_PRINCIPAL_ASSERTION_MAX_TTL_SECONDS
+        or not isinstance(signature, dict)
+        or set(signature) != {"algorithm", "key_id", "value"}
+        or signature.get("algorithm") != "ed25519"
+        or not isinstance(signature.get("value"), str)
+    ):
+        raise GovernedProfileError("principal assertion is missing or invalid")
+    now = _ASSERTION_CLOCK()
+    if (
+        issued_at > now + GOVERNED_PRINCIPAL_ASSERTION_CLOCK_SKEW_SECONDS
+        or expires_at
+        <= now - GOVERNED_PRINCIPAL_ASSERTION_CLOCK_SKEW_SECONDS
+    ):
+        raise GovernedProfileError("principal assertion is expired or not yet valid")
+    key_id, public_key = _managed_principal_assertion_trust(profile)
+    if signature.get("key_id") != key_id:
+        raise GovernedProfileError("principal assertion signature is invalid")
+    unsigned = dict(assertion)
+    unsigned.pop("signature", None)
+    try:
+        payload = json.dumps(
+            unsigned,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        decoded = base64.b64decode(signature["value"], validate=True)
+        if len(decoded) != 64:
+            raise ValueError("wrong Ed25519 signature length")
+        public_key.verify(decoded, payload)
+    except (TypeError, ValueError, binascii.Error) as exc:
+        raise GovernedProfileError("principal assertion signature is invalid") from exc
+    except Exception as exc:
+        raise GovernedProfileError("principal assertion signature is invalid") from exc
+    _consume_principal_assertion_nonce(
+        profile=profile,
+        nonce=nonce,
+        expires_at=expires_at,
+        now=now,
+    )
+    assertion_json = json.dumps(
+        assertion,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    assertion_sha256 = hashlib.sha256(assertion_json).hexdigest()
+    return GovernedPrincipalBinding(
+        tenant_id=profile.tenant_id,
+        employee_id=profile.employee_id,
+        profile_id=profile.slug,
+        release_id=profile.release_id,
+        principal_namespace=namespace,
+        principal_id=principal_id,
+        assertion_sha256=assertion_sha256,
+        assertion_json=assertion_json,
+        _proof=_PRINCIPAL_BINDING_PROOF,
+    )
+
+
+def _require_principal_binding(value: Any) -> GovernedPrincipalBinding:
+    if (
+        not isinstance(value, GovernedPrincipalBinding)
+        or value._proof is not _PRINCIPAL_BINDING_PROOF
+    ):
+        raise GovernedProfileError("authenticated memory principal is required")
+    return value
+
+
+def bind_governed_principal_assertion(
+    source: Any,
+    assertion: Any,
+) -> GovernedPrincipalBinding:
+    """Verify an inbound assertion and attach only opaque process-local proof."""
+
+    existing = getattr(source, _PRINCIPAL_BINDING_ATTR, None)
+    if assertion is None and existing is not None:
+        return _require_principal_binding(existing)
+    binding = verify_governed_principal_assertion(
+        assertion,
+        platform=getattr(source, "platform", None),
+        user_id=getattr(source, "user_id", None),
+        user_id_alt=getattr(source, "user_id_alt", None),
+    )
+    if existing is not None:
+        previous = _require_principal_binding(existing)
+        if (
+            previous.tenant_id != binding.tenant_id
+            or previous.employee_id != binding.employee_id
+            or previous.profile_id != binding.profile_id
+            or previous.principal_namespace != binding.principal_namespace
+            or previous.principal_id != binding.principal_id
+        ):
+            raise GovernedProfileError("authenticated memory principal changed")
+    setattr(source, _PRINCIPAL_BINDING_ATTR, binding)
+    return binding
+
+
+def bind_governed_event_principal(event: Any) -> GovernedPrincipalBinding:
+    """Consume an event assertion exactly once before governed session keying.
+
+    Platform adapters call this before their active-session guard computes a
+    key.  ``GatewayRunner`` calls it again for direct/synthetic paths; the
+    private event marker makes that second call idempotent without accepting a
+    replayed wire assertion on a different event object.
+    """
+
+    source = getattr(event, "source", None)
+    if source is None:
+        raise GovernedProfileError("governed principal assertion is required")
+    if getattr(event, _PRINCIPAL_EVENT_BOUND_ATTR, None) is _PRINCIPAL_BINDING_PROOF:
+        return governed_principal_binding_for_source(source)
+    metadata = getattr(event, "metadata", None)
+    if not isinstance(metadata, dict):
+        metadata = {}
+    assertion = metadata.pop("flexa_principal_assertion", None)
+    is_internal = bool(getattr(event, "internal", False))
+    if not is_internal and assertion is None:
+        raise GovernedProfileError("governed principal assertion is required")
+    binding = bind_governed_principal_assertion(source, assertion)
+    setattr(event, _PRINCIPAL_EVENT_BOUND_ATTR, _PRINCIPAL_BINDING_PROOF)
+    return binding
+
+
+def governed_principal_binding_for_source(source: Any) -> GovernedPrincipalBinding:
+    """Return verified process-local source proof or fail closed."""
+
+    return _require_principal_binding(getattr(source, _PRINCIPAL_BINDING_ATTR, None))
+
+
+def require_governed_principal_binding(value: Any) -> GovernedPrincipalBinding:
+    """Validate opaque proof passed between reviewed Hermes components."""
+
+    return _require_principal_binding(value)
+
+
+def governed_principal_id_for_source(source: Any) -> str:
+    """Return a canonical principal only after assertion verification."""
+
+    return governed_principal_binding_for_source(source).principal_id
 
 
 def governed_memory_scope(
@@ -462,52 +847,65 @@ def governed_memory_scope(
     platform: str,
     user_id: Any,
     user_id_alt: Any = None,
+    principal_assertion: Any = None,
+    principal_binding: Any = None,
 ) -> dict[str, str]:
-    """Build the immutable scope handed to a governed memory provider.
-
-    ``user_id`` and ``user_id_alt`` must come from the authenticated transport
-    adapter, never message/RPC content.  Desktop/TUI currently supplies no such
-    identity and therefore fails here instead of collapsing users into a
-    shared native ``USER.md``.
-    """
+    """Build the immutable scope handed to the governed read-only provider."""
 
     profile, _binding = binding_for_current_home()
-    namespace = str(platform or "").strip()
-    principal = str(user_id_alt or user_id or "").strip()
+    verified = (
+        _require_principal_binding(principal_binding)
+        if principal_binding is not None
+        else verify_governed_principal_assertion(
+            principal_assertion,
+            platform=platform,
+            user_id=user_id,
+            user_id_alt=user_id_alt,
+        )
+    )
     if (
-        not namespace
-        or len(namespace) > 128
-        or "\x00" in namespace
-        or not namespace.isprintable()
-        or not principal
-        or len(principal) > 512
-        or "\x00" in principal
-        or not principal.isprintable()
+        verified.tenant_id != profile.tenant_id
+        or verified.employee_id != profile.employee_id
+        or verified.profile_id != profile.slug
+        or verified.release_id != profile.release_id
+        or verified.principal_namespace != _principal_namespace(platform)
     ):
-        raise GovernedProfileError("authenticated memory principal is required")
+        raise GovernedProfileError("authenticated memory principal is invalid")
     return {
         "schema_version": GOVERNED_MEMORY_SCOPE_VERSION,
         "tenant_id": profile.tenant_id,
         "employee_id": profile.employee_id,
         "profile_slug": profile.slug,
-        "principal_namespace": namespace,
-        "principal_id": principal,
+        "principal_namespace": verified.principal_namespace,
+        "principal_id": verified.principal_id,
         "release_id": profile.release_id,
         "bundle_signing_payload_sha256": profile.bundle_signing_payload_sha256,
     }
 
 
 def require_governed_memory_provider(provider: Any) -> None:
-    """Require an adapter that explicitly consumes the governed scope v1."""
+    """Require the exact governed-scope and read-only capability contract."""
 
     try:
         version = provider.governed_scope_version
+        capabilities = provider.capabilities
     except Exception as exc:
         raise GovernedProfileError(
             "memory provider does not support governed scope"
         ) from exc
     if version != GOVERNED_MEMORY_SCOPE_VERSION:
         raise GovernedProfileError("memory provider does not support governed scope")
+    try:
+        from agent.memory_provider import MemoryProviderCapabilities
+
+        read_only = (
+            type(capabilities) is MemoryProviderCapabilities
+            and capabilities.is_read_only_recall
+        )
+    except Exception:
+        read_only = False
+    if not read_only:
+        raise GovernedProfileError("memory provider is not governed read-only")
 
 
 def require_governed_memory_write_approval(*, operation: str) -> None:
@@ -560,7 +958,11 @@ def _verify_profile_assets(home: Path, profile: ManagedProfile) -> dict[str, Any
     binding = _strict_yaml(binding_path)
     expected_workspace = f"/workspaces/{profile.employee_id}"
     try:
-        provider = validate_governed_memory_config(config.get("memory"), exact=True)
+        memory_config = config.get("memory")
+        provider = validate_governed_memory_config(memory_config, exact=True)
+        principal_assertion = _validate_principal_assertion_descriptor(
+            memory_config.get("principal_assertion")
+        )
     except GovernedProfileError as exc:
         raise GovernedProfileError("managed profile config is not canonical") from exc
     if config != {
@@ -572,6 +974,7 @@ def _verify_profile_assets(home: Path, profile: ManagedProfile) -> dict[str, Any
             "user_profile_enabled": False,
             "write_approval": True,
             "provider": provider,
+            "principal_assertion": principal_assertion,
         },
     }:
         raise GovernedProfileError("managed profile config is not canonical")

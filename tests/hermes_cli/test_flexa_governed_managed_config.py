@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
+
+from agent.memory_provider import MemoryProviderCapabilities
 
 from hermes_cli.flexa_governed import (
     GOVERNED_MEMORY_MODE,
@@ -73,6 +76,11 @@ def _managed_config(employee_id: str = "oren-cto") -> dict[str, object]:
             "user_profile_enabled": False,
             "write_approval": True,
             "provider": "flexa-memory",
+            "principal_assertion": {
+                "algorithm": "ed25519",
+                "key_id": "unconfigured",
+                "public_key_sha256": "unconfigured",
+            },
         },
     }
 
@@ -197,13 +205,31 @@ def test_governed_memory_scope_requires_principal(
         lambda: (profile, {"working_directory": "/workspaces/oren-cto"}),
     )
 
-    with pytest.raises(GovernedProfileError, match="authenticated memory principal"):
+    def verify(assertion, **_kwargs):
+        if assertion is None:
+            raise GovernedProfileError("principal assertion is missing or invalid")
+        return SimpleNamespace(
+            tenant_id="tenant-one",
+            employee_id="oren-cto",
+            profile_id="oren-cto",
+            release_id="release-one",
+            principal_namespace="telegram",
+            principal_id="canonical-user",
+        )
+
+    monkeypatch.setattr(
+        "hermes_cli.flexa_governed.verify_governed_principal_assertion",
+        verify,
+    )
+
+    with pytest.raises(GovernedProfileError, match="principal assertion"):
         governed_memory_scope(platform="desktop", user_id=None)
 
     scope = governed_memory_scope(
         platform="telegram",
         user_id="user-primary",
         user_id_alt="user-stable",
+        principal_assertion={"signed": True},
     )
     assert scope == {
         "schema_version": "1",
@@ -211,7 +237,7 @@ def test_governed_memory_scope_requires_principal(
         "employee_id": "oren-cto",
         "profile_slug": "oren-cto",
         "principal_namespace": "telegram",
-        "principal_id": "user-stable",
+        "principal_id": "canonical-user",
         "release_id": "release-one",
         "bundle_signing_payload_sha256": "a" * 64,
     }
@@ -223,8 +249,15 @@ def test_governed_memory_provider_must_declare_scope_v1() -> None:
 
     class GovernedProvider:
         governed_scope_version = "1"
+        capabilities = MemoryProviderCapabilities.read_only_recall()
+
+    class WritableProvider:
+        governed_scope_version = "1"
+        capabilities = MemoryProviderCapabilities()
 
     with pytest.raises(GovernedProfileError, match="does not support governed scope"):
         require_governed_memory_provider(LegacyProvider())
+    with pytest.raises(GovernedProfileError, match="not governed read-only"):
+        require_governed_memory_provider(WritableProvider())
 
     require_governed_memory_provider(GovernedProvider())

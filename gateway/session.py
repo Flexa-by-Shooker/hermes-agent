@@ -904,6 +904,25 @@ def build_session_key(
     """
     ns = _session_key_namespace(profile)
     platform = source.platform.value
+
+    principal_suffix = ""
+    from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+    if _flexa_governed_mode():
+        from hermes_cli.flexa_governed import governed_principal_binding_for_source
+
+        binding = governed_principal_binding_for_source(source)
+        principal_fingerprint = hashlib.sha256(
+            (
+                f"{binding.tenant_id}\x00{binding.employee_id}\x00"
+                f"{binding.principal_namespace}\x00{binding.principal_id}"
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        principal_suffix = f":principal:{principal_fingerprint}"
+
+    def scoped(key: str) -> str:
+        return f"{key}{principal_suffix}"
+
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
@@ -911,8 +930,8 @@ def build_session_key(
 
         if dm_chat_id:
             if source.thread_id:
-                return f"{ns}:{platform}:dm:{dm_chat_id}:{source.thread_id}"
-            return f"{ns}:{platform}:dm:{dm_chat_id}"
+                return scoped(f"{ns}:{platform}:dm:{dm_chat_id}:{source.thread_id}")
+            return scoped(f"{ns}:{platform}:dm:{dm_chat_id}")
         # No chat_id — fall back to the sender's own identifier before the
         # bare per-platform sink.  Without this, every DM from every user that
         # arrives without a chat_id (non-standard adapters / synthetic sources)
@@ -927,11 +946,13 @@ def build_session_key(
             )
         if dm_participant_id:
             if source.thread_id:
-                return f"{ns}:{platform}:dm:{dm_participant_id}:{source.thread_id}"
-            return f"{ns}:{platform}:dm:{dm_participant_id}"
+                return scoped(
+                    f"{ns}:{platform}:dm:{dm_participant_id}:{source.thread_id}"
+                )
+            return scoped(f"{ns}:{platform}:dm:{dm_participant_id}")
         if source.thread_id:
-            return f"{ns}:{platform}:dm:{source.thread_id}"
-        return f"{ns}:{platform}:dm"
+            return scoped(f"{ns}:{platform}:dm:{source.thread_id}")
+        return scoped(f"{ns}:{platform}:dm")
 
     participant_id = source.user_id_alt or source.user_id
     if participant_id and source.platform == Platform.WHATSAPP:
@@ -956,7 +977,7 @@ def build_session_key(
     if isolate_user and participant_id:
         key_parts.append(str(participant_id))
 
-    return ":".join(key_parts)
+    return scoped(":".join(key_parts))
 
 
 class _SessionFlight:

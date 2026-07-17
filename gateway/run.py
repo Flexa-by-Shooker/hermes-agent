@@ -7061,10 +7061,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             
             # Set up message + fatal error handlers
             from hermes_cli.flexa_governed import governed_mode, primary_profile
+            _governed = governed_mode()
+            _profile_name = primary_profile().slug if _governed else None
             adapter.set_message_handler(
-                self._make_profile_message_handler(primary_profile().slug)
-                if governed_mode()
+                self._make_profile_message_handler(_profile_name)
+                if _governed
                 else self._handle_message
+            )
+            adapter.set_pre_session_key_hook(
+                self._make_profile_pre_session_key_hook(_profile_name)
+                if _governed
+                else None
             )
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
@@ -7902,10 +7909,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
 
                     from hermes_cli.flexa_governed import governed_mode, primary_profile
+                    _governed = governed_mode()
+                    _profile_name = primary_profile().slug if _governed else None
                     adapter.set_message_handler(
-                        self._make_profile_message_handler(primary_profile().slug)
-                        if governed_mode()
+                        self._make_profile_message_handler(_profile_name)
+                        if _governed
                         else self._handle_message
+                    )
+                    adapter.set_pre_session_key_hook(
+                        self._make_profile_pre_session_key_hook(_profile_name)
+                        if _governed
+                        else None
                     )
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
@@ -8614,6 +8628,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_message_handler(
                 self._make_profile_message_handler(profile_name)
             )
+            from hermes_cli.flexa_governed import governed_mode
+            adapter.set_pre_session_key_hook(
+                self._make_profile_pre_session_key_hook(
+                    profile_name,
+                    profile_home=profile_home,
+                )
+                if governed_mode()
+                else None
+            )
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -8646,6 +8669,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
             return await self._handle_message(event)
         return _handler
+
+    def _make_profile_pre_session_key_hook(
+        self,
+        profile_name: str,
+        *,
+        profile_home: Optional["Path"] = None,
+    ):
+        """Bind a governed event inside its verified profile scope."""
+
+        def _hook(event):
+            source = getattr(event, "source", None)
+            if source is None:
+                from hermes_cli.flexa_governed import GovernedProfileError
+
+                raise GovernedProfileError("governed principal assertion is required")
+            source.profile = profile_name
+            resolved_home = profile_home or self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(resolved_home):
+                from hermes_cli.flexa_governed import (
+                    bind_governed_event_principal,
+                    ensure_governed_content_free_logging,
+                )
+
+                ensure_governed_content_free_logging()
+                bind_governed_event_principal(event)
+
+        return _hook
 
     @staticmethod
     def _adapter_credential_fingerprint(adapter: Any) -> Optional[str]:
@@ -8903,6 +8953,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
+
+        # BasePlatformAdapter normally verifies before its active-session key.
+        # Repeat through the idempotent event helper for direct/synthetic paths
+        # that call GatewayRunner without passing through the adapter.
+        from hermes_cli.flexa_governed import governed_mode as _flexa_governed_mode
+
+        if _flexa_governed_mode():
+            from hermes_cli.flexa_governed import (
+                bind_governed_event_principal,
+                ensure_governed_content_free_logging,
+            )
+
+            ensure_governed_content_free_logging()
+            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                bind_governed_event_principal(event)
 
         # scale-to-zero (Phase 0, 0.B/F13): stamp the gateway-scoped last-inbound
         # clock for real (user-originated) inbound only. Internal/system events
@@ -13444,6 +13509,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception as e:
                         logger.warning("Background task vision enrichment failed: %s", e)
 
+            from hermes_cli.flexa_governed import governed_mode as _governed_mode
+
+            _governed_principal_binding = None
+            if _governed_mode():
+                from hermes_cli.flexa_governed import (
+                    governed_principal_binding_for_source,
+                )
+
+                _governed_principal_binding = governed_principal_binding_for_source(
+                    source
+                )
+
             def run_sync():
                 agent = AIAgent(
                     model=turn_route["model"],
@@ -13466,6 +13543,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform=platform_key,
                     user_id=source.user_id,
                     user_id_alt=source.user_id_alt,
+                    principal_binding=_governed_principal_binding,
                     user_name=source.user_name,
                     chat_id=source.chat_id,
                     chat_name=source.chat_name,
@@ -15892,6 +15970,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         cache_keys: dict | None = None,
         user_id: str | None = None,
         user_id_alt: str | None = None,
+        principal_id: str | None = None,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -15919,6 +15998,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         broke #27371's per-user-peer contract in multi-user gateways.
         Per-user agent rebuilds in shared threads trade prompt-cache
         warmth for correct memory attribution.
+
+        ``principal_id`` is the verified Flexa canonical principal.  It is
+        included only in the hashed signature and is never logged or placed in
+        model context.  Governed session keys are independently principal-
+        fingerprinted as a second isolation boundary.
         """
         import hashlib, json as _j
 
@@ -15945,6 +16029,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cache_keys_sorted,
                 str(user_id or ""),
                 str(user_id_alt or ""),
+                str(principal_id or ""),
             ],
             sort_keys=True,
             default=str,
@@ -18205,6 +18290,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
 
+            from hermes_cli.flexa_governed import governed_mode as _governed_mode
+
+            _governed_principal_binding = None
+            if _governed_mode():
+                from hermes_cli.flexa_governed import (
+                    governed_principal_binding_for_source,
+                )
+
+                _governed_principal_binding = governed_principal_binding_for_source(
+                    source
+                )
+
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
             # schemas for prompt cache hits.
@@ -18216,6 +18313,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 cache_keys=self._extract_cache_busting_config(user_config),
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
+                principal_id=(
+                    _governed_principal_binding.principal_id
+                    if _governed_principal_binding is not None
+                    else None
+                ),
             )
             agent = None
             reused_cached_agent = False
@@ -18365,6 +18467,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform=platform_key,
                     user_id=source.user_id,
                     user_id_alt=source.user_id_alt,
+                    principal_binding=_governed_principal_binding,
                     user_name=source.user_name,
                     chat_id=source.chat_id,
                     chat_name=source.chat_name,
@@ -18387,6 +18490,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
+
+            if _governed_principal_binding is not None:
+                memory_manager = getattr(agent, "_memory_manager", None)
+                if memory_manager is None:
+                    from hermes_cli.flexa_governed import GovernedProfileError
+
+                    raise GovernedProfileError("managed memory provider is unavailable")
+                memory_manager.bind_governed_principal(
+                    _governed_principal_binding
+                )
+                # Cached agents must own the same freshly verified binding
+                # that was just installed on their provider.  Channel ingress
+                # derives the canonical turn principal from this private
+                # process-local proof and fails closed when it is absent.
+                agent._governed_principal_binding = (
+                    _governed_principal_binding
+                )
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.

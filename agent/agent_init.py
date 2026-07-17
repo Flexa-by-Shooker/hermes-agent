@@ -311,6 +311,8 @@ def init_agent(
     platform: str = None,
     user_id: str = None,
     user_id_alt: str = None,
+    principal_assertion: Dict[str, Any] = None,
+    principal_binding: Any = None,
     user_name: str = None,
     chat_id: str = None,
     chat_name: str = None,
@@ -396,6 +398,11 @@ def init_agent(
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
     agent._user_id_alt = user_id_alt  # Optional stable alternate platform identifier
+    # Short-lived assertion content is consumed during initialization and kept
+    # only inside an opaque, non-repr process-local binding so the governed
+    # adapter can forward it to Engine.  It is never placed in model context or
+    # ordinary log fields.
+    agent._governed_principal_binding = principal_binding
     agent._user_name = user_name
     agent._chat_id = chat_id
     agent._chat_name = chat_name
@@ -1313,8 +1320,10 @@ def init_agent(
         GovernedProfileError as _GovernedProfileError,
         governed_memory_scope as _governed_memory_scope,
         governed_mode as _flexa_governed_mode,
+        require_governed_principal_binding as _require_governed_principal_binding,
         require_governed_memory_provider as _require_governed_memory_provider,
         validate_governed_memory_config as _validate_governed_memory_config,
+        verify_governed_principal_assertion as _verify_governed_principal_assertion,
     )
     _governed_memory = _flexa_governed_mode()
     try:
@@ -1332,10 +1341,22 @@ def init_agent(
         if skip_memory:
             raise _GovernedProfileError("managed memory cannot be skipped")
         _mem_provider_name = _validate_governed_memory_config(mem_config)
+        if principal_binding is None:
+            agent._governed_principal_binding = _verify_governed_principal_assertion(
+                principal_assertion,
+                platform=platform or "cli",
+                user_id=agent._user_id,
+                user_id_alt=agent._user_id_alt,
+            )
+        else:
+            agent._governed_principal_binding = _require_governed_principal_binding(
+                principal_binding
+            )
         _governed_scope = _governed_memory_scope(
             platform=platform or "cli",
             user_id=agent._user_id,
             user_id_alt=agent._user_id_alt,
+            principal_binding=agent._governed_principal_binding,
         )
     else:
         _mem_provider_name = str(mem_config.get("provider", "") or "").strip()
@@ -1402,6 +1423,9 @@ def init_agent(
                     }
                     if _governed_scope is not None:
                         _init_kwargs["flexa_scope"] = dict(_governed_scope)
+                        _init_kwargs["flexa_principal_binding"] = (
+                            agent._governed_principal_binding
+                        )
                     if _init_kwargs["platform"] == "cli":
                         _init_kwargs["warning_callback"] = agent._emit_warning
                         _init_kwargs["status_callback"] = agent._emit_status
