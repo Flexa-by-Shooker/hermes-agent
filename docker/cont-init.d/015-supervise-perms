@@ -44,10 +44,30 @@ set -eu
 # point here. Per-service supervise/ + event/ retain root ownership for
 # s6-supervise while granting group access to the hermes runtime user.
 SVC_ROOT=/run/s6-rc/servicedirs
+SCAN_ROOT=/run/service
 
 if [ ! -d "$SVC_ROOT" ]; then
     echo "[supervise-perms] $SVC_ROOT not present; skipping"
     exit 0
+fi
+
+# s6-svscanctl and the shutdown helper use the scanner control FIFO and
+# mutate service links in the top-level scandir. Keep root as owner while
+# granting only the hermes group access to the container-local tmpfs tree.
+if [ -d "$SCAN_ROOT" ]; then
+    chown root:hermes "$SCAN_ROOT" 2>/dev/null || \
+        echo "[supervise-perms] could not set ownership on $SCAN_ROOT"
+    chmod 0770 "$SCAN_ROOT" 2>/dev/null || true
+    if [ -d "$SCAN_ROOT/.s6-svscan" ]; then
+        chown root:hermes "$SCAN_ROOT/.s6-svscan" 2>/dev/null || \
+            echo "[supervise-perms] could not set scanner ownership"
+        chmod 0710 "$SCAN_ROOT/.s6-svscan" 2>/dev/null || true
+        if [ -p "$SCAN_ROOT/.s6-svscan/control" ]; then
+            chown root:hermes "$SCAN_ROOT/.s6-svscan/control" 2>/dev/null || \
+                echo "[supervise-perms] could not set scanner control ownership"
+            chmod 0660 "$SCAN_ROOT/.s6-svscan/control" 2>/dev/null || true
+        fi
+    fi
 fi
 
 for svc in "$SVC_ROOT"/*; do

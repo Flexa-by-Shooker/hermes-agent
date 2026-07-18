@@ -58,19 +58,11 @@ fi
 # don't try to write to /root.
 export HOME="$HERMES_HOME"
 
-# Save the Docker -w (or default) working directory before init
-# scripts cd to the governed Hermes root, so the container starts in the
-# directory the user requested.
-_hermes_orig_cwd="${HERMES_ORIG_CWD:-$PWD}"
-
-cd "$HERMES_HOME"
+# Activating the immutable environment does not require traversing mutable
+# state. Preserve Docker's reviewed working directory and avoid a pre-drop
+# access dependency on the employee-state mount.
 # shellcheck disable=SC1091
 . /opt/hermes/.venv/bin/activate
-
-# Restore the original working directory before handing off to
-# the user's command so `hermes chat` starts in the Docker -w
-# directory, not the governed state root.
-cd "$_hermes_orig_cwd"
 
 if [ $# -eq 0 ]; then
     drop hermes
