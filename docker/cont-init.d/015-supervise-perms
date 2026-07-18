@@ -25,9 +25,10 @@
 #    image-build time under /etc/s6-overlay/s6-rc.d/*: these are
 #    compiled by s6-rc at boot, and s6-supervise spawns BEFORE
 #    cont-init.d gets to run — so by the time we're here, the
-#    supervise/ tree is already there as root:root 0700. We chown
-#    it here. s6-supervise will keep using the same files; it never
-#    re-asserts ownership on a running service.
+#    supervise/ tree is already there as root:root 0700. Keep root as
+#    owner for s6-supervise and grant the hermes group the minimum
+#    control access. This remains valid when the container deliberately
+#    drops DAC_OVERRIDE from its bootstrap capability set.
 #
 # This script runs as root after 01-hermes-setup but before
 # 02-reconcile-profiles, so the chowns are settled before the
@@ -40,8 +41,8 @@ set -eu
 
 # /run/s6-rc/servicedirs holds the live, compiled service directories
 # for every static (s6-rc) service. Symlinks under /run/service/*
-# point here. Per-service supervise/ + event/ both need hermes
-# ownership for s6-svstat etc. to work as hermes.
+# point here. Per-service supervise/ + event/ retain root ownership for
+# s6-supervise while granting group access to the hermes runtime user.
 SVC_ROOT=/run/s6-rc/servicedirs
 
 if [ ! -d "$SVC_ROOT" ]; then
@@ -63,16 +64,15 @@ for svc in "$SVC_ROOT"/*; do
 
     # supervise/ tree — needed by s6-svstat / s6-svc.
     if [ -d "$svc/supervise" ]; then
-        chown -R hermes:hermes "$svc/supervise" 2>/dev/null || \
-            echo "[supervise-perms] could not chown $svc/supervise"
+        chown -R root:hermes "$svc/supervise" 2>/dev/null || \
+            echo "[supervise-perms] could not set ownership on $svc/supervise"
         # 0710 = group searchable. ``s6-svstat`` only needs to openat
         # status, not list the dir, but giving the hermes group +x is
         # the minimum that lets group members access the contents.
         chmod 0710 "$svc/supervise" 2>/dev/null || true
         # supervise/control is a FIFO that s6-svc writes commands
-        # into; the hermes user needs +w. Owner is already hermes
-        # after the recursive chown above; widen perms to 0660 so
-        # ``s6-svc`` works for any member of the hermes group too.
+        # into; the hermes group needs +w while root remains the owner
+        # used by s6-supervise.
         if [ -p "$svc/supervise/control" ]; then
             chmod 0660 "$svc/supervise/control" 2>/dev/null || true
         fi
@@ -80,11 +80,11 @@ for svc in "$SVC_ROOT"/*; do
 
     # Top-level event/ dir — s6-svlisten1 / s6-svwait subscribe here.
     if [ -d "$svc/event" ]; then
-        chown hermes:hermes "$svc/event" 2>/dev/null || \
-            echo "[supervise-perms] could not chown $svc/event"
+        chown root:hermes "$svc/event" 2>/dev/null || \
+            echo "[supervise-perms] could not set ownership on $svc/event"
         # Preserve s6's 03730 mode (setgid + g+rwx + sticky).
         chmod 03730 "$svc/event" 2>/dev/null || true
     fi
 done
 
-echo "[supervise-perms] chowned supervise/ trees for static s6-rc services"
+echo "[supervise-perms] granted hermes group access to static s6-rc services"
