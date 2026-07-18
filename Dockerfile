@@ -311,7 +311,15 @@ COPY --link --chmod=a+rX,go-w . .
 # Link hermes-agent itself (editable). Deps are already installed in the
 # cached layer above; `--no-deps` makes this a fast egg-link creation with no
 # resolution or downloads.
-RUN uv pip install --no-cache-dir --no-deps -e "."
+RUN set -eu; \
+    uv pip install --no-cache-dir --no-deps -e "."; \
+    set -- /opt/hermes/.venv/lib/python*/site-packages/hermes_agent-*.dist-info; \
+    test "$#" -eq 1; \
+    dist_info="$1"; \
+    rm -f "${dist_info}/uv_cache.json"; \
+    sed -i '\|/uv_cache\.json,|d' "${dist_info}/RECORD"; \
+    test ! -e "${dist_info}/uv_cache.json"; \
+    ! grep -F '/uv_cache.json,' "${dist_info}/RECORD"
 
 # Wire the exec shim and install-method stamp.  Files under /opt/hermes are
 # already root-owned (COPY, uv sync, npm install all run as root) and

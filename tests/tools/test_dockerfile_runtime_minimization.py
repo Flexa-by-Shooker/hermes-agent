@@ -118,3 +118,12 @@ def test_python_olm_uses_the_snapshot_binary_instead_of_a_local_source_build() -
     assert "cp -a /usr/lib/python3/dist-packages/olm" in text
     assert "python_olm-3.2.16.egg-info" in text
     assert 'importlib.metadata.version("python-olm") == "3.2.16"' in text
+
+
+def test_editable_install_drops_uvs_builder_local_cache_metadata() -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+
+    assert "hermes_agent-*.dist-info" in text
+    assert 'rm -f "${dist_info}/uv_cache.json"' in text
+    assert "sed -i '\\|/uv_cache\\.json,|d' \"${dist_info}/RECORD\"" in text
+    assert "! grep -F '/uv_cache.json,' \"${dist_info}/RECORD\"" in text
