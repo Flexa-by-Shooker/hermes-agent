@@ -1,10 +1,13 @@
 """Security contracts for the production container's final runtime stage."""
 
 from pathlib import Path
+import tomllib
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCKERFILE = REPO_ROOT / "Dockerfile"
+PYPROJECT = REPO_ROOT / "pyproject.toml"
+UV_LOCK = REPO_ROOT / "uv.lock"
 
 
 def _final_runtime_stage() -> str:
@@ -17,6 +20,20 @@ def _final_runtime_stage() -> str:
     ]
     assert len(starts) == 1, "Dockerfile must define exactly one named final runtime stage"
     return "\n".join(lines[starts[0] :])
+
+
+def test_flexa_engine_direct_dependencies_are_pinned_in_the_shared_runtime_venv() -> None:
+    project = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]
+    dependencies = set(project["dependencies"])
+    assert "typer==0.24.1" in dependencies
+    assert "tzdata==2025.3" in dependencies
+    assert not any(item.startswith("tzdata==") and ";" in item for item in dependencies)
+
+    lock = tomllib.loads(UV_LOCK.read_text(encoding="utf-8"))
+    hermes = next(package for package in lock["package"] if package["name"] == "hermes-agent")
+    locked = {item["name"]: item for item in hermes["dependencies"]}
+    assert locked["typer"] == {"name": "typer"}
+    assert locked["tzdata"] == {"name": "tzdata"}
 
 
 def test_final_image_is_built_from_a_separate_minimal_runtime_stage() -> None:

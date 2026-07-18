@@ -48,6 +48,9 @@ dependencies = [
   "fire==0.7.1",
   "httpx[socks]==0.28.1",
   "rich==14.3.3",
+  # Flexa Engine's production CLI is installed into this shared venv with
+  # --no-deps, so its direct CLI runtime must be part of the pinned base set.
+  "typer==0.24.1",
   "tenacity==9.1.4",
   "pyyaml==6.0.3",
   "ruamel.yaml==0.18.17",
@@ -90,12 +93,10 @@ dependencies = [
   # cryptography is pulled in transitively by PyJWT[crypto]; pin it explicitly
   # so the WeCom/Weixin crypto paths can't drift below the CVE-fixed floor.
   "cryptography==48.0.1",  # GHSA-537c-gmf6-5ccf
-  # Windows has no IANA tzdata shipped with the OS, so Python's ``zoneinfo``
-  # (PEP 615) raises ``ZoneInfoNotFoundError`` for every non-UTC timezone
-  # out of the box.  ``tzdata`` ships the Olson database as a data package
-  # Python resolves automatically.  No-op on Linux/macOS (which have
-  # /usr/share/zoneinfo).  Credits: PR #13182 (@sprmn24).
-  "tzdata==2025.3; sys_platform == 'win32'",
+  # Keep the Python tzdata distribution available on every platform. Flexa
+  # Engine declares it as a direct runtime dependency so its metadata and
+  # timezone behavior must remain complete in the shared production venv.
+  "tzdata==2025.3",
   # Cross-platform process / PID management.  `psutil` is the canonical
   # answer for "is this PID alive" and process-tree walking across Linux,
   # macOS and Windows.  It replaces POSIX-only idioms like `os.kill(pid, 0)`
