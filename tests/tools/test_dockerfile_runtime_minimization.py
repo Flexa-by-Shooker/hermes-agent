@@ -54,6 +54,8 @@ def test_final_runtime_excludes_build_and_administrative_tools() -> None:
         "python3-venv",
         "ripgrep",
         "xvfb",
+        "/tmp/libcap2-runtime.deb",
+        "1:2.75-10+deb13u1",
     ):
         assert required in runtime
 

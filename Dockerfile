@@ -430,6 +430,20 @@ RUN set -eu; \
     apt-get autoremove -y --purge; \
     rm -rf /var/lib/apt/lists/*
 
+# Apply the checksum-locked libcap2 security update to the final runtime stage,
+# not only to the disposable build stage.
+ADD --checksum=sha256:f8db64b636eb3e4f805b3f5f62cc32b99beec92df49920a9c24d34902bba0ce9 https://snapshot.debian.org/file/9d57cee3a8050e82ebd1ba078b5767a321bbf5ad /tmp/libcap2-runtime.deb
+RUN set -eu; \
+    test "${TARGETARCH:-amd64}" = 'amd64'; \
+    printf '%s  %s\n' 'f8db64b636eb3e4f805b3f5f62cc32b99beec92df49920a9c24d34902bba0ce9' /tmp/libcap2-runtime.deb | sha256sum -c -; \
+    test "$(dpkg-deb -f /tmp/libcap2-runtime.deb Package)" = 'libcap2'; \
+    test "$(dpkg-deb -f /tmp/libcap2-runtime.deb Architecture)" = 'amd64'; \
+    test "$(dpkg-deb -f /tmp/libcap2-runtime.deb Version)" = '1:2.75-10+deb13u1'; \
+    dpkg -i /tmp/libcap2-runtime.deb; \
+    test "$(dpkg-query -W -f='${Version}' libcap2)" = '1:2.75-10+deb13u1'; \
+    test -z "$(dpkg --audit)"; \
+    rm /tmp/libcap2-runtime.deb
+
 RUN useradd -u 10000 -m -d /var/lib/hermes hermes
 
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
