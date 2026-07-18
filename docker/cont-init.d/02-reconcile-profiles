@@ -15,29 +15,28 @@
 # `running` — see hermes_cli/container_boot.py.
 #
 # Phase 4 also needs hermes-user writes to /run/service/ (so the
-# profile create/delete hooks can register/unregister at runtime),
-# so we chown the scandir before invoking the reconciler. We
-# additionally chown the s6-svscan control FIFO so the hermes user
-# can send rescan signals via ``s6-svscanctl -a``; without this the
-# entire runtime-registration path is inert under UID 10000 (the
-# Python wrapper catches the resulting EACCES, prints a warning,
-# and swallows the failure).
+# profile create/delete hooks can register/unregister at runtime).
+# Keep root as owner of the scanner tree and its control endpoints,
+# while granting the hermes group the required access. The ownership
+# matters because s6-overlay's own legacy-services action runs as root;
+# root deliberately has no DAC_OVERRIDE in the production container.
 set -e
 
-# Make the dynamic scandir hermes-writable. The directory itself
-# starts root-owned by s6-overlay.
-chown hermes:hermes /run/service 2>/dev/null || true
+# Make the dynamic scandir hermes-group-writable without preventing
+# root-owned s6-overlay services from accessing it.
+chown root:hermes /run/service 2>/dev/null || true
+chmod 0770 /run/service 2>/dev/null || true
 
-# Make the svscan control FIFO hermes-writable so s6-svscanctl -a
-# / -an work for the hermes user. The FIFO is created by s6-svscan
-# at PID-1 startup, so by the time this cont-init.d script runs it
-# already exists. Both ``control`` and ``lock`` need to be writable
-# for the various svscanctl operations; the directory itself stays
-# root-owned (we only need to touch the two FIFOs/locks inside).
+# Make the svscan control endpoints root-owned and hermes-group-writable
+# so both s6-overlay and the UID-10000 runtime can issue scanner commands.
+# They exist by the time this cont-init.d script runs.
 if [ -d /run/service/.s6-svscan ]; then
+    chown root:hermes /run/service/.s6-svscan 2>/dev/null || true
+    chmod 0710 /run/service/.s6-svscan 2>/dev/null || true
     for entry in control lock; do
         if [ -e "/run/service/.s6-svscan/$entry" ]; then
-            chown hermes:hermes "/run/service/.s6-svscan/$entry" 2>/dev/null || true
+            chown root:hermes "/run/service/.s6-svscan/$entry" 2>/dev/null || true
+            chmod 0660 "/run/service/.s6-svscan/$entry" 2>/dev/null || true
         fi
     done
 fi
