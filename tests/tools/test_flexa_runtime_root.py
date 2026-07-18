@@ -16,7 +16,9 @@ def _text(relative: str) -> str:
 def test_dockerfile_declares_only_governed_writable_roots() -> None:
     dockerfile = _text("Dockerfile")
 
-    assert f"RUN useradd -u 10000 -m -d {RUNTIME_ROOT} hermes" in dockerfile
+    assert f"hermes:x:10000:10000::{RUNTIME_ROOT}:/bin/sh" in dockerfile
+    assert "install -d -o 10000 -g 10000 -m 0755 /var/lib/hermes" in dockerfile
+    assert "useradd " not in dockerfile
     assert f"ENV HERMES_HOME={RUNTIME_ROOT}" in dockerfile
     assert f"ENV HERMES_WRITE_SAFE_ROOT={RUNTIME_ROOT}:/workspaces" in dockerfile
     assert "HERMES_LAZY_INSTALL_TARGET" not in dockerfile

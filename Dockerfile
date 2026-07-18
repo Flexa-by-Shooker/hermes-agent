@@ -71,7 +71,7 @@ RUN set -eu; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg \
-        gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev procps \
+        gcc g++ make cmake python3-dev python3-venv python3-olm libffi-dev libolm-dev procps \
         git openssh-client docker-cli xz-utils unzip; \
     rm -rf /var/lib/apt/lists/* /var/log/apt/*; \
     rm -f /var/log/dpkg.log /var/log/alternatives.log /var/cache/ldconfig/aux-cache
@@ -233,7 +233,7 @@ RUN set -eu; \
     test "$(dpkg-query -W -f='${Architecture}' libcap2)" = 'amd64'; \
     test "$(dpkg-query -W -f='${Version}' libcap2)" = '1:2.75-10+deb13u1'; \
     test -z "$(dpkg --audit)"; \
-    rm -f /tmp/libcap2.deb /var/log/dpkg.log
+    rm -f /tmp/libcap2.deb /var/log/dpkg.log /var/cache/ldconfig/aux-cache
 
 # ---------- Layer-cached Python dependency install ----------
 # Copy only pyproject.toml + uv.lock so the Python dep resolve + wheel
@@ -276,7 +276,17 @@ RUN set -eu; \
 # The editable link is created after the source copy below.
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
-RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix
+RUN set -eu; \
+    uv sync --frozen --no-install-project --no-install-package python-olm \
+        --extra all --extra messaging --extra anthropic --extra bedrock \
+        --extra azure-identity --extra hindsight --extra matrix; \
+    site_packages="$(/opt/hermes/.venv/bin/python -c \
+        'import sysconfig; print(sysconfig.get_paths()["purelib"])')"; \
+    cp -a /usr/lib/python3/dist-packages/_libolm.abi3.so "${site_packages}/"; \
+    cp -a /usr/lib/python3/dist-packages/olm "${site_packages}/"; \
+    cp -a /usr/lib/python3/dist-packages/python_olm-3.2.16.egg-info "${site_packages}/"; \
+    /opt/hermes/.venv/bin/python -c \
+        'import importlib.metadata, olm; assert importlib.metadata.version("python-olm") == "3.2.16"'
 
 # ---------- Frontend build (cached independently from Python source) ----------
 # Copy only the frontend source trees first so that Python-only changes don't
@@ -526,7 +536,7 @@ RUN set -eu; \
     dpkg -i /tmp/libcap2-runtime.deb; \
     test "$(dpkg-query -W -f='${Version}' libcap2)" = '1:2.75-10+deb13u1'; \
     test -z "$(dpkg --audit)"; \
-    rm -f /tmp/libcap2-runtime.deb /var/log/dpkg.log
+    rm -f /tmp/libcap2-runtime.deb /var/log/dpkg.log /var/cache/ldconfig/aux-cache
 
 RUN set -eu; \
     epoch_days=$((SOURCE_DATE_EPOCH / 86400)); \

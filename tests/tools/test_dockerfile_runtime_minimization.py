@@ -104,6 +104,17 @@ def test_generated_package_and_user_state_is_clock_independent() -> None:
 
     assert text.count("/var/log/apt/*") >= 2
     assert text.count("/var/log/dpkg.log") >= 2
-    assert text.count("/var/cache/ldconfig/aux-cache") >= 2
+    assert text.count("/var/cache/ldconfig/aux-cache") >= 4
     assert text.count("epoch_days=$((SOURCE_DATE_EPOCH / 86400))") >= 2
-    assert text.count("$1 == \"hermes\" { $3 = epoch_days }") >= 2
+    assert text.count("hermes:!:%s:0:99999:7:::") >= 2
+
+
+def test_python_olm_uses_the_snapshot_binary_instead_of_a_local_source_build() -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+
+    assert "python3-olm libffi-dev libolm-dev" in text
+    assert "--no-install-package python-olm" in text
+    assert "cp -a /usr/lib/python3/dist-packages/_libolm.abi3.so" in text
+    assert "cp -a /usr/lib/python3/dist-packages/olm" in text
+    assert "python_olm-3.2.16.egg-info" in text
+    assert 'importlib.metadata.version("python-olm") == "3.2.16"' in text
