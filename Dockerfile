@@ -1,3 +1,8 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+ARG SOURCE_DATE_EPOCH=1783793773
+ARG DEBIAN_SNAPSHOT=20260718T000000Z
+
 FROM ghcr.io/astral-sh/uv:0.11.29-python3.13-trixie@sha256:d880a6830733cadff8d92e4f7fda20d9a23985f7c198183ef7e5f86bea170cf8 AS uv_source
 # Node 22 LTS source stage. Debian trixie's bundled nodejs is pinned to 20.x
 # which reached EOL in April 2026 — we copy node + npm + corepack from the
@@ -23,12 +28,17 @@ RUN set -eu; \
 
 FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS build
 ARG TARGETARCH
+ARG SOURCE_DATE_EPOCH
+ARG DEBIAN_SNAPSHOT
 
 # Disable Python stdout buffering to ensure logs are printed immediately.
 # Do not write .pyc files at runtime: /opt/hermes is immutable in the
 # published container and writable state belongs under /var/lib/hermes.
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+ENV TZ=UTC
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
 
 # Store Playwright browsers outside the volume mount so the build-time
 # install stays separate from the governed runtime-state bind mount.
@@ -41,10 +51,30 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # replaces tini with s6-overlay's /init (PID 1 = s6-svscan), which reaps
 # zombies non-blockingly on SIGCHLD and additionally supervises the main
 # hermes process, the dashboard, and per-profile gateways.
-RUN apt-get update && \
+RUN set -eu; \
+    rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*; \
+    printf '%s\n' \
+        'Types: deb' \
+        "URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/" \
+        'Suites: trixie trixie-updates' \
+        'Components: main' \
+        'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
+        'Check-Valid-Until: no' \
+        '' \
+        'Types: deb' \
+        "URIs: http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/" \
+        'Suites: trixie-security' \
+        'Components: main' \
+        'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
+        'Check-Valid-Until: no' \
+        > /etc/apt/sources.list.d/debian-snapshot.sources; \
+    apt-get update; \
     apt-get install -y --no-install-recommends \
-    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev procps git openssh-client docker-cli xz-utils && \
-    rm -rf /var/lib/apt/lists/*
+        ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg \
+        gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev procps \
+        git openssh-client docker-cli xz-utils unzip; \
+    rm -rf /var/lib/apt/lists/* /var/log/apt/*; \
+    rm -f /var/log/dpkg.log /var/log/alternatives.log /var/cache/ldconfig/aux-cache
 
 # ---------- s6-overlay install ----------
 # s6-overlay provides supervision for the main hermes process, the dashboard,
@@ -103,7 +133,14 @@ RUN set -eu; \
     ln -sf /init /usr/bin/tini
 
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
-RUN useradd -u 10000 -m -d /var/lib/hermes hermes
+RUN set -eu; \
+    useradd -u 10000 -m -d /var/lib/hermes hermes; \
+    epoch_days=$((SOURCE_DATE_EPOCH / 86400)); \
+    awk -F: -v OFS=: -v epoch_days="${epoch_days}" \
+        '$1 == "hermes" { $3 = epoch_days } { print }' \
+        /etc/shadow > /tmp/shadow; \
+    install -o root -g shadow -m 0640 /tmp/shadow /etc/shadow; \
+    rm -f /tmp/shadow /var/log/lastlog /var/log/faillog
 
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
 
@@ -149,8 +186,36 @@ COPY apps/shared/ apps/shared/
 # guards against a future regression if the source npm version changes.
 ENV npm_config_install_links=false
 
-RUN npm install --prefer-offline --no-audit && \
-    npx --yes playwright@1.61.1 install chromium --only-shell && \
+# Playwright's browser payloads are installed from exact, checksum-locked
+# archives instead of an npx transaction and a mutable CDN response. The paths
+# and completion markers match Playwright 1.61.1's chromium-headless-shell 1228
+# and ffmpeg 1011 registry contract.
+ADD --checksum=sha256:410c9407d5de3fea80d9398666be06f2aa09154a3fa7b327dc254e336bb4c4b7 https://cdn.playwright.dev/builds/cft/149.0.7827.55/linux64/chrome-headless-shell-linux64.zip /tmp/playwright-chromium.zip
+ADD --checksum=sha256:ebc74fc5b94830176a3c2914ae96bd8bc7f6a91f4f33890230f84a172ee61ccc https://cdn.playwright.dev/dbazure/download/playwright/builds/ffmpeg/1011/ffmpeg-linux.zip /tmp/playwright-ffmpeg.zip
+RUN set -eu; \
+    npm install --prefer-offline --no-audit; \
+    printf '%s  %s\n' \
+        '410c9407d5de3fea80d9398666be06f2aa09154a3fa7b327dc254e336bb4c4b7' \
+        /tmp/playwright-chromium.zip | sha256sum -c -; \
+    printf '%s  %s\n' \
+        'ebc74fc5b94830176a3c2914ae96bd8bc7f6a91f4f33890230f84a172ee61ccc' \
+        /tmp/playwright-ffmpeg.zip | sha256sum -c -; \
+    install -d -m 0755 \
+        /opt/hermes/.playwright/chromium_headless_shell-1228 \
+        /opt/hermes/.playwright/ffmpeg-1011; \
+    unzip -q /tmp/playwright-chromium.zip \
+        -d /opt/hermes/.playwright/chromium_headless_shell-1228; \
+    unzip -q /tmp/playwright-ffmpeg.zip \
+        -d /opt/hermes/.playwright/ffmpeg-1011; \
+    chmod 0755 \
+        /opt/hermes/.playwright/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell \
+        /opt/hermes/.playwright/ffmpeg-1011/ffmpeg-linux; \
+    touch \
+        /opt/hermes/.playwright/chromium_headless_shell-1228/INSTALLATION_COMPLETE \
+        /opt/hermes/.playwright/chromium_headless_shell-1228/DEPENDENCIES_VALIDATED \
+        /opt/hermes/.playwright/ffmpeg-1011/INSTALLATION_COMPLETE \
+        /opt/hermes/.playwright/ffmpeg-1011/DEPENDENCIES_VALIDATED; \
+    rm -f /tmp/playwright-chromium.zip /tmp/playwright-ffmpeg.zip; \
     npm cache clean --force
 
 # Debian Snapshot hotfix applied after Playwright's own APT transaction so the
@@ -168,7 +233,7 @@ RUN set -eu; \
     test "$(dpkg-query -W -f='${Architecture}' libcap2)" = 'amd64'; \
     test "$(dpkg-query -W -f='${Version}' libcap2)" = '1:2.75-10+deb13u1'; \
     test -z "$(dpkg --audit)"; \
-    rm /tmp/libcap2.deb
+    rm -f /tmp/libcap2.deb /var/log/dpkg.log
 
 # ---------- Layer-cached Python dependency install ----------
 # Copy only pyproject.toml + uv.lock so the Python dep resolve + wheel
@@ -386,6 +451,8 @@ CMD [ ]
 # and encrypted-messaging runtime capabilities.
 FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS runtime
 ARG TARGETARCH
+ARG SOURCE_DATE_EPOCH
+ARG DEBIAN_SNAPSHOT
 ARG S6_OVERLAY_VERSION=3.2.3.0
 ARG S6_OVERLAY_NOARCH_SHA256=b720f9d9340efc8bb07528b9743813c836e4b02f8693d90241f047998b4c53cf
 ARG S6_OVERLAY_X86_64_SHA256=a93f02882c6ed46b21e7adb5c0add86154f01236c93cd82c7d682722e8840563
@@ -393,6 +460,22 @@ ARG S6_OVERLAY_AARCH64_SHA256=0952056ff913482163cc30e35b2e944b507ba1025d78f5becb
 ARG S6_OVERLAY_SYMLINKS_SHA256=a60dc5235de3ecbcf874b9c1f18d73263ab99b289b9329aa950e8729c4789f0e
 
 RUN set -eu; \
+    rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*; \
+    printf '%s\n' \
+        'Types: deb' \
+        "URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/" \
+        'Suites: trixie trixie-updates' \
+        'Components: main' \
+        'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
+        'Check-Valid-Until: no' \
+        '' \
+        'Types: deb' \
+        "URIs: http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/" \
+        'Suites: trixie-security' \
+        'Components: main' \
+        'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
+        'Check-Valid-Until: no' \
+        > /etc/apt/sources.list.d/debian-snapshot.sources; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates curl xz-utils \
@@ -428,7 +511,8 @@ RUN set -eu; \
     ln -sf /init /usr/bin/tini; \
     apt-get purge -y curl xz-utils; \
     apt-get autoremove -y --purge; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* /var/log/apt/*; \
+    rm -f /var/log/dpkg.log /var/log/alternatives.log /var/cache/ldconfig/aux-cache
 
 # Apply the checksum-locked libcap2 security update to the final runtime stage,
 # not only to the disposable build stage.
@@ -442,9 +526,16 @@ RUN set -eu; \
     dpkg -i /tmp/libcap2-runtime.deb; \
     test "$(dpkg-query -W -f='${Version}' libcap2)" = '1:2.75-10+deb13u1'; \
     test -z "$(dpkg --audit)"; \
-    rm /tmp/libcap2-runtime.deb
+    rm -f /tmp/libcap2-runtime.deb /var/log/dpkg.log
 
-RUN useradd -u 10000 -m -d /var/lib/hermes hermes
+RUN set -eu; \
+    useradd -u 10000 -m -d /var/lib/hermes hermes; \
+    epoch_days=$((SOURCE_DATE_EPOCH / 86400)); \
+    awk -F: -v OFS=: -v epoch_days="${epoch_days}" \
+        '$1 == "hermes" { $3 = epoch_days } { print }' \
+        /etc/shadow > /tmp/shadow; \
+    install -o root -g shadow -m 0640 /tmp/shadow /etc/shadow; \
+    rm -f /tmp/shadow /var/log/lastlog /var/log/faillog
 
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
 COPY --chmod=0755 --from=node_source /usr/local/bin/node /usr/local/bin/
