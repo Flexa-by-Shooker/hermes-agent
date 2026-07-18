@@ -134,13 +134,13 @@ RUN set -eu; \
 
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
 RUN set -eu; \
-    useradd -u 10000 -m -d /var/lib/hermes hermes; \
     epoch_days=$((SOURCE_DATE_EPOCH / 86400)); \
-    awk -F: -v OFS=: -v epoch_days="${epoch_days}" \
-        '$1 == "hermes" { $3 = epoch_days } { print }' \
-        /etc/shadow > /tmp/shadow; \
-    install -o root -g shadow -m 0640 /tmp/shadow /etc/shadow; \
-    rm -f /tmp/shadow /var/log/lastlog /var/log/faillog
+    printf 'hermes:x:10000:10000::/var/lib/hermes:/bin/sh\n' >> /etc/passwd; \
+    printf 'hermes:x:10000:\n' >> /etc/group; \
+    printf 'hermes:!:%s:0:99999:7:::\n' "${epoch_days}" >> /etc/shadow; \
+    printf 'hermes:!::\n' >> /etc/gshadow; \
+    install -d -o 10000 -g 10000 -m 0755 /var/lib/hermes; \
+    rm -f /var/log/lastlog /var/log/faillog
 
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
 
@@ -529,13 +529,13 @@ RUN set -eu; \
     rm -f /tmp/libcap2-runtime.deb /var/log/dpkg.log
 
 RUN set -eu; \
-    useradd -u 10000 -m -d /var/lib/hermes hermes; \
     epoch_days=$((SOURCE_DATE_EPOCH / 86400)); \
-    awk -F: -v OFS=: -v epoch_days="${epoch_days}" \
-        '$1 == "hermes" { $3 = epoch_days } { print }' \
-        /etc/shadow > /tmp/shadow; \
-    install -o root -g shadow -m 0640 /tmp/shadow /etc/shadow; \
-    rm -f /tmp/shadow /var/log/lastlog /var/log/faillog
+    printf 'hermes:x:10000:10000::/var/lib/hermes:/bin/sh\n' >> /etc/passwd; \
+    printf 'hermes:x:10000:\n' >> /etc/group; \
+    printf 'hermes:!:%s:0:99999:7:::\n' "${epoch_days}" >> /etc/shadow; \
+    printf 'hermes:!::\n' >> /etc/gshadow; \
+    install -d -o 10000 -g 10000 -m 0755 /var/lib/hermes; \
+    rm -f /var/log/lastlog /var/log/faillog
 
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
 COPY --chmod=0755 --from=node_source /usr/local/bin/node /usr/local/bin/
