@@ -21,7 +21,7 @@ RUN set -eu; \
     test "$(node -p 'require("/usr/local/lib/node_modules/npm/node_modules/tinyglobby/node_modules/picomatch/package.json").version')" = '4.0.4'; \
     rm /tmp/npm.tgz
 
-FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da
+FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS build
 ARG TARGETARCH
 
 # Disable Python stdout buffering to ensure logs are printed immediately.
@@ -150,7 +150,7 @@ COPY apps/shared/ apps/shared/
 ENV npm_config_install_links=false
 
 RUN npm install --prefer-offline --no-audit && \
-    npx playwright install --with-deps chromium --only-shell && \
+    npx --yes playwright@1.61.1 install chromium --only-shell && \
     npm cache clean --force
 
 # Debian Snapshot hotfix applied after Playwright's own APT transaction so the
@@ -376,5 +376,86 @@ ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:${PATH}"
 # and exec's the final program so its exit code becomes the container
 # exit code. Without the wrapper-as-ENTRYPOINT, leading-dash args
 # like `--version` would be intercepted by /init's POSIX shell.
+ENTRYPOINT [ "/init", "/opt/hermes/docker/main-wrapper.sh" ]
+CMD [ ]
+
+# ---------- Minimal production runtime ----------
+# Build compilers, development headers, npm/corepack, Docker CLI, and SSH are
+# intentionally confined to the build stage. The final stage installs only
+# the explicitly supported Python, browser, media, Git-over-HTTPS, terminal,
+# and encrypted-messaging runtime capabilities.
+FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da AS runtime
+ARG TARGETARCH
+ARG S6_OVERLAY_VERSION=3.2.3.0
+ARG S6_OVERLAY_NOARCH_SHA256=b720f9d9340efc8bb07528b9743813c836e4b02f8693d90241f047998b4c53cf
+ARG S6_OVERLAY_X86_64_SHA256=a93f02882c6ed46b21e7adb5c0add86154f01236c93cd82c7d682722e8840563
+ARG S6_OVERLAY_AARCH64_SHA256=0952056ff913482163cc30e35b2e944b507ba1025d78f5becbb89367bf344581
+ARG S6_OVERLAY_SYMLINKS_SHA256=a60dc5235de3ecbcf874b9c1f18d73263ab99b289b9329aa950e8729c4789f0e
+
+RUN set -eu; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl xz-utils \
+        python3 python-is-python3 python3-venv \
+        procps git ripgrep ffmpeg libolm3 \
+        xvfb fonts-noto-color-emoji fonts-unifont libfontconfig1 libfreetype6 \
+        xfonts-scalable fonts-liberation fonts-ipafont-gothic fonts-wqy-zenhei \
+        fonts-tlwg-loma-otf fonts-freefont-ttf \
+        libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 \
+        libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 \
+        libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 \
+        libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2; \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) s6_arch="x86_64"; s6_arch_sha="${S6_OVERLAY_X86_64_SHA256}" ;; \
+        arm64) s6_arch="aarch64"; s6_arch_sha="${S6_OVERLAY_AARCH64_SHA256}" ;; \
+        *) echo "Unsupported TARGETARCH=${TARGETARCH} for s6-overlay" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --retry 3 -o /tmp/s6-overlay-noarch.tar.xz \
+        "https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz"; \
+    curl -fsSL --retry 3 -o /tmp/s6-overlay-arch.tar.xz \
+        "https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-${s6_arch}.tar.xz"; \
+    curl -fsSL --retry 3 -o /tmp/s6-overlay-symlinks-noarch.tar.xz \
+        "https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-symlinks-noarch.tar.xz"; \
+    { \
+        printf '%s  %s\n' "${S6_OVERLAY_NOARCH_SHA256}" /tmp/s6-overlay-noarch.tar.xz; \
+        printf '%s  %s\n' "${s6_arch_sha}" /tmp/s6-overlay-arch.tar.xz; \
+        printf '%s  %s\n' "${S6_OVERLAY_SYMLINKS_SHA256}" /tmp/s6-overlay-symlinks-noarch.tar.xz; \
+    } | sha256sum -c -; \
+    tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz; \
+    tar -C / -Jxpf /tmp/s6-overlay-arch.tar.xz; \
+    tar -C / -Jxpf /tmp/s6-overlay-symlinks-noarch.tar.xz; \
+    rm -f /tmp/s6-overlay-*.tar.xz; \
+    ln -sf /init /usr/bin/tini; \
+    apt-get purge -y curl xz-utils; \
+    apt-get autoremove -y --purge; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN useradd -u 10000 -m -d /var/lib/hermes hermes
+
+COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+COPY --chmod=0755 --from=node_source /usr/local/bin/node /usr/local/bin/
+COPY --from=build /opt/hermes /opt/hermes
+
+WORKDIR /opt/hermes
+
+COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
+RUN mkdir -p /etc/cont-init.d && \
+    printf '#!/command/with-contenv sh\nexec /opt/hermes/docker/stage2-hook.sh\n' \
+        > /etc/cont-init.d/01-hermes-setup && \
+    chmod +x /etc/cont-init.d/01-hermes-setup
+COPY --chmod=0755 docker/cont-init.d/015-supervise-perms /etc/cont-init.d/015-supervise-perms
+COPY --chmod=0755 docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-reconcile-profiles
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
+ENV npm_config_install_links=false
+ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
+ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
+ENV HERMES_HOME=/var/lib/hermes
+ENV HERMES_WRITE_SAFE_ROOT=/var/lib/hermes:/workspaces
+ENV HERMES_DISABLE_LAZY_INSTALLS=1
+ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:${PATH}"
+
 ENTRYPOINT [ "/init", "/opt/hermes/docker/main-wrapper.sh" ]
 CMD [ ]
