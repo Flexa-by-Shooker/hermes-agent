@@ -1319,7 +1319,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                     shown_end = offset + lines_kept - 1
                     result_dict["content"] = trimmed
                     result_dict["truncated"] = True
-                    result_dict["truncated_by"] = "bytes"
+                    result_dict["truncated_by"] = "chars"
                     result_dict["next_offset"] = next_offset
                     result_dict["hint"] = (
                         f"Output truncated at the {max_chars:,}-char read budget "
@@ -1470,7 +1470,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
             result.content = trimmed
             result_dict["content"] = trimmed
             result_dict["truncated"] = True
-            result_dict["truncated_by"] = "bytes"
+            result_dict["truncated_by"] = "chars"
             result_dict["next_offset"] = next_offset
             result_dict["hint"] = (
                 f"Output truncated at the {max_chars:,}-char read budget after "
