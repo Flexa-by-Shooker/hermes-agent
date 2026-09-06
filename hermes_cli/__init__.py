@@ -14,6 +14,10 @@ Provides subcommands for:
 import os
 import sys
 
+# Host deployment configuration must be captured before any profile dotenv
+# loader runs. Profile config and HTTP input cannot choose the control socket.
+_CONSOLIDA_CONTROL_SOCKET = os.environ.get("CONSOLIDA_CONTROL_SOCKET")
+
 __version__ = "0.20.0"
 __release_date__ = "2026.8.3"
 

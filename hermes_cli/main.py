@@ -9403,6 +9403,10 @@ def cmd_profile(args):
                             )
                             print('    export PATH="$HOME/.local/bin:$PATH"')
 
+            from hermes_cli.profile_lifecycle import notify_profile
+            provisioning = notify_profile(name, "profile_configured")
+            print(f"Provisioning: {provisioning['status']}")
+
             # Profile dir for display
             try:
                 profile_dir_display = "~/" + str(profile_dir.relative_to(Path.home()))

@@ -1181,6 +1181,11 @@ def create_profile(
     # unit-generation paths handle gateway lifecycle.
     _maybe_register_gateway_service(canon)
 
+    # Provisioning is a separate durable lifecycle. An unavailable controller
+    # must not roll back a successfully created profile or imply readiness.
+    from hermes_cli.profile_lifecycle import notify_profile
+    notify_profile(canon, "profile_created")
+
     return profile_dir
 
 

@@ -4335,8 +4335,8 @@ def _pool_codex_access_token() -> str:
 
     Used as a fallback by ``resolve_codex_runtime_credentials`` when the
     singleton has no creds.  Reads ``credential_pool.openai-codex`` entries
-    directly from auth.json and picks the first non-empty access_token,
-    preferring entries that are not currently in an exhaustion cooldown.
+    directly from auth.json and picks the first non-empty access_token that
+    is neither dead, expired, nor currently in an exhaustion cooldown.
     Returns ``""`` when no usable entry is found (caller handles by raising
     the original AuthError).
     """
@@ -4356,9 +4356,21 @@ def _pool_codex_access_token() -> str:
             token = entry.get("access_token")
             if not isinstance(token, str) or not token.strip():
                 return False
-            # Skip entries currently in an exhaustion cooldown window.
-            reset_at = entry.get("last_error_reset_at")
-            if isinstance(reset_at, (int, float)) and reset_at > time.time():
+            # Match the pool's health rules without load/select side effects:
+            # runtime fallback must not resurrect a dead first entry after a
+            # separate account was added, or return an already expired JWT.
+            from agent.credential_pool import (
+                PooledCredential, STATUS_DEAD, _exhausted_until,
+                _parse_absolute_timestamp,
+            )
+            credential = PooledCredential.from_dict("openai-codex", entry)
+            if credential.last_status == STATUS_DEAD:
+                return False
+            if _codex_access_token_is_expiring(token, 0):
+                return False
+            reset_at = _parse_absolute_timestamp(entry.get("last_error_reset_at"))
+            cooldown = _exhausted_until(credential)
+            if any(value is not None and value > time.time() for value in (reset_at, cooldown)):
                 return False
             return True
 

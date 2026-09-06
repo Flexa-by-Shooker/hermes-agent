@@ -245,7 +245,7 @@ class TestCharacterCountGuard(unittest.TestCase):
         self.assertTrue(result["content"])
         # Truncation metadata for the model to paginate.
         self.assertTrue(result["truncated"])
-        self.assertEqual(result["truncated_by"], "bytes")
+        self.assertEqual(result["truncated_by"], "chars")
         self.assertIn("next_offset", result)
         self.assertGreater(result["next_offset"], 1)
         # Body fits the budget (allowing for redaction not growing it).
@@ -637,7 +637,7 @@ class TestConfigOverride(unittest.TestCase):
         result = json.loads(read_file_tool("/tmp/cfgtest.txt", task_id="cfg1"))
         self.assertNotIn("error", result)
         self.assertTrue(result["truncated"])
-        self.assertEqual(result["truncated_by"], "bytes")
+        self.assertEqual(result["truncated_by"], "chars")
         self.assertIn("50", result["hint"])  # should show the configured limit
         self.assertLessEqual(len(result["content"]), 50)
 

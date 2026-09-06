@@ -1261,6 +1261,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    create_paused: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1270,6 +1271,7 @@ def create_job(
                 Ignored when ``no_agent=True`` except as an optional name hint.
         schedule: Schedule string (see parse_schedule)
         name: Optional friendly name
+        create_paused: Persist initially disabled in the same creation transaction.
         repeat: How many times to run (None = forever, 1 = once)
         deliver: Where to deliver output ("origin", "local", "telegram", etc.)
         origin: Source info where job was created (for "origin" delivery)
@@ -1355,6 +1357,8 @@ def create_job(
     else:
         context_from = None
 
+    if type(create_paused) is not bool:
+        raise ValueError("create_paused must be a boolean")
     prompt_text = _coerce_job_text(prompt)
 
     # Reject cron jobs that schedule gateway-lifecycle commands. Prevents
@@ -1411,10 +1415,10 @@ def create_job(
             "times": repeat,  # None = forever
             "completed": 0
         },
-        "enabled": True,
-        "state": "scheduled",
-        "paused_at": None,
-        "paused_reason": None,
+        "enabled": not create_paused,
+        "state": "paused" if create_paused else "scheduled",
+        "paused_at": now if create_paused else None,
+        "paused_reason": "created_paused" if create_paused else None,
         "created_at": now,
         "next_run_at": next_run_at,
         "last_run_at": None,

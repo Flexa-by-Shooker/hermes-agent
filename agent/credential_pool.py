@@ -904,7 +904,7 @@ class CredentialPool:
         device_code-sourced entries; env/API-key-sourced entries have no
         auth.json shadow to sync from.
         """
-        if self.provider != "openai-codex" or entry.source not in ("device_code", "manual:device_code"):
+        if self.provider != "openai-codex" or entry.source != "device_code":
             return entry
         try:
             with _auth_store_lock():
@@ -1287,7 +1287,84 @@ class CredentialPool:
         except Exception as exc:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
+    def _refresh_independent_codex_entry(
+        self, entry: PooledCredential, *, force: bool
+    ) -> Optional[PooledCredential]:
+        """Rotate only this locally owned grant, never a singleton fallback.
+
+        The profile lock covers reread, refresh and atomic persistence. A stale
+        pool must not spend an already rotated token or overwrite another
+        entry's newer credentials through a whole-pool in-memory snapshot.
+        """
+        with _auth_store_lock(timeout_seconds=self._single_use_refresh_lock_timeout()):
+            def local_rows():
+                store = _load_auth_store()
+                pool = store.get("credential_pool") or {}
+                return pool.get(self.provider) or []
+
+            rows = local_rows()
+            matches = [row for row in rows if row.get("id") == entry.id]
+            if len(matches) != 1 or matches[0].get("source") != SOURCE_MANUAL_DEVICE_CODE:
+                return None
+            original = matches[0]
+            current = PooledCredential.from_dict(self.provider, original)
+            self._replace_entry(entry, current)
+            if current.last_status == STATUS_DEAD:
+                return None
+            if (current.access_token, current.refresh_token) != (
+                entry.access_token, entry.refresh_token
+            ):
+                return current
+            if not force and not self._entry_needs_refresh(current):
+                return current
+            if current.auth_type != AUTH_TYPE_OAUTH or not current.refresh_token:
+                return None
+            success = False
+            try:
+                refreshed = auth_mod.refresh_codex_oauth_pure(
+                    current.access_token, current.refresh_token,
+                )
+                updated = replace(
+                    current,
+                    access_token=refreshed["access_token"],
+                    refresh_token=refreshed["refresh_token"],
+                    last_refresh=refreshed.get("last_refresh"),
+                    last_status=STATUS_OK, last_status_at=None,
+                    last_error_code=None, last_error_reason=None,
+                    last_error_message=None, last_error_reset_at=None,
+                )
+                success = True
+            except Exception as exc:
+                terminal = auth_mod._is_terminal_codex_oauth_refresh_error(exc)
+                updated = replace(
+                    current,
+                    last_status=STATUS_DEAD if terminal else STATUS_EXHAUSTED,
+                    last_status_at=time.time(),
+                    last_error_code=401 if terminal else None,
+                    last_error_reason="independent_oauth_refresh_failed",
+                    last_error_message=None, last_error_reset_at=None,
+                )
+            # Preserve a newer write even from a reentrant callback. The
+            # outer native lock excludes ordinary cross-process writers.
+            rows = local_rows()
+            matches = [row for row in rows if row.get("id") == current.id]
+            if len(matches) != 1 or matches[0] != original:
+                return None
+            replacement = dict(original)
+            before, after = current.to_dict(), updated.to_dict()
+            for key, value in after.items():
+                if before.get(key) != value:
+                    replacement[key] = value
+            write_credential_pool(self.provider, [
+                replacement if row.get("id") == current.id else row
+                for row in rows
+            ])
+            self._replace_entry(current, updated)
+            return updated if success else None
+
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
+        if self.provider == "openai-codex" and entry.source == SOURCE_MANUAL_DEVICE_CODE:
+            return self._refresh_independent_codex_entry(entry, force=force)
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
                 self._mark_exhausted(entry, None)
