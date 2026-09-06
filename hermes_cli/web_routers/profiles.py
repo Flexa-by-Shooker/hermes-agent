@@ -452,15 +452,36 @@ async def create_profile_endpoint(body: ProfileCreate):
             )
             hub_installs.append({"identifier": ident, "pid": None})
 
+    # Creation and model/options writes are complete. The controller rechecks
+    # the same approved profile identity and resumes its durable operation.
+    from hermes_cli.profile_lifecycle import notify_profile
+    provisioning = await asyncio.to_thread(notify_profile, body.name, "profile_configured")
     return {
         "ok": True,
         "name": body.name,
         "path": str(path),
+        "provisioning": provisioning,
         "model_set": model_set,
         "mcp_written": mcp_written,
         "skills_disabled": skills_disabled,
         "hub_installs": hub_installs,
     }
+
+
+@router.get("/api/profiles/{name}/provisioning")
+async def get_profile_provisioning_endpoint(name: str):
+    """Read the operator service's current provisioning state for this profile."""
+    from hermes_cli import profiles as profiles_mod
+    from hermes_cli.profile_lifecycle import notify_profile
+    try:
+        canonical = profiles_mod.normalize_profile_name(name)
+        profiles_mod.validate_profile_name(canonical)
+        path = profiles_mod.get_profile_dir(canonical)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not path.is_dir():
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return {"provisioning": await asyncio.to_thread(notify_profile, canonical, "profile_status")}
 
 
 @router.get("/api/profiles/active")
