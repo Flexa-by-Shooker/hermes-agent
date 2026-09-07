@@ -101,9 +101,10 @@ def test_chown_helper_refuses_target_under_symlinked_home(
     assert "refusing recursive chown through symlinked path" in proc.stdout
 
 
+# Profile ownership has a separate owner-only repair. Its behavior, including
+# unchanged modes and links, is exercised by the native entrypoint fixture.
 def test_stage2_uses_symlink_safe_helper_for_hermes_home_trees(stage2_text: str) -> None:
     assert 'chown_hermes_tree "$HERMES_HOME/$sub"' in stage2_text
-    assert 'chown_hermes_tree "$HERMES_HOME/profiles"' in stage2_text
     assert 'chown_hermes_tree "$HERMES_HOME/cron"' in stage2_text
     assert 'chown -R hermes:hermes "$HERMES_HOME/$sub"' not in stage2_text
     assert 'chown -R hermes:hermes "$HERMES_HOME/profiles"' not in stage2_text
@@ -121,7 +122,6 @@ def test_stage2_skips_recursive_repairs_when_tree_is_already_owned(
 ) -> None:
     assert "tree_has_non_hermes_owner() {" in stage2_text
     assert 'if [ -e "$HERMES_HOME/$sub" ] && tree_has_non_hermes_owner "$HERMES_HOME/$sub"; then' in stage2_text
-    assert 'if [ -d "$HERMES_HOME/profiles" ] && tree_has_non_hermes_owner "$HERMES_HOME/profiles"; then' in stage2_text
     # Sibling every-boot chown blocks carry the same warm-boot gate.
     assert 'if [ -d "$HERMES_HOME/cron" ] && tree_has_non_hermes_owner "$HERMES_HOME/cron"; then' in stage2_text
     assert 'if [ -d "$HERMES_HOME/platforms/pairing" ] && tree_has_non_hermes_owner "$HERMES_HOME/platforms/pairing"; then' in stage2_text

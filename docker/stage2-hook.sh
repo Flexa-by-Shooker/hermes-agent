@@ -273,16 +273,22 @@ fi
 # unprivileged runtime user, and it persists across container recreates /
 # image updates (an ABI stamp wipes it if a rebuild bumps the interpreter).
 
-# Always reset ownership of $HERMES_HOME/profiles to hermes on every
-# boot. Profile dirs and files can land owned by root when commands
+# Repair the owner UID of $HERMES_HOME/profiles on every boot. Profile
+# dirs and files can land owned by root when commands
 # are invoked via `docker exec <container> hermes …` (which defaults
 # to root unless `-u` is passed), and that breaks the cont-init
 # reconciler (02-reconcile-profiles) which runs as hermes and walks
-# the profiles dir. Skip the recursive walk when the tree is already
-# owned correctly so warm boots do not rescan huge profile caches.
-# Idempotent; skipped on rootless containers where chown would fail.
-if [ -d "$HERMES_HOME/profiles" ] && tree_has_non_hermes_owner "$HERMES_HOME/profiles"; then
-    chown_hermes_tree "$HERMES_HOME/profiles"
+# the profiles dir. Preserve group ownership: host services can deliberately
+# share selected profile directories through a separate group and setgid.
+# Only mismatched UIDs are changed; correctly owned files retain their modes
+# and groups, and symbolic links never redirect this ownership repair.
+if [ -d "$HERMES_HOME/profiles" ]; then
+    if refuse_symlinked_path "profile owner repair" "$HERMES_HOME/profiles"; then
+        :
+    else
+        find -P "$HERMES_HOME/profiles" ! -user hermes -exec chown -h hermes {} + 2>/dev/null || \
+            echo "[stage2] Warning: profile owner repair failed (rootless container?) — continuing"
+    fi
 fi
 
 # Always reset ownership of $HERMES_HOME/cron on every boot for the same
